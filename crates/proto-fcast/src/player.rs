@@ -245,6 +245,15 @@ impl Player {
         self.volume
     }
 
+    /// Where the current item is fetched from — the *resolved* URL, after the adapter
+    /// pointed inline content and `fcomp://` at the local host, and therefore the one
+    /// the boundary can ask questions about (#336).
+    #[must_use]
+    pub fn current_source(&self) -> Option<&str> {
+        let loaded = self.loaded.as_ref()?;
+        Some(loaded.queue.get(loaded.index)?.request.uri().as_str())
+    }
+
     /// The playback snapshot senders are told about, joined with the position the
     /// pipeline reported — the clock is read at the actor boundary, not here.
     #[must_use]

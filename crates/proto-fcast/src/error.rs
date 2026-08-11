@@ -88,6 +88,14 @@ pub enum FCastError {
     #[error("fcomp resource unavailable: {0}")]
     CompanionUnavailable(String),
 
+    /// The providing sender answered a read with `NotFound` (#336). Kept apart from
+    /// [`FCastError::CompanionUnavailable`] because it is an *answer* and not a failure
+    /// to get one: the device that offered the resource has looked and does not have it,
+    /// which is the only thing that justifies telling the sender `ResourceNotFound`
+    /// rather than that this receiver could not reach it.
+    #[error("the providing sender has no resource {0}")]
+    CompanionNotFound(String),
+
     /// A v4 `Flatbuf` body that fails the verifier, or a verified union whose
     /// required member is absent. Session-fatal, as in the reference receiver —
     /// unlike an unknown-but-well-formed payload type, which gets a polite

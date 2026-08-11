@@ -76,6 +76,25 @@ impl LocalHost {
             self.base, url.provider, url.resource
         )
     }
+
+    /// Which companion resource one of *our own* URLs proxies, if it is one.
+    ///
+    /// The inverse of [`Self::companion_url`], and the reason that inverse is needed: a
+    /// load rewrites `fcomp://3.fcast/7` to this host before the player ever sees it, so
+    /// "is the thing playing right now a file on somebody's phone?" is a question about
+    /// our own path (#336).
+    #[must_use]
+    pub fn companion_of(&self, url: &str) -> Option<CompanionUrl> {
+        let rest = url
+            .strip_prefix(&self.base)?
+            .strip_prefix(COMPANION_PATH)?
+            .strip_prefix('/')?;
+        let (provider, resource) = rest.split_once('/')?;
+        Some(CompanionUrl {
+            provider: provider.parse().ok()?,
+            resource: resource.parse().ok()?,
+        })
+    }
 }
 
 /// One published blob.
@@ -171,6 +190,31 @@ mod tests {
                 }),
                 "http://10.0.0.5:8008/fcast/companion/2/9"
             );
+        }
+    }
+
+    /// A companion URL this host built is one it can read back, and nothing else is.
+    ///
+    /// The reading back is what tells a load-time check which resource the thing now
+    /// playing came from (#336); mistaking somebody else's URL for one of ours would
+    /// have us interrogating a sender about a resource it never offered.
+    #[test]
+    fn our_own_companion_urls_read_back_and_no_others_do() {
+        let host = LocalHost::new("http://10.0.0.5:8008");
+        let url = CompanionUrl {
+            provider: 2,
+            resource: 9,
+        };
+        assert_eq!(host.companion_of(&host.companion_url(url)), Some(url));
+        for foreign in [
+            "http://10.0.0.5:8008/fcast/content/7",
+            "http://10.0.0.5:8008/fcast/companion/2",
+            "http://10.0.0.5:8008/fcast/companion//9",
+            "http://10.0.0.5:8008/fcast/companion/70000/9",
+            "http://example.com/fcast/companion/2/9",
+            "fcomp://2.fcast/9",
+        ] {
+            assert_eq!(host.companion_of(foreign), None, "{foreign}");
         }
     }
 

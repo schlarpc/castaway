@@ -661,6 +661,33 @@ async fn a_companion_resource_is_read_back_over_the_control_connection() {
         "an fcomp URL must reach the decoder as one it can open"
     );
 
+    // Before anything has fetched anything, the receiver asks the phone for a byte of the
+    // resource, because a read is the only question FCompanion answers with "no such
+    // resource" (#336). Here it is there, and the load stands.
+    let probe_frame = sender
+        .expect_payload(flat::Message::CompanionResourceRequest)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&probe_frame).unwrap();
+    let probe = packet.payload_as_companion_resource_request().unwrap();
+    assert_eq!(probe.resource_id(), RESOURCE);
+    let head = probe.read_head().unwrap();
+    assert_eq!(
+        (head.start(), head.stop_inclusive()),
+        (0, 0),
+        "one byte is enough to learn whether the resource is there"
+    );
+    sender
+        .send(&Frame::with_body(
+            Opcode::Resource,
+            encode_resource(&ResourcePart {
+                request_id: probe.request_id(),
+                part: 0,
+                total: 1,
+                result: ResourceResult::Data(BODY[..1].to_vec()),
+            }),
+        ))
+        .await;
+
     // Now be the sender: answer the reads the HTTP request provokes. Driven from a task,
     // because the GET below does not return until they have been answered.
     let fetch = tokio::spawn(async move { get(&url).await });
@@ -730,6 +757,76 @@ async fn a_companion_resource_is_read_back_over_the_control_connection() {
         served, BODY,
         "the bytes the sender served came through whole"
     );
+}
+
+/// A companion resource the providing sender does not have is refused as
+/// `ResourceNotFound`, without anything having tried to fetch it (#336).
+///
+/// This is what the two `cast_companion_missing_*` conformance cases assert, and the
+/// reason the receiver has to ask rather than wait: FCompanion's info answer carries a
+/// content type and no not-found shape, so the sender's "I do not have that" exists only
+/// in the reply to a *read*. A receiver that leaves the discovery to its decoder says
+/// nothing at all on a build whose pipeline never opens the URL — and then a phone that
+/// cast a file it had since deleted sits watching a receiver that claims to be playing.
+#[tokio::test]
+async fn a_companion_resource_the_sender_does_not_have_is_refused_as_not_found() {
+    use proto_fcast::companion::{encode_resource, ResourcePart, ResourceResult};
+
+    let (addr, mut rx, _fp, _base) = started_full(None, true).await;
+    let mut sender = V4Sender::connect(addr).await;
+    sender
+        .expect_payload(flat::Message::ReceiverIntroduction)
+        .await;
+
+    sender.send(&companion_hello_frame()).await;
+    let body = sender
+        .expect_payload(flat::Message::CompanionHelloResponse)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&body).unwrap();
+    let provider = packet
+        .payload_as_companion_hello_response()
+        .unwrap()
+        .provider_id();
+
+    const RESOURCE: u32 = 3;
+    sender.send(&load_companion_frame(provider, RESOURCE)).await;
+
+    let probe_frame = sender
+        .expect_payload(flat::Message::CompanionResourceRequest)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&probe_frame).unwrap();
+    let probe = packet.payload_as_companion_resource_request().unwrap();
+    assert_eq!(probe.resource_id(), RESOURCE);
+    sender
+        .send(&Frame::with_body(
+            Opcode::Resource,
+            encode_resource(&ResourcePart {
+                request_id: probe.request_id(),
+                part: 0,
+                total: 1,
+                result: ResourceResult::NotFound,
+            }),
+        ))
+        .await;
+
+    let body = sender.expect_payload(flat::Message::Error).await;
+    let packet = fcast_flatbuf::root_as_packet(&body).unwrap();
+    assert_eq!(
+        packet.payload_as_error().unwrap().kind(),
+        flat::ErrorKind::ResourceNotFound,
+        "the sender is told which of its resources could not be played"
+    );
+
+    // And the screen does not go on claiming to play a file nobody has: the stop reaches
+    // the session manager too, not just the sender that asked.
+    loop {
+        if matches!(
+            next_event(&mut rx).await,
+            SessionEvent::Control(castaway_core::ControlTxn::Stop)
+        ) {
+            break;
+        }
+    }
 }
 
 /// A `fcomp://` URL whose provider nobody owns is a 404, not a hang.

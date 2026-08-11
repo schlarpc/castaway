@@ -123,9 +123,10 @@ pub(crate) struct Inner {
 
 /// A companion read waiting on the sender that owns the resource.
 struct PendingRead {
-    /// Which provider is answering, so a disconnect can abandon exactly its reads and
-    /// leave another sender's alone.
-    provider: u16,
+    /// What is being read. The provider half routes it — a disconnect abandons exactly
+    /// that sender's reads and leaves another's alone — and the resource half names it
+    /// in the answer, so a `NotFound` can say which resource was not found.
+    url: CompanionUrl,
     kind: PendingKind,
 }
 
@@ -423,6 +424,50 @@ impl Shared {
         events
     }
 
+    /// Which companion resource is playing right now, if the current media is one.
+    ///
+    /// Asked of the *resolved* URL rather than remembered from the load, so it answers
+    /// for every way an item becomes current — a `Load`, a `QueueItemSelected`, the
+    /// playlist advancing — instead of only the one the caller happened to hook (#336).
+    fn current_companion(&self) -> Option<CompanionUrl> {
+        let host = self.local_host.as_ref()?;
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        host.companion_of(guard.player.current_source()?)
+    }
+
+    /// The media that was loaded cannot be obtained: say so to every session, and stop.
+    ///
+    /// Broadcast rather than sent to whoever asked, because this is not a refusal of a
+    /// command — the command was accepted and the media failed afterwards, which is a
+    /// fact about the screen every connected sender is entitled to (`v4_update_frame`
+    /// draws the same line). The stop is what keeps the receiver's state honest: a
+    /// panel left "playing" something that does not exist would answer `InvalidState` to
+    /// the resume its sender offers next.
+    fn media_failed(
+        &self,
+        message: String,
+        kind: fcast_flatbuf::flat::ErrorKind,
+    ) -> Vec<SessionEvent> {
+        let wall_ms = Self::wall_ms();
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = &mut *guard;
+        Self::broadcast(
+            inner,
+            wall_ms,
+            &[ReceiverUpdate::Error { message, kind }],
+            None,
+        );
+        let Applied { events, updates } = inner.player.stop();
+        Self::broadcast(inner, wall_ms, &updates, None);
+        events
+    }
+
     /// Apply a v4 command (#248). Same shape as [`Shared::apply`], with typed
     /// refusals and the v4-only verbs.
     fn apply_v4(&self, peer_id: u64, command: V4Command) -> Result<Vec<SessionEvent>, Refusal> {
@@ -580,10 +625,11 @@ impl Shared {
     /// the await — the answer arrives on the connection actor, which takes the same lock.
     async fn companion_ask<T>(
         &self,
-        provider: u16,
+        url: CompanionUrl,
         make_pending: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> PendingKind,
         make_frame: impl FnOnce(u32) -> Frame,
     ) -> Result<T, FCastError> {
+        let provider = url.provider;
         let request_id = self
             .next_request
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -602,7 +648,7 @@ impl Shared {
             inner.reads.insert(
                 request_id,
                 PendingRead {
-                    provider,
+                    url,
                     kind: make_pending(tx),
                 },
             );
@@ -641,7 +687,7 @@ impl Shared {
         &self,
         url: CompanionUrl,
     ) -> Result<CompanionInfo, FCastError> {
-        self.companion_ask(url.provider, PendingKind::Info, |request_id| {
+        self.companion_ask(url, PendingKind::Info, |request_id| {
             v4msg::companion_resource_info_request_frame(request_id, url.resource)
         })
         .await
@@ -659,7 +705,7 @@ impl Shared {
         stop_inclusive: u64,
     ) -> Result<Vec<u8>, FCastError> {
         self.companion_ask(
-            url.provider,
+            url,
             |answer| PendingKind::Data {
                 read: ResourceRead::new(),
                 answer,
@@ -724,16 +770,16 @@ impl Shared {
                         guard.reads.insert(
                             request_id,
                             PendingRead {
-                                provider: pending.provider,
+                                url: pending.url,
                                 kind: PendingKind::Data { read, answer },
                             },
                         );
                         return;
                     }
                     Ok(ReadProgress::Complete(data)) => Ok(data),
-                    Ok(ReadProgress::NotFound) => Err(FCastError::CompanionUnavailable(
-                        "the providing sender has no such resource".into(),
-                    )),
+                    Ok(ReadProgress::NotFound) => {
+                        Err(FCastError::CompanionNotFound(pending.url.to_url()))
+                    }
                     Err(e) => Err(e),
                 };
                 let _ = answer.send(outcome);
@@ -753,7 +799,7 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .reads
-            .retain(|_, pending| pending.provider != provider);
+            .retain(|_, pending| pending.url.provider != provider);
     }
 
     /// Release a disconnecting peer's companion provider id.
@@ -1630,7 +1676,19 @@ async fn serve_v4(
                     };
                     buf.drain(..raw.consumed);
                     match handle_v4_frame(shared, peer_id, peer_addr, started.elapsed(), &raw).await {
-                        Ok(events) => emit_all(sink, shared, events).await,
+                        Ok(outcome) => {
+                            emit_all(sink, shared, outcome.events).await;
+                            // After the events, never before: the check can end in a stop,
+                            // and a stop the session manager hears before the play it
+                            // undoes leaves the screen running (#336).
+                            if let Some(url) = outcome.verify {
+                                tokio::spawn(verify_companion(
+                                    Arc::clone(shared),
+                                    sink.clone(),
+                                    url,
+                                ));
+                            }
+                        }
                         Err(fault) => {
                             warn!(peer = %peer_addr, %fault, "fcast: v4 session fault; disconnecting");
                             break 'conn;
@@ -1761,6 +1819,27 @@ async fn handle_frame(
     }
 }
 
+/// What one v4 frame produced.
+///
+/// The events are emitted by the caller, as they always were; `verify` is the companion
+/// resource that this frame made the current media, which the caller must then check
+/// exists — *after* those events, so a resource that turns out to be missing can never
+/// stop a playback the session manager has not been told about yet (#336).
+#[derive(Default)]
+struct V4Outcome {
+    events: Vec<SessionEvent>,
+    verify: Option<CompanionUrl>,
+}
+
+impl From<Vec<SessionEvent>> for V4Outcome {
+    fn from(events: Vec<SessionEvent>) -> Self {
+        Self {
+            events,
+            verify: None,
+        }
+    }
+}
+
 /// Feed one raw frame through a v4 session (#248).
 ///
 /// Async only for the mirroring offer, which is a DTLS handshake and an ICE gather and
@@ -1772,17 +1851,17 @@ async fn handle_v4_frame(
     peer_addr: SocketAddr,
     now: Duration,
     raw: &wire::RawFrame,
-) -> Result<Vec<SessionEvent>, FCastError> {
+) -> Result<V4Outcome, FCastError> {
     let (reaction, sender_identity) = {
         let mut guard = shared
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(peer) = guard.peers.get_mut(&peer_id) else {
-            return Ok(Vec::new());
+            return Ok(V4Outcome::default());
         };
         let PeerSession::V4(session) = &mut peer.session else {
-            return Ok(Vec::new());
+            return Ok(V4Outcome::default());
         };
         let reaction: V4Reaction = session.on_frame(now, raw)?;
         for reply in &reaction.replies {
@@ -1793,18 +1872,20 @@ async fn handle_v4_frame(
     };
 
     let Some(command) = reaction.command else {
-        return Ok(Vec::new());
+        return Ok(V4Outcome::default());
     };
     debug!(?command, "fcast: v4 sender command");
     if let V4Command::MirroringOffer { session_id, sdp } = &command {
-        return Ok(answer_mirroring(shared, peer_id, *session_id, sdp).await);
+        return Ok(answer_mirroring(shared, peer_id, *session_id, sdp)
+            .await
+            .into());
     }
     if matches!(
         command,
         V4Command::CompanionInfo { .. } | V4Command::CompanionData(_)
     ) {
         shared.deliver_companion(command);
-        return Ok(Vec::new());
+        return Ok(V4Outcome::default());
     }
     let was_load = matches!(command, V4Command::Load { .. });
     // `fcomp://` is not a URL any decoder can open; the local proxy is (#249). Only the
@@ -1821,6 +1902,10 @@ async fn handle_v4_frame(
         }
         _ => {}
     }
+    // What was playing before the command, so only a *change* to a companion resource
+    // provokes a check: re-reading a phone's file on every pause would be a round trip
+    // per verb for nothing.
+    let before = shared.current_companion();
     match shared.apply_v4(peer_id, command) {
         Ok(mut events) => {
             if was_load {
@@ -1831,13 +1916,51 @@ async fn handle_v4_frame(
                         .and_then(|i| i.display_name.clone().or_else(|| i.app_name.clone())),
                 )));
             }
-            Ok(events)
+            let verify = shared
+                .current_companion()
+                .filter(|url| Some(*url) != before);
+            Ok(V4Outcome { events, verify })
         }
         Err(refusal) => {
             info!(reason = %refusal.message, "fcast: v4 request refused");
-            Ok(Vec::new())
+            Ok(V4Outcome::default())
         }
     }
+}
+
+/// Check that a companion resource is really there, and tell the senders when it is not.
+///
+/// FCompanion has no way to *ask*. The info answer carries a content type and a size and
+/// has no not-found shape at all — FUTO's own driver answers info for a resource it will
+/// then refuse to serve, and the reference sender SDK reports a missing file only when
+/// asked for its bytes — so the one honest question is a read, and a single byte is
+/// enough to hear the answer.
+///
+/// Why the receiver asks at all, rather than letting the fetch discover it: nothing here
+/// guarantees a fetch. On the portable build the null pipeline never opens the URL, so a
+/// resource the phone does not have would play silently forever and the sender would
+/// never be told — which is exactly how the two `cast_companion_missing_*` conformance
+/// cases went red (#336). Asking at load time also gets the answer to the sender before
+/// a decoder has had to fail on it.
+///
+/// Spawned rather than awaited in the read loop, and that is not a preference: the
+/// providing sender is usually the connection that sent the `Load`, and its answer
+/// arrives on the very loop that would be blocked waiting for it.
+async fn verify_companion(shared: Arc<Shared>, sink: SessionSink, url: CompanionUrl) {
+    use fcast_flatbuf::flat::ErrorKind;
+    let Err(error) = shared.companion_read(url, 0, 0).await else {
+        return;
+    };
+    // A load, a queue select, or a stop may have happened while the phone was thinking.
+    // Failing *that* media because this one turned out to be missing would be a receiver
+    // that stops whatever is playing whenever an abandoned resource finally answers.
+    if shared.current_companion() != Some(url) {
+        debug!(url = %url.to_url(), %error, "fcast: a companion resource nobody is waiting for");
+        return;
+    }
+    warn!(url = %url.to_url(), %error, "fcast: the companion resource cannot be played");
+    let events = shared.media_failed(format!("{error}"), ErrorKind::ResourceNotFound);
+    emit_all(&sink, &shared, events).await;
 }
 
 /// Answer a sender's mirroring offer and take the screen (#248).
