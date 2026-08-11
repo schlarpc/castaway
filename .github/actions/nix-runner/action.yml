@@ -79,13 +79,35 @@ runs:
         sudo sysctl -w vm.swappiness=60 >/dev/null
         free -h
 
+    # The other half of what `checks.android-cast` needs, and the reason it had never once
+    # passed on a hosted runner — 25 red jobs from the day it landed (#338).
+    #
+    # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which lets an
+    # unprivileged process create a user namespace and then refuses the `uid_map` write
+    # that would make it useful: `unshare: write failed /proc/self/uid_map: Operation not
+    # permitted`. The check needs that namespace because a nix build has no capabilities
+    # at all (`CapEff: 0000000000000000`), so the nested userns is what buys CAP_NET_ADMIN
+    # and lets `ip tuntap add` work.
+    #
+    # Established by probing the runner rather than reasoning about it. The same `unshare`
+    # fails identically *outside* nix, which is what rules out the sandbox, the KVM builder
+    # and the emulator; and with this sysctl cleared the whole sequence — nested userns,
+    # netns, tap creation inside it — succeeds inside the sandbox, while the two operations
+    # that fail on the dev box (`unshare --net` alone, a tap in the sandbox's own netns)
+    # keep failing there too. Runner and bench then agree operation for operation.
+    #
+    # Scoped to the runner's own ephemeral VM, and a relaxation nothing else here exercises.
+    - name: Let a nix build open a user namespace
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
     # `extra-sandbox-paths`: `checks.android-cast` builds a TAP inside the sandbox's
     # network namespace to put the Android emulator and the receiver on one L2 segment
-    # (#225). The unprivileged netns works out of the box; creating a tap in it does not,
+    # (#225). The namespace is the sysctl above; creating a tap in it needs one more thing,
     # because the sandbox's /dev has no `net/tun` and a user namespace cannot mknod one.
-    # Bind-mounting the host's is the whole fix. Harmless for every other job — a path in
-    # the sandbox that nothing else opens — and the alternative was keeping the network
-    # leg out of `nix flake check` entirely.
+    # Bind-mounting the host's is the rest of the fix. Harmless for every other job — a
+    # path in the sandbox that nothing else opens — and the alternative was keeping the
+    # network leg out of `nix flake check` entirely.
     - uses: DeterminateSystems/nix-installer-action@v22
       with:
         extra-conf: |
