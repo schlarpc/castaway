@@ -857,7 +857,7 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
     let Some(state) = publish_with(
         320,
         176,
-        2,
+        3,
         Scenario {
             sound: Some(Duration::from_millis(100)),
             ..Scenario::default()
@@ -865,7 +865,7 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
     ) else {
         return;
     };
-    let file = playable(&state, 2);
+    let file = playable(&state, 3);
     let sound = decode_audio(file.path()).expect("an audio track");
     assert_eq!(sound.sample_rate, RATE);
     assert_eq!(sound.channels, 2);
@@ -886,8 +886,15 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
         sound.peak,
         state.sound_diagnostics()
     );
-    // And the tone that is there is exact, not just loud (#290). Two segments minus the
-    // settle, the uncut tail and the tenth-of-a-second lead leave at least 80 ms of it.
+    // And the tone that is there is exact, not just loud (#290).
+    //
+    // Three segments, not two, and the third is what makes the floor reachable. The audio
+    // behind a cut is only what the encode thread drained before it, so a two-segment
+    // window decodes to 8192 frames however long the video span is; less the 4800-frame
+    // lead, that leaves 7.07 blocks and an `at_least: 8` that no box has ever satisfied.
+    // A third segment carries the track past 12k frames, so eight blocks are asked of a
+    // window with room for fifteen — a floor with margin rather than a knife edge. The
+    // premise check inside the assertion is what says so if that ever stops being true.
     assert_the_marker_blocks_line_up(&state, &sound, 8);
 }
 
@@ -988,11 +995,39 @@ fn assert_the_marker_blocks_line_up(state: &Published, sound: &Sound, at_least: 
         .expect("the onset crossed 0.1, so some sample is loud");
     let block_len = usize::try_from(MARKER_FRAMES).unwrap();
     let blocks = (last_loud + 1 - onset) / block_len;
+
+    // The premise, before the assertion that rests on it (rule 6): could this window have
+    // carried `at_least` blocks at all? The audio behind a cut is only what the encode
+    // thread drained before it, so the track is materially shorter than the video span —
+    // and how much shorter is the encoder's schedule, not the stream's correctness.
+    //
+    // Worth the separate check because getting it wrong is not hypothetical. `at_least: 8`
+    // was unreachable from the day it was written (#290): a two-segment window decodes to
+    // exactly 8192 frames, the deliberate 100 ms lead puts the onset at 4800, and 3392
+    // frames is 7.07 blocks. It failed identically on every box and every run — no
+    // contention needed — and read as "the decode lost the bulk of the tone" while the
+    // decode had in fact returned every sample there was. This says which of the two it is.
+    let capacity = sound.mono.len().saturating_sub(onset) / block_len;
+    assert!(
+        capacity >= at_least,
+        "this window carries only {capacity} whole marker blocks after the onset, so it \
+         cannot show {at_least} — the tone was played but the segments read were cut before \
+         it (onset at frame {onset}, {} frames in the track, {block_len} to a block). The \
+         measurement is void, not failed: give the scenario more segments, or shorten its \
+         silent lead. {}",
+        sound.mono.len(),
+        state.sound_diagnostics()
+    );
+
     // `at_least` is what the scenario says the tone must span: a handful of blocks lining
-    // up perfectly would still mean the decode lost the bulk of the tone.
+    // up perfectly would still mean the decode lost the bulk of the tone. Past the premise
+    // above, a shortfall here is the stream mislaying sound it was given.
     assert!(
         blocks >= at_least,
-        "only {blocks} whole marker blocks decoded where at least {at_least} were played. {}",
+        "only {blocks} whole marker blocks decoded where at least {at_least} were played, \
+         out of a window with room for {capacity} (onset at frame {onset}, last loud sample \
+         at {last_loud}, {} frames in the track, {block_len} frames to a block). {}",
+        sound.mono.len(),
         state.sound_diagnostics()
     );
     // The first two AAC frames of the *track* decode attenuated: the overlap-add window
