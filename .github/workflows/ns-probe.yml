@@ -1,0 +1,49 @@
+name: Namespace probe
+
+# Temporary, and on demand only. `checks.android-cast` has failed on every hosted runner
+# it has ever been given (25 of 25 since it landed in e807ca3), at
+#
+#   unshare: write failed /proc/self/uid_map: Operation not permitted
+#
+# which is the `unshare --user --map-root-user --net` that gives the check its TAP segment.
+# It succeeds on the dev box, and the nix sandbox strips every capability (`CapEff: 0`) so
+# the unshare is load-bearing rather than incidental — the check cannot simply drop it.
+#
+# The difference is therefore in the runner environment, and it is not reproducible on the
+# bench by construction. This runs the same three namespace operations the check depends
+# on, inside the same nix sandbox and the same installer configuration, and prints what
+# the kernel says about each. Delete once #338 is decided.
+on:
+  workflow_dispatch:
+
+jobs:
+  ns-probe:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/nix-runner
+        with:
+          cache-save: "false"
+      - name: What the runner allows, outside the sandbox
+        run: |
+          echo "::group::kernel and userns policy"
+          uname -a
+          for k in kernel.unprivileged_userns_clone user.max_user_namespaces \
+                   kernel.apparmor_restrict_unprivileged_userns \
+                   kernel.apparmor_restrict_unprivileged_unconfined; do
+            printf '%-55s %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null || echo '(absent)')"
+          done
+          echo "::endgroup::"
+          echo "::group::unshare on the runner itself, no nix in the way"
+          unshare --user --map-root-user --net -- true \
+            && echo "host unshare OK" || echo "host unshare FAILED rc=$?"
+          echo "::endgroup::"
+          echo "::group::determinate settings"
+          echo "DETERMINATE_NIX_KVM=${DETERMINATE_NIX_KVM:-unset}"
+          nix config show | grep -E '^(sandbox|extra-sandbox-paths|sandbox-paths|system-features) ' || true
+          echo "::endgroup::"
+      - name: The same operations, inside a nix build sandbox
+        run: nix build --impure --no-link -f .github/scripts/ns-probe.nix
