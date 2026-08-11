@@ -9,8 +9,21 @@ name: Release
 # Deliberately not gated on the Test workflow: the full check matrix takes upwards of two
 # hours, and the cross-build neither runs those tests nor shares their failure modes. A
 # broken commit produces a release the same as a good one — the release records what
-# `main` was, not that it was good; the Test workflow's own red X on the same commit is
-# the verdict, one click away.
+# `main` was, not that it was good.
+#
+# But "not gated" is not the same as "indistinguishable", and it used to be. Every release
+# was published as Latest by virtue of being newest, so the default download was whatever
+# had most recently *compiled*, on a tree whose test matrix had been red for four commits
+# without anyone noticing (#334). So the two claims are now separated:
+#
+#   * this workflow publishes every commit, as a **prerelease** — the artifact exists, and
+#     the badge says nothing has vouched for it;
+#   * the Test workflow's `promote` job clears the prerelease flag and moves **Latest**,
+#     once its whole matrix is green and only ever forwards along the commit graph.
+#
+# Which makes Latest mean "the newest commit CI validated" and keeps every commit
+# downloadable for a panel-side bisect. It also means Latest can sit several commits
+# behind the tip, and that is the honest reading rather than a defect.
 on:
   push:
     branches: [main]
@@ -44,8 +57,16 @@ jobs:
           cp result/castaway-windows-electron.zip "castaway-windows-electron-$short.zip"
           # `build-<sha>` rather than the bare sha: a tag that *is* a commit id shadows
           # the commit in every ref-vs-object ambiguity git and the API have.
+          # `--prerelease` and `--latest=false` are the same claim twice, deliberately.
+          # The prerelease flag is what keeps this release out of GitHub's `releases/latest`
+          # — that exclusion is defined behaviour, where relying on `make_latest` alone
+          # would leave the pointer to a date heuristic. `--latest=false` then says it
+          # again for the one API that reads it. `promote` in the Test workflow clears
+          # both, for green commits only, in commit order.
           gh release create "build-$short" \
             --target "$GITHUB_SHA" \
+            --prerelease \
+            --latest=false \
             --title "castaway $short" \
             --notes "$(git log -1 --format='%s%n%n%H')" \
             "castaway-windows-electron-$short.zip"

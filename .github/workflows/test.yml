@@ -11,12 +11,25 @@ on:
   schedule:
     - cron: "20 9 * * *"
 
-# A push that lands while the previous one is still building makes the older run
-# irrelevant, and these jobs are long enough that letting both finish wastes a lot of
-# runner time. Not on `main`: there, every commit's result is worth having on its own.
+# Coalesce to the tip. A push that lands while an older one is still building makes the
+# older run irrelevant, and these jobs are long enough that letting both finish wastes a
+# lot of runner time.
+#
+# `main` used to be exempt, on the theory that there every commit's result is worth having
+# on its own. It never bought that. `cancel-in-progress: false` protects a run that has
+# *started*; it does nothing for one that is still pending, because a concurrency group
+# holds at most one pending run and each new push evicts the queued one. Ten of the last
+# twenty main runs were cancelled while pending, having built nothing — and `main` stayed
+# red for four commits with no completed run anywhere to say so (#334).
+#
+# So the exemption delivered the opposite of its intent: the runner time went to whichever
+# stale commit happened to be in flight, and the tip — the one commit anybody was waiting
+# on — was the one reliably evicted. Coalescing inverts that. The last push of a burst is
+# never superseded, so the tip always runs to completion, and the nightly below re-tests
+# the tip unconditionally, so a gap closes within a day instead of never.
 concurrency:
   group: test-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 jobs:
   # Everything that is a mistake in the flake rather than in the code, found in a minute
@@ -51,10 +64,14 @@ jobs:
           checks=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
           # Coverage re-compiles the workspace instrumented and re-runs the whole suite —
           # 70+ minutes for a number nothing gates on per commit, and its test verdict is
-          # `test`'s verdict. Nightly is enough; per-commit runs drop it (#238).
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            checks='["coverage"]'
-          else
+          # `test`'s verdict. Per-commit runs drop it; the nightly keeps it (#238).
+          #
+          # The nightly runs the *whole* matrix, not coverage alone as it used to. That is
+          # the other half of coalescing: leaving only the tip tested is the intent, but it
+          # is sound only if something re-tests the tip no matter what happened during the
+          # burst. This is that something — and it is also what lets a commit whose own run
+          # was superseded still reach the Latest release pointer, through `promote` (#334).
+          if [ "${{ github.event_name }}" != "schedule" ]; then
             checks=$(echo "$checks" | jq -c 'map(select(. != "coverage"))')
           fi
           echo "checks=$checks" >> "$GITHUB_OUTPUT"
@@ -105,3 +122,76 @@ jobs:
       - run: .github/scripts/nix-build.sh '.#checks.x86_64-linux.${{ matrix.check }}'
       - uses: ./.github/actions/postmortem
         if: failure()
+
+  # The Latest release pointer — the one thing in this repo that claims a commit was good.
+  #
+  # Every commit on `main` publishes its Windows zip the moment it cross-builds, as a
+  # *prerelease* (Release workflow). This job takes that release out of prerelease and
+  # marks it Latest once the whole matrix has agreed, so what a download-the-latest link
+  # hands the panel is the newest commit CI validated, not the newest commit that merely
+  # compiled. Artifacts stay per-commit either way; it is only the pointer that waits.
+  #
+  # Two invariants, and the second is the one with teeth:
+  #
+  #   * Only green commits are promoted — `success()` here means every job in the matrix
+  #     passed, `fail-fast: false` notwithstanding.
+  #   * The pointer never moves backwards. Runs finish out of order all the time: a
+  #     nightly re-testing a tip that a push has since moved past, a superseded run
+  #     beating its successor to the line. A bare `--latest` would happily walk Latest
+  #     back onto an ancestor, so the ancestry check below is what actually holds the
+  #     ordering rule. Note it is a *check*, not a lock: serialising this with a
+  #     concurrency group would drop pending runs, which is #334 again on the one stream
+  #     that must not have gaps.
+  promote:
+    needs: [check]
+    if: ${{ success() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # As in the Release workflow, and for the same reason: editing a release is a write
+      # to this repository's contents. Nothing else here needs more than the default.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # `git merge-base --is-ancestor` needs real history and the release tags. The
+          # default shallow clone has one commit and no tags, and would answer every
+          # ancestry question wrong rather than failing.
+          fetch-depth: 0
+      - name: Move Latest onto this commit, if it is ahead of the current one
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short=$(git rev-parse --short "$GITHUB_SHA")
+          tag="build-$short"
+
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::the matrix is green for $short but no $tag release exists, so" \
+                 "the Release workflow failed to publish an artifact for it. Latest stays."
+            exit 1
+          fi
+
+          # GitHub's own answer for Latest: the newest release that is neither draft nor
+          # prerelease, which under this scheme means the newest commit a run promoted.
+          # 404s on a repo where nothing has been promoted yet, hence the `|| true`.
+          current=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [ -n "$current" ] && [ "$current" != "$tag" ]; then
+            # `^{commit}` so this reads the same for a lightweight tag (what `gh release
+            # create` makes) and an annotated one (what a human would make by hand).
+            if ! current_sha=$(git rev-parse -q --verify "refs/tags/$current^{commit}"); then
+              echo "::error::Latest is $current, which does not resolve in this checkout;" \
+                   "refusing to move the pointer without knowing what it points at."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$current_sha" "$GITHUB_SHA"; then
+              echo "Latest is $current, which is not an ancestor of $short — this run" \
+                   "finished out of order. Leaving the pointer where it is."
+              exit 0
+            fi
+          fi
+
+          # Both halves: out of prerelease, because it has now been validated, and onto
+          # Latest. `--latest` is explicit rather than date-inferred, which matters here
+          # precisely because a newer prerelease usually already exists.
+          gh release edit "$tag" --prerelease=false --latest
+          echo "Latest is now $tag${current:+ (was $current)}"
