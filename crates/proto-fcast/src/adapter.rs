@@ -844,13 +844,44 @@ async fn resolve_sources(shared: &Arc<Shared>, command: SenderCommand) -> Sender
 /// rewrites, and an item shape we do not model is carried through rather than dropped.
 /// A document that will not parse is returned unchanged, so the player refuses it with
 /// the message it would have anyway.
+///
+/// "Untouched" has to mean the bytes, not the meaning, and that is why a document with
+/// nothing to rewrite returns the original string rather than a re-serialisation of an
+/// equal value. `serde_json::Value` holds objects in a `BTreeMap` unless `preserve_order`
+/// is on, so a round trip **alphabetises every key**: a sender's
+/// `{container, url, headers}` comes back `{container, headers, url}`. The echo in a
+/// `PlayUpdate` is compared as a string by senders — FUTO's conformance driver does
+/// exactly that — so reordering is a wire-visible change.
+///
+/// It went unnoticed because it was invisible until #251: playlist items carried only
+/// `container` and `url`, which are already in alphabetical order, and adding `headers`
+/// put a key between them. `cast_simple_playlist_with_headers` is the case that caught it
+/// (#336).
 fn publish_playlist_items(shared: &Arc<Shared>, host: &LocalHost, content: String) -> String {
+    rewrite_playlist_items(content, |container, inline| {
+        let id = shared
+            .content
+            .publish(container, bytes::Bytes::from(inline));
+        host.content_url(id)
+    })
+}
+
+/// The pure half of [`publish_playlist_items`]: everything except where the bytes go.
+///
+/// Split out so the byte-preservation property above can be a test rather than a comment
+/// — `publish` stands in for the shared content host, which a unit test has no business
+/// building (ground rule 3).
+fn rewrite_playlist_items(
+    content: String,
+    mut publish: impl FnMut(&str, String) -> String,
+) -> String {
     let Ok(mut document) = serde_json::from_str::<serde_json::Value>(&content) else {
         return content;
     };
     let Some(items) = document.get_mut("items").and_then(|i| i.as_array_mut()) else {
         return content;
     };
+    let mut rewrote = false;
     for item in items {
         let (Some(inline), None) = (
             item.get("content")
@@ -863,14 +894,17 @@ fn publish_playlist_items(shared: &Arc<Shared>, host: &LocalHost, content: Strin
         let container = item
             .get("container")
             .and_then(|c| c.as_str())
-            .unwrap_or("application/octet-stream");
-        let id = shared
-            .content
-            .publish(container, bytes::Bytes::from(inline));
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let url = publish(&container, inline);
         if let Some(object) = item.as_object_mut() {
-            object.insert("url".into(), host.content_url(id).into());
+            object.insert("url".into(), url.into());
             object.remove("content");
+            rewrote = true;
         }
+    }
+    if !rewrote {
+        return content;
     }
     serde_json::to_string(&document).unwrap_or(content)
 }
@@ -1980,6 +2014,41 @@ mod tests {
 
     use super::*;
     use crate::identity::V4Identity;
+
+    /// A playlist with nothing to publish comes back byte for byte (#336).
+    ///
+    /// `serde_json::Value` keeps objects in a `BTreeMap`, so any round trip alphabetises
+    /// keys — and the echo in a `PlayUpdate` is compared as a *string* by senders. This
+    /// item is the shape FUTO's `cast_simple_playlist_with_headers` sends, whose keys are
+    /// deliberately not in alphabetical order; before the fix it came back with `headers`
+    /// hoisted above `url` and the case failed on an echo that was semantically identical.
+    #[test]
+    fn a_playlist_with_nothing_to_publish_is_echoed_byte_for_byte() {
+        let sent = r#"{"contentType":0,"items":[{"container":"image/jpeg","url":"http://h/x","headers":{"Custom-Key":"ABC","User-Agent":"Fake"}}]}"#;
+        let echoed = rewrite_playlist_items(sent.to_owned(), |_, _| {
+            panic!("nothing in this document is inline, so nothing should be published")
+        });
+        assert_eq!(echoed, sent);
+    }
+
+    /// And an item that *is* inline still gets its URL, so the guard above did not turn
+    /// the rewrite off.
+    #[test]
+    fn an_inline_playlist_item_is_published_and_rewritten() {
+        let sent = r#"{"contentType":0,"items":[{"container":"application/dash+xml","content":"<MPD/>"}]}"#;
+        let echoed = rewrite_playlist_items(sent.to_owned(), |container, inline| {
+            assert_eq!(container, "application/dash+xml");
+            assert_eq!(inline, "<MPD/>");
+            "http://h/published".to_owned()
+        });
+        assert!(echoed.contains(r#""url":"http://h/published""#), "{echoed}");
+        // `"content":` with its colon, because the document's own `"contentType"` starts
+        // with the same seven characters — which is how this assertion first failed.
+        assert!(
+            !echoed.contains(r#""content":"#),
+            "the inline bytes should have been replaced by the url: {echoed}"
+        );
+    }
 
     /// The QR is a promise, and it is only made when it can be kept.
     ///
