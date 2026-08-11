@@ -398,7 +398,7 @@ Exit criteria are marked **[A]** asserted today or **[P]** proposed.
 | Mirroring OFFER/ANSWER | T0 | `mirror.rs` negotiation tests | **every OFFER is hand-written by us**; no captured Chrome offer; ANSWER never parsed by openscreen's `Answer` parser |
 | Mirroring RTCP | T0+T1 | `rtcp.rs`; `mirror_udp.rs` | differential in **one direction only**; nothing openscreen wrote parses what we emit |
 | Mirroring audio (Opus/AAC) | T0 | codec-name parsing only | **fixture is VP8 video only** (`audio: None`); nothing decodes a mirrored Opus frame |
-| Mirroring → pixels | NONE in CI | `render_pipeline.rs::encoded_mirror_decodes_and_composites_pixels` exists | needs `render`+`ffmpeg`; no check enables both |
+| Mirroring → pixels | **T1, runs in `checks.test`** | `render_pipeline.rs::encoded_mirror_decodes_and_composites_pixels` | the row's own precondition — a check enabling both `render` and ffmpeg — is what D55 made unavoidable, since both are default. Observed `... ok` in a full instrumented run at `ccb380e` |
 | Cast Connect / queue | NONE | — | not implemented and **not declared** as a non-goal; no test pins what `QUEUE_LOAD` returns |
 
 **Exit criteria.** [A] all 12 device-auth vectors judged exactly as recorded; both chains
@@ -557,12 +557,12 @@ is the same contract from another *host*, out of the real app wiring.
 | Browser-less honesty (D27) | **T2** | VM asserts absence, 404s, and the log line | — |
 | `dd.xml`, app state, launch, DELETE, CORS | **T1** | `dial.rs`; `app/src/screen.rs` | DIAL **does** test XML escaping (`Test & Screen`) where DLNA does not |
 | `<screenId>` attach-to-running-app | **T1** | `screen.rs`, `dial.rs` | the real attach exists only in `yt-selfplay --reconnect` |
-| Real screen resolver (`screen.rs::fetch`) | **NONE in CI** | `#[cfg(feature = "electron")]` | no check compiles it (§3.1) |
+| Real screen resolver (`screen.rs::fetch`) | **NONE in CI** | `#[cfg(feature = "electron")]` | still NONE, but not for the reason given: `electron` is default since D55, so every check compiles it. Nothing exercises the resolver — the gap is a missing test, not a dark feature |
 | Lounge bind-channel framing | T0 | `lounge/mod.rs`, `sender.rs` | **#41: no golden transcript.** Every fixture is one we invented |
 | `lounge::to_event` | T0 | `lounge::mod` units | **tested and unreachable** — no runtime caller. Inflates apparent DIAL coverage |
 | SponsorBlock lookup / filter / plan | T0 | `sponsorblock`, incl. the `Decision` machine | fixtures are ours, not captured API responses |
 | SponsorBlock Lounge payload + clock | T0 | `app/src/sponsorblock/mod.rs`, against real captured payloads | these **do** run |
-| SponsorBlock actor (long poll, UTF-8 boundaries, lookup HTTP) | **NONE in CI** | `actor.rs` `#[cfg(feature = "electron")]` | the three `decodable_prefix` tests exist because a desync is *permanent and silent*, and they have never executed |
+| SponsorBlock actor (UTF-8 boundaries) | **T0, runs by default** | `actor.rs::tests`, and the module carries no feature gate at all | the three `decodable_prefix` tests exist because a desync is *permanent and silent*; verified executing and passing at `ccb380e`. The **long poll and the lookup HTTP** around them are still untested — that half of the row stands |
 | Real YouTube playback | **T4 opt-in** | `nix run .#yt-selfplay` | not a check; needs real internet. Last recorded run **2026-07-26 against the pre-D36 CEF build that no longer exists**. Oracle is the page's own `currentTime`, not pixels |
 | `skip_ads` live press | **T4, never observed** | unit-tested against a captured ad payload | YouTube served an unskippable pre-roll during capture |
 
@@ -703,7 +703,7 @@ a non-conformant endpoint, and a real phone's UDC retransmit timing and instance
 | `/cancel` | **NONE** | — | no unit test, no socket test, unreachable in the VM (only called after a successful launch) |
 | App chooser (D38) | T0 screens only | `shell_nav.rs` | navigation never talks to any host; and these are `render`-gated (§3.1) |
 | GFE fork | T0+T3 (Sunshine side) | `nvhttp.rs`; VM `sunshine=true` | **T4/NONE for GFE, permanently** — discontinued NVIDIA software needing a Windows host. Worth recording in notes §6 as a permanent T4, not a backlog item |
-| moonlight-sys link / ABI | **NONE in CI** | `links_moonlight.rs` is `#![cfg(feature = "stream")]` | never compiled (§3.1). The bindgen size/offset asserts are **self-referential** — bindgen generated both struct and assertion from the same header, so they catch a hand-edit, never upstream drift. And `lib.rs:10`/`bindings.rs:5` both reference a **`moonlight-bindings` flake check that does not exist** |
+| moonlight-sys link / ABI | **T1, runs in `checks.test`** | `links_moonlight.rs` is `#![cfg(feature = "stream")]`, and `stream` is default since D55 | its four tests observed passing at `ccb380e`, and `checks.moonlight-bindings` exists now too. What does **not** change: the bindgen size/offset asserts are **self-referential** — bindgen generated both struct and assertion from the same header, so they catch a hand-edit, never upstream drift |
 | RTSP, ENet, video+FEC, Opus audio, A/V pacing, input, teardown | **NONE** | — | linked C, never executed. **FEC recovery under loss and A/V pacing under jitter are the two properties D37 names as the reason for linking**, and nothing induces loss anywhere in this tree. Input is not implemented at all (**#167**) |
 
 **Extending the Sunshine VM past `/launch` is tractable and is the highest-value work here.**
@@ -790,7 +790,7 @@ The shared destination every protocol feeds. Measured at the audit, at `37db8a7`
 | Device-vanish retry (#55) | T0, **half** | `a_box_with_no_device_still_drains_its_sources_in_real_time` | the factory refuses *forever*; **the recovery half has no test**, and #55 asks for exactly that |
 | LDAC / aptX / SBC / ALAC decode | **T0 signal** | `ldac_decode.rs`, `audio_decode.rs` | see §4.3 for the per-codec weaknesses |
 | Real audio device | **T2** | `mixer_real_device.rs`, `checks.mixer-vm` | `snd-dummy` in a VM: an independent clock, no analogue output. `starved`, `shed` and emission rate are all asserted (#204) |
-| cpal / ALSA / WASAPI backend | **NONE in CI** | — | `audio-out` is **not even compiled** by `nix flake check` on Linux; only the Windows DLL-closure check touches it |
+| cpal / ALSA / WASAPI backend | **NONE in CI** | — | still NONE, but `audio-out` is default since D55 and every check now compiles it. No check opens a cpal device: the Windows DLL-closure check links one, and `checks.mixer-vm` reaches a real card down the `audio-pipewire` path instead |
 | `/screenshot.png` | T1, content untested | `tap::tests` | asserts three bytes (§3.5) |
 | fMP4/HLS boxing | **T0, runs by default** | `fmp4`, `hls`, `cadence`, `timeline`, `feed` | self-consistency against the test module's own naive `find_box`. **`hls.rs` never calls `push_audio`** |
 | fMP4/HLS vs libavformat | T1, in `checks.test` | `tests/output_stream.rs` | dark on both counts at the audit (`stream`-gated, and skip-passing by design); `stream` is default since D55 and the skips now go through the #182 tripwires, so under `checks.test`'s lavapipe + `CASTAWAY_REQUIRE_GPU`/`_FFMPEG` a missing adapter or encoder fails rather than passes |
