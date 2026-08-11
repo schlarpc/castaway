@@ -49,6 +49,10 @@ const WARMUP: Duration = Duration::from_millis(1500);
 const WINDOW: Duration = Duration::from_millis(3000);
 /// -80 dBFS. Audible to the assertion, not to the room.
 const AMPLITUDE: f32 = 1e-4;
+/// The share of its source's rate the mixer must accept, and — as its complement — how
+/// much starvation the measurement can absorb before it stops being about the mixer at
+/// all. One constant because the two are the same tolerance seen from either end (#337).
+const ACCEPT_FLOOR: f64 = 0.97;
 
 #[test]
 #[ignore = "needs a real PipeWire sink"]
@@ -85,8 +89,9 @@ fn a_44_1k_source_is_drained_in_real_time_by_a_real_device() {
         "accepted {rate:.0} frames/s of {SOURCE_RATE} ({:.1}%); {window:?}",
         share * 100.0
     );
+    the_source_was_never_found_empty(&window);
     assert!(
-        share > 0.97,
+        share > ACCEPT_FLOOR,
         "the input accepted {rate:.0} frames/s of a {SOURCE_RATE} Hz source ({:.1}%); \
          a live sender cannot be slowed down, so its queue fills at the difference and \
          then never drains again — a permanent drop rate and a permanent latency floor",
@@ -94,6 +99,45 @@ fn a_44_1k_source_is_drained_in_real_time_by_a_real_device() {
     );
     invented_is_negligible(&window);
     emission_is_real_time(&window, elapsed);
+}
+
+/// Fail unless the mixer always had something to take from this source (#337).
+///
+/// The premise the accept-rate assertion rests on, checked separately so a box that could
+/// not keep a saturating loop fed says *that* rather than reporting a mixer defect. The
+/// sibling test below has had this since it was written — its producer keeps a schedule,
+/// so `offered` says whether it kept it — and the saturating loop has no schedule to keep,
+/// which is why it went without one for so long.
+///
+/// `starved` is what separates the two, and it separates them cleanly, because the two
+/// failures leave opposite marks on the ring. A mixer that will not drain leaves the ring
+/// *full*: `write` blocks, the accept rate falls, and `starved` stays at zero — the reading
+/// this assertion is for. A source that cannot keep up leaves it *empty*: the mixer's
+/// backstop finds nothing mid-stream, and `starved` counts every frame of it.
+///
+/// The bound is the accept floor's own tolerance rather than a new number. Starvation is
+/// time the mixer had no input to take, so it lands on the accept rate roughly
+/// one-for-one; admitting more of it than the floor allows would let the premise pass a
+/// measurement it had already explained.
+///
+/// Not hypothetical, and not only a CI concern: against this box's real PipeWire sink,
+/// idle, two consecutive runs read 95.9% with `starved: 4320` and 98.4% with
+/// `starved: 2400` — one either side of the floor, with the starvation tracking the
+/// shortfall. The first used to fail as "the input accepted 42300 frames/s … a permanent
+/// drop rate and a permanent latency floor", which is a diagnosis of the wrong component.
+fn the_source_was_never_found_empty(window: &MixerCounters) {
+    #[allow(clippy::cast_precision_loss)]
+    let starved = window.starved as f64 / f64::from(RATE);
+    let share = starved / WINDOW.as_secs_f64();
+    assert!(
+        share < 1.0 - ACCEPT_FLOOR,
+        "the mixer found this source empty for {starved:.3}s of a {:.1}s window ({:.1}%), so \
+         the box could not keep a saturating loop ahead of the mix and the accept rate below \
+         measures that. This box cannot take this measurement; it is not a defect in the \
+         mixer. {window:?}",
+        WINDOW.as_secs_f64(),
+        share * 100.0,
+    );
 }
 
 /// The share of the device's frames the mixer made up, asserted rather than inferred.
