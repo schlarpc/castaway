@@ -52,11 +52,25 @@ echo "::endgroup::"
 sampler=$!
 trap 'kill "$sampler" 2>/dev/null || true' EXIT
 
-# `raw` rather than the default progress bar: on a non-tty the bar re-emits its whole
-# pending-builds list on every update, which is why a single job produced a 57 MB log —
-# 495k lines, most of them the same line — and why GitHub truncated it 48 minutes before
-# the job actually ended, taking the failure with it.
-nix build "${pacing[@]}" --log-format raw --print-build-logs "$@"
+# Not the default progress bar: on a non-tty the bar re-emits its whole pending-builds
+# list on every update, which is why a single job produced a 57 MB log — 495k lines, most
+# of them the same line — and why GitHub truncated it 48 minutes before the job actually
+# ended, taking the failure with it.
+#
+# But the first attempt at that, `--log-format raw --print-build-logs`, threw away the
+# other half: `raw` is the logger *without* build logs, and `--print-build-logs` cannot
+# turn them back on — the flag is ignored whichever side of `--log-format` it sits on.
+# So no derivation's output ever reached the step log, and every failure arrived as nix's
+# quoted 25-line tail with the root error scrolled off the top of it. That cost a real
+# investigation: `can't find crate for pipeline` is impossible on its own terms, and the
+# actual cause (`E0433: cannot find module or crate 'rtc'`) was only found in a *different*
+# job's log, where it happened to land inside that job's 25 lines (#332).
+#
+# Measured against Determinate Nix 3.17.3, building a derivation that prints 100 lines and
+# exits 1 — chatter lines reaching the caller: `raw --print-build-logs` 0, `raw-with-logs`
+# 100, `bar-with-logs` 100, `--print-build-logs` alone 100. `raw-with-logs` is the one that
+# both streams and has no bar to re-emit.
+nix build "${pacing[@]}" --log-format raw-with-logs "$@"
 status=$?
 
 kill "$sampler" 2>/dev/null || true
