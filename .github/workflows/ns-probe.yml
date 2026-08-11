@@ -46,4 +46,22 @@ jobs:
           nix config show | grep -E '^(sandbox|extra-sandbox-paths|sandbox-paths|system-features) ' || true
           echo "::endgroup::"
       - name: The same operations, inside a nix build sandbox
-        run: nix build --impure --no-link -f .github/scripts/ns-probe.nix
+        # `raw-with-logs`, or the derivation's output does not reach this log at all — the
+        # first run of this probe printed nothing from inside the sandbox for exactly the
+        # reason #332 was filed about.
+        run: nix build --impure --no-link --log-format raw-with-logs -f .github/scripts/ns-probe.nix
+
+      # Round one said the runner refuses `unshare --user` *outside* nix as readily as
+      # inside it, and named the reason: Ubuntu 24.04 ships
+      # `kernel.apparmor_restrict_unprivileged_userns=1`, which lets the namespace be
+      # created and then denies the uid_map write. Does turning it off restore the whole
+      # sequence android-cast needs, on the runner, inside the sandbox?
+      - name: Same again, with AppArmor's userns restriction lifted
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          echo "::group::host unshare, restriction lifted"
+          unshare --user --map-root-user --net -- true \
+            && echo "host unshare OK" || echo "host unshare STILL FAILS rc=$?"
+          echo "::endgroup::"
+          nix build --impure --no-link --rebuild --log-format raw-with-logs \
+            -f .github/scripts/ns-probe.nix
