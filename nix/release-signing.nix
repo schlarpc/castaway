@@ -2,8 +2,9 @@
 #
 # Two independent signatures, and they answer different questions:
 #
-#   * the **release manifest** (#343), minisign over `manifest.json`, which is what tells
-#     the panel that an offered release is genuine and newer than the one it is running;
+#   * the **release manifest** (#343), which carries the build number that tells the panel
+#     an offered release is *newer* than the one it is running — authenticated not by a
+#     signature of its own but by GitHub's build provenance over it (D59);
 #   * **Authenticode + castLabs VMP** on the Windows artifact (#344), which is what tells
 #     *Windows* the .exe is not anonymous and tells *Widevine* that the media path is
 #     verified.
@@ -28,16 +29,13 @@
 # monotonic build number is the ordering, and the signature is what stops the ordering
 # from being rewritten in transit.
 #
-# The tool is minisign rather than something of ours (ground rule 9's spirit: the
-# artefact should be inspectable without our code). `minisign -Vm manifest.json -p
-# crates/update/release-key.pub` verifies a release from any machine with minisign on it.
+# Neither signature is one of ours, which is the point (ground rule 9's spirit: the artefact
+# should be inspectable without our code). `gh attestation verify <artifact> --repo
+# schlarpc/castaway` checks the provenance from any machine with `gh` on it, and
+# `osslsigncode verify` reads the Authenticode signature.
 { pkgs }:
 
 let
-  # Where the receiver reads the public half from. One string, so the keygen writes to
-  # exactly the path `include_str!` reads.
-  publicKeyPath = "crates/update/release-key.pub";
-
   # The Authenticode certificate, public half. Checked in for two readers: the box, which
   # imports it into its trust store once (#346), and CI, which verifies its own output
   # against it — a different claim from verifying against the key it just signed with,
@@ -49,9 +47,7 @@ let
   # answer is a positive match on the payload's own marker rather than "not a comment":
   # a stub that reads as a key is how a release ships looking signed.
   #
-  # Every minisign public key begins `RW` — the base64 of the format's `Ed` tag — and
   # PEM says what it is on the tin.
-  hasKey = path: ''[ -f "${path}" ] && grep -q '^RW' "${path}"'';
   hasCert = path: ''[ -f "${path}" ] && grep -q 'BEGIN CERTIFICATE' "${path}"'';
 
   # `nix run .#windows-authenticode -- <exe>...` — sign each in place.
@@ -150,17 +146,18 @@ in
 {
   # `nix run .#release-manifest -- <zip> <commit-sha> <build-number> <outdir>`
   #
-  # Writes `<outdir>/manifest.json` and `<outdir>/manifest.json.minisig`. The secret key
-  # arrives in `CASTAWAY_RELEASE_SECRET_KEY` as the literal contents of a minisign secret
-  # key file — the shape a GitHub Actions secret holds — and is written to a private temp
-  # file because minisign takes a path, never a value.
+  # Writes `<outdir>/manifest.json`, and nothing else. It carries no signature of its own
+  # any more: `release.yml` attests it with `actions/attest-build-provenance`, and the
+  # receiver verifies *that* — a Sigstore bundle signed by a certificate bound to the
+  # workflow identity, with no secret in the repository for anyone to steal (D59).
   #
-  # Refuses to write an unsigned manifest. An unsigned manifest is not a weaker manifest,
-  # it is a file the receiver ignores entirely, and shipping one would make "the release
-  # carries a manifest" true while the property it exists for is false.
+  # So the manifest is authenticated by something outside itself, which is why this script
+  # no longer refuses to run without a key: there is no key. What the file still does is
+  # the part a signature never did — carry the monotonic build number that *orders* two
+  # releases, and the digest that binds the artifact to it.
   manifest = pkgs.writeShellApplication {
     name = "castaway-release-manifest";
-    runtimeInputs = [ pkgs.minisign pkgs.jq pkgs.coreutils pkgs.gnugrep ];
+    runtimeInputs = [ pkgs.jq pkgs.coreutils pkgs.gnugrep ];
     text = ''
       zip="''${1:?usage: castaway-release-manifest <zip> <commit-sha> <build-number> <outdir>}"
       commit="''${2:?commit sha}"
@@ -183,14 +180,6 @@ in
         exit 1
       fi
 
-      if [ -z "''${CASTAWAY_RELEASE_SECRET_KEY:-}" ]; then
-        echo "CASTAWAY_RELEASE_SECRET_KEY is unset: no release signing key." >&2
-        echo "Generate one with 'nix run .#release-keygen' and put the secret half in" >&2
-        echo "the repository's RELEASE_SIGNING_KEY Actions secret. Refusing to write an" >&2
-        echo "unsigned manifest, which the receiver would ignore anyway." >&2
-        exit 1
-      fi
-
       mkdir -p "$outdir"
       name=$(basename "$zip")
       sha=$(sha256sum "$zip" | cut -d' ' -f1)
@@ -208,77 +197,7 @@ in
         '{schema: $schema, commit: $commit, build: $build, artifact: $artifact, sha256: $sha256, size: $size}' \
         > "$outdir/manifest.json"
 
-      key=$(mktemp)
-      trap 'rm -f "$key"' EXIT
-      chmod 600 "$key"
-      printf '%s\n' "$CASTAWAY_RELEASE_SECRET_KEY" > "$key"
-
-      # The trusted comment is the one string in the exchange an attacker cannot write,
-      # so it says what the receiver would most want to read back in a log line.
-      minisign -S -m "$outdir/manifest.json" -s "$key" \
-        -c 'castaway release manifest' \
-        -t "castaway build $build $commit"
-
-      # Verify what we just produced against the public half the *receiver* carries, not
-      # against the secret we just used. That is a different claim: it catches a secret
-      # rotated without the tree being updated, which would otherwise ship releases no
-      # panel can install and look entirely healthy from here.
-      #
-      # The path is overridable because it is otherwise relative to the caller's working
-      # directory, which is the repository root in CI and a sandbox in a check — and a
-      # check that silently took the "no key here" branch would be asserting nothing
-      # about the half of this that matters.
-      pubkey="''${CASTAWAY_RELEASE_PUBKEY:-${publicKeyPath}}"
-      if ${hasKey "$pubkey"}; then
-        minisign -V -m "$outdir/manifest.json" -p "$pubkey" -q \
-          || { echo "the manifest does not verify against $pubkey:" >&2
-               echo "the signing secret and the key compiled into the receiver disagree." >&2
-               exit 1; }
-      else
-        echo "warning: $pubkey carries no key, so the signature was not checked" >&2
-        echo "against what the receiver trusts. Run 'nix run .#release-keygen'." >&2
-      fi
-
       echo "manifest: build $build, $name ($size bytes, sha256 $sha)"
-    '';
-  };
-
-  # `nix run .#release-keygen` — once, by hand, on a machine the operator trusts.
-  #
-  # Writes the public half into the tree (commit it) and prints the secret half for the
-  # Actions secret. The secret is printed rather than written anywhere: a file is a thing
-  # that gets committed by accident, and this one only ever needs to be pasted once.
-  keygen = pkgs.writeShellApplication {
-    name = "castaway-release-keygen";
-    runtimeInputs = [ pkgs.minisign pkgs.coreutils pkgs.gnugrep ];
-    text = ''
-      out="''${1:-${publicKeyPath}}"
-      if ${hasKey "$out"}; then
-        echo "$out already carries a key." >&2
-        echo >&2
-        echo "Replacing it makes every panel running an older build refuse every future" >&2
-        echo "release, because the key it was compiled with no longer signs anything." >&2
-        echo "Rotation is therefore a deploy, not a keygen: generate elsewhere, commit," >&2
-        echo "ship that build to the panel by hand, and only then switch the secret." >&2
-        exit 1
-      fi
-
-      secret=$(mktemp)
-      trap 'rm -f "$secret"' EXIT
-      # `-W` for an unencrypted secret key: CI cannot type a passphrase, and a passphrase
-      # stored beside the key it protects protects nothing.
-      minisign -G -W -p "$out" -s "$secret" \
-        -c 'castaway release signing key (#343)' >/dev/null
-
-      echo "wrote the public half to $out — commit it."
-      echo
-      echo "Put this in the repository's RELEASE_SIGNING_KEY Actions secret, whole,"
-      echo "both lines. It does not need to be kept anywhere else: losing it costs one"
-      echo "keygen and one hand-deployed build, and having it stolen costs a panel."
-      echo
-      cat "$secret"
-      echo
-      echo "Then: gh secret set RELEASE_SIGNING_KEY < the-file-you-pasted-it-into"
     '';
   };
 

@@ -656,12 +656,11 @@
 
           castaway = self.packages.${system}.default;
 
-          # Signing a release, and making the key that signs it (#343). Both halves of
-          # one key, so they live in one file: `release-keygen` runs once by hand and
-          # writes the public half into the tree; `release-manifest` runs in CI on every
-          # push and refuses to produce an unsigned manifest.
+          # The manifest every release carries (#343): the build number that orders it
+          # against what a panel is running, and the digest that binds the artifact. It
+          # carries no signature of its own — GitHub's build provenance over it is what
+          # authenticates it (D59).
           release-manifest = releaseSigning.manifest;
-          release-keygen = releaseSigning.keygen;
 
           # Authenticode + castLabs VMP over the Windows artifact (#344), so the release
           # asset arrives complete and the panel holds no credentials. Without it the
@@ -1003,36 +1002,24 @@
           # by regenerating the crate's fixtures with the real script and the checked-in
           # test key, and demanding they come back byte-identical.
           #
-          # Byte-identical is available because Ed25519 signing is deterministic (RFC
-          # 8032) and minisign does not salt: the same key over the same bytes always
-          # produces the same signature. So this also pins the *signature format* — a
-          # minisign that switched back from `ED` to `Ed`, or changed its base64 layout,
-          # fails here rather than on the panel.
-          #
-          # If it fails because the format changed on purpose: run the same command the
-          # check runs and copy the three outputs over `crates/update/fixtures/`.
+          # The manifest carries no signature of its own any more (D59) — GitHub's build
+          # provenance over it is what the receiver checks — so what this pins is the JSON
+          # itself: field names, ordering, and the exact rendering of every value.
           release-manifest = pkgs.runCommand "release-manifest-fixtures"
             {
               nativeBuildInputs = [ self.packages.${system}.release-manifest pkgs.diffutils ];
               meta.description = "The manifest release.yml writes round-trips through castaway-update's fixtures";
             } ''
             fixtures=${./crates/update/fixtures}
-            export CASTAWAY_RELEASE_SECRET_KEY="$(cat "$fixtures/test-release.key")"
-            # Point the script's own verification at the fixture's public half, so the
-            # "does this signature check out against what the receiver trusts" branch is
-            # exercised rather than skipped. Without it the check would silently take the
-            # no-key path and assert nothing about the half that matters.
-            export CASTAWAY_RELEASE_PUBKEY="$fixtures/test-release.pub"
             castaway-release-manifest \
               "$fixtures/castaway-windows-electron-ae2f19e.zip" \
               ae2f19ef1f9d9a2488008f1075b252178ae7ef85 935 out
 
-            for f in manifest.json manifest.json.minisig; do
-              diff -u "$fixtures/$f" "out/$f" || {
-                echo "crates/update/fixtures/$f is not what the release script writes." >&2
-                exit 1
-              }
-            done
+            diff -u "$fixtures/manifest.json" out/manifest.json || {
+              echo "crates/update/fixtures/manifest.json is not what the release script" >&2
+              echo "writes. Copy out/manifest.json over it if the change was deliberate." >&2
+              exit 1
+            }
             echo "the release script and crates/update agree byte for byte" > "$out"
           '';
 

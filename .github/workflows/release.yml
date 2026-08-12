@@ -25,13 +25,16 @@ name: Release
 # downloadable for a panel-side bisect. It also means Latest can sit several commits
 # behind the tip, and that is the honest reading rather than a defect.
 #
-# Since #343 each release also carries `manifest.json` and its detached minisign
-# signature. The panel follows Latest unattended, and two things it cannot work out for
-# itself live there: whether the release is *newer* than the one running (a sha
-# identifies a tree, it does not order two of them) and whether the bytes are the ones
-# this repository built (TLS authenticates the host, not the artifact). The threat model
-# is stated honestly in `crates/update/src/lib.rs`: this defends the CDN and mitm path,
-# not a compromise of the account that holds the signing secret.
+# Since #343 each release also carries `manifest.json`, and since D59 that manifest is
+# authenticated by GitHub's own build provenance rather than by a signature of ours. The
+# panel follows Latest unattended, and two things it cannot work out for itself live in
+# that file: whether the release is *newer* than the one running (a sha identifies a tree,
+# it does not order two of them) and whether the bytes are the ones this repository built
+# (TLS authenticates the host, not the artifact).
+#
+# The provenance is the stronger half of that, and it is why there is no signing secret
+# here any more: forging it requires a visible commit to *this file* on this repository,
+# rather than reading a secret any workflow could have read.
 on:
   push:
     branches: [main]
@@ -44,8 +47,6 @@ jobs:
     # a repository that has no castLabs account, and a step-scoped variable would be
     # invisible to it.
     env:
-      # The minisign secret key, whole, as `release-keygen` printed it (#343).
-      CASTAWAY_RELEASE_SECRET_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       # The Authenticode certificate, base64 of a PKCS#12, and its password (#344).
       CASTAWAY_CODESIGN_PFX: ${{ secrets.WINDOWS_CODESIGN_PFX }}
       CASTAWAY_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
@@ -126,25 +127,19 @@ jobs:
           fi
           assets=("$zip")
 
-          # The signed manifest an unattended panel needs (#343): the build number that
-          # orders this release against the one already installed, the zip's digest, and
-          # an ed25519 signature over both. Detached rather than embedded, so
-          # `minisign -Vm manifest.json -p crates/update/release-key.pub` inspects a
-          # release with none of our code involved.
-          if [ -n "${CASTAWAY_RELEASE_SECRET_KEY:-}" ]; then
-            build=$(git rev-list --count "$GITHUB_SHA")
-            nix run '.#release-manifest' -- "$zip" "$GITHUB_SHA" "$build" .
-            assets+=(manifest.json manifest.json.minisig)
-          else
-            # Loud, and not fatal. A release with no manifest is exactly what every
-            # release was before #343 — downloadable, deployable by hand, and invisible
-            # to the auto-updater, which refuses an unsigned one. Failing the job instead
-            # would make `main` unbuildable on a repository that has simply not had its
-            # key generated yet, which is a worse trade than a red annotation.
-            echo "::error::no RELEASE_SIGNING_KEY secret, so this release carries no" \
-                 "signed manifest and no panel will auto-update to it. Generate the key" \
-                 "with 'nix run .#release-keygen' and set the secret (#343)."
-          fi
+          # The manifest an unattended panel needs (#343): the monotonic build number that
+          # orders this release against the one already installed, and the zip's digest and
+          # size. Unconditional, and carrying no signature of its own — the attestation
+          # step below covers it, and that is what the receiver verifies (D59).
+          #
+          # It matters that this is the *small* file. Attestations are keyed by artifact
+          # digest, so a panel that verified the zip directly would have to download 250 MB
+          # before it could ask whether the bytes were genuine, with nothing trustworthy to
+          # bound the download by. Verifying the 240-byte manifest first yields the digest
+          # and the size, and the zip is then fetched against both.
+          build=$(git rev-list --count "$GITHUB_SHA")
+          nix run '.#release-manifest' -- "$zip" "$GITHUB_SHA" "$build" .
+          assets+=(manifest.json)
 
           # Handed to the next two steps as one line, because the attestation has to cover
           # exactly the bytes the release will carry — naming them twice is how the two
