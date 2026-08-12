@@ -2476,38 +2476,50 @@ it sets, so that is where the check earns its keep. The chain is attestation →
 → the zip's SHA-256 → the artifact, which is why the small file is the one verified: the
 manifest names the digest, and the receiver checks that digest when it downloads.
 
-**The receiver does not verify the attestation, and the reason is one line of somebody
-else's `Cargo.toml`:**
+**The receiver does not verify the attestation *yet*, and — this is the important part —
+not for any of the three reasons first advanced against it.** All three were measurement
+errors, and they are written down here because they are exactly the objections that will be
+raised again:
 
-```toml
-[target.'cfg(not(target_arch = "powerpc64"))'.dependencies.aws-lc-rs]
-version = "1"
-```
+1. *"It links 326 packages."* Measured badly and against the wrong baseline. `cargo tree`
+   marks repeated subtrees `(*)`, so `sort -u` counted `hyper v1.11.0` and
+   `hyper v1.11.0 (*)` as two packages; and the comparison was against `castaway-update`
+   alone rather than against the application. Corrected: **35 new packages on top of the
+   572 the app already links**, and `reqwest`/`hyper` are not among them, because webrtc
+   and axum already carry both.
+2. *"Sigstore's TUF trust root rotates, so a stale embedded copy fails closed."* True and
+   nearly irrelevant. The trusted root is *cumulative* — old keys stay with validity
+   windows precisely so old signatures keep verifying — so elapsed time alone never
+   invalidates anything. And the panel is online by definition when it updates: refreshing
+   the root is the same class of dependency as the release fetch it is already making, with
+   the same benign failure ("no update tonight, try tomorrow"). It is also the tradeoff the
+   minisign key *already* has, since that public half is compiled in and rotating it is a
+   hand deploy either way.
+3. *"`aws-lc-sys` will not cross-build."* Simply false, and the run that appeared to prove
+   it was self-inflicted: `env PATH="…:$PATH"` expanded in the outer shell and clobbered the
+   dev shell's own PATH, so `llvm-lib` "disappeared" and a `No such file or directory` was
+   read as a toolchain limitation. Measured properly, `aws-lc-sys` 0.44 cross-compiles to
+   `x86_64-pc-windows-msvc` from Linux through this tree's own sysroot **with neither cmake
+   nor NASM on PATH** — it takes its `cc_builder` path with the prebuilt NASM objects the
+   crate ships — producing a real 13.8 MB `aws_lc_0_44_0_crypto.lib` in 24 seconds for the
+   whole 232-crate graph.
 
-`sigstore` 0.14 depends on `aws-lc-rs` unconditionally — not optional, not feature-gated,
-and `cert = ["rustls-webpki/aws-lc-rs"]` wires the same provider into the one feature a
-verifier needs. So there is no feature combination that reaches it through `ring`, and
-putting it on the panel means building `aws-lc-sys` — C, cmake, and NASM for x86-64 Windows
-assembly — through the hand-rolled clang-cl/lld-link MSVC sysroot. The workspace pins `ring`
-everywhere for exactly this reason, in a comment that names this exact scenario. Everything
-else about the crate is fine: it cross-compiles, it verifies offline (`offline: bool` is a
-parameter), `Verifier::new` takes any `TrustRoot` so the trust root can be embedded, and it
-adds 35 packages to an application that already links 572. The blocker is the C library, and
-nothing else.
+So `sigstore` 0.14 *is* usable here. What it costs, honestly: 35 packages, ~14 MB of static
+library, and a second crypto provider compiled into `rustls` alongside `ring` — because
+`sigstore` depends on `aws-lc-rs` unconditionally (not optional, not feature-gated, and
+`cert = ["rustls-webpki/aws-lc-rs"]` wires it into the one feature a verifier needs), so
+feature unification lands both. The workspace's `ring` pin was written to keep a second C
+crypto build out of the cross-toolchain; that cost turns out to be affordable, and the pin's
+remaining force is about audit surface rather than buildability.
 
-**Two objections raised against keyless during the design were wrong, and are recorded
-because they are the ones that will be raised again.** The first was package weight: measured
-badly (`cargo tree` marks repeated subtrees `(*)`, which `sort -u` counts twice) and measured
-against the wrong baseline (`castaway-update` alone rather than the application). Corrected,
-it is 35 new packages, and `reqwest`/`hyper` are not among them because the app already
-carries both. The second was that Sigstore's TUF trust root rotates and a stale embedded copy
-fails closed. That is true and almost irrelevant: the trusted root is *cumulative*, so time
-alone never invalidates anything, and the panel is by definition online when it updates —
-refreshing the root is the same class of dependency as the release fetch it is already making,
-with the same benign failure ("no update tonight"). It is also the tradeoff the minisign key
-already has, since that public half is compiled in too and rotating it is a hand deploy.
+Everything else about the crate suits this use: `offline: bool` is a parameter on
+`verify_digest`, and `Verifier::new` takes any `TrustRoot`, so the trust root can be embedded
+exactly the way `release-key.pub` is today.
 
-What remains open is whether the panel keeps a signature check of its own at all. The honest
+What remains open, therefore, is a straight choice rather than a constraint: whether the
+panel verifies the Sigstore bundle itself (35 packages, ~14 MB, a second crypto provider) or
+keeps the small minisign check and leans on `promote`'s gate. What remains open alongside it
+is whether the panel keeps a signature check of its own at all. The honest
 reading of the current one is that it is thin: `RELEASE_SIGNING_KEY` is readable by any
 workflow in this repository, so it does not defend against the attacker who motivates
 signing — someone with write access swapping a release asset — and against a network attacker
