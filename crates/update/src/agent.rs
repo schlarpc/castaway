@@ -745,6 +745,7 @@ fn unzip_stripping_top_level(zip: &Path, into: &Path) -> Result<(), UpdateError>
         source,
     })?;
 
+    let mut wrapper: Option<std::ffi::OsString> = None;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(UpdateError::Zip)?;
         let Some(name) = entry.enclosed_name() else {
@@ -752,10 +753,21 @@ fn unzip_stripping_top_level(zip: &Path, into: &Path) -> Result<(), UpdateError>
                 name: entry.name().to_owned(),
             });
         };
-        // Drop the wrapper directory. An archive whose entries are not all under one is
-        // not the archive this receiver knows how to install.
+        // Drop the wrapper directory — and check there is exactly one of it. An archive
+        // whose entries are not all under a single top level is not the archive this
+        // receiver knows how to install, and merging two of them would produce a tree that
+        // is neither.
         let mut parts = name.components();
-        let Some(_top) = parts.next() else { continue };
+        let Some(top) = parts.next() else { continue };
+        match &wrapper {
+            None => wrapper = Some(top.as_os_str().to_owned()),
+            Some(first) if first == top.as_os_str() => {}
+            Some(_) => {
+                return Err(UpdateError::HostileEntry {
+                    name: entry.name().to_owned(),
+                })
+            }
+        }
         let relative: PathBuf = parts.collect();
         if relative.as_os_str().is_empty() {
             continue;
