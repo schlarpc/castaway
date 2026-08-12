@@ -19,5 +19,19 @@ base64.workspace = true
 # The artifact digest the manifest carries.
 sha2.workspace = true
 
+# --- the agent: the I/O half (#345) ---
+# The install tree the launcher and this both write into.
+castaway-paths.workspace = true
+tracing.workspace = true
+# Blocking HTTP, driven from `spawn_blocking` exactly as `proto-dlna`'s probe and
+# `proto-fcast`'s playlist fetch are: the download is minutes long and must not sit on the
+# runtime.
+ureq.workspace = true
+# The release artifact is a zip (nix/windows.nix `mkArchive`, Info-ZIP deflate).
+# `default-features = false` and deflate only: the full default set drags bzip2, lzma and
+# zstd — three C libraries — into a cross-build that has no need of any of them.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+
 [lints]
 workspace = true

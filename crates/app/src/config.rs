@@ -76,6 +76,9 @@ pub struct Config {
     /// is −30 dBFS. See [`default_initial_volume`] for why the default is what it is.
     #[serde(default = "default_initial_volume")]
     pub initial_volume: f32,
+    /// Replacing this build with a newer one, unattended (#345).
+    #[serde(default)]
+    pub update: Update,
     /// The remote-control web UI (#18).
     #[serde(default)]
     pub remote: Remote,
@@ -833,6 +836,102 @@ impl Config {
     }
 }
 
+/// Auto-update: following the release the whole test matrix vouched for, at night, when
+/// nobody is using the panel (#345).
+///
+/// On by default, and switchable here at runtime rather than at compile time (D55): a
+/// receiver built without an updater is code nothing compiles and nothing tests, and the
+/// question "should this panel update itself" is an operational one that deserves an
+/// answer an operator can change.
+///
+/// Turning it off is not the only way it stands down, and the others need no config at
+/// all: a build from a dirty tree, a `hold` file at the install root, an install that is
+/// not under a launcher, and a build with no release signing key each disarm it with a
+/// line in the log. Those are the states where updating would be wrong rather than
+/// unwanted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Update {
+    /// Whether to look at all.
+    pub enable: bool,
+    /// The release API root.
+    ///
+    /// Overridable so a test harness can impersonate GitHub — which is what makes the
+    /// whole loop drivable in a VM with no network. Pointing it at something hostile buys
+    /// nothing: the manifest's signature is checked against a key compiled into this
+    /// binary, so a different server can withhold an update but cannot supply one.
+    pub base_url: String,
+    /// Which repository's releases to follow, `owner/name`.
+    pub repository: String,
+    /// When updating is allowed at all, `HH:MM` on the panel's own local clock.
+    pub window_start: String,
+    /// When it stops being allowed. May be earlier than the start, which means a window
+    /// that crosses midnight.
+    pub window_end: String,
+    /// How many minutes the panel must have gone untouched before a restart is
+    /// acceptable. A cast in progress blocks it regardless — a film playing to an empty
+    /// room touches no input device for two hours.
+    pub idle_minutes: u16,
+    /// How long after startup to call this build healthy, once every enabled adapter is
+    /// bound and advertising.
+    ///
+    /// The marker this writes is what the launcher's rollback rule reads: a version that
+    /// has written it once is never rolled back, because its later crashes are a bad
+    /// night rather than bad bits. So the delay is a claim about *this build being sound*,
+    /// and five minutes is long enough to have survived first contact with the display,
+    /// the browser and the radios.
+    pub healthy_after_minutes: u16,
+}
+
+impl Default for Update {
+    fn default() -> Self {
+        let policy = castaway_update::policy::Policy::default();
+        Self {
+            enable: true,
+            base_url: "https://api.github.com".to_string(),
+            repository: "schlarpc/castaway".to_string(),
+            // Rendered from the policy's own defaults rather than typed again here, so
+            // the file schema and the shipped schedule cannot say different things.
+            window_start: policy.window.start().to_string(),
+            window_end: policy.window.end().to_string(),
+            idle_minutes: u16::try_from(policy.idle_after.as_secs() / 60).unwrap_or(15),
+            healthy_after_minutes: 5,
+        }
+    }
+}
+
+impl Update {
+    /// The schedule, as the updater's policy type.
+    ///
+    /// # Errors
+    /// Whatever [`castaway_update::policy::MinuteOfDay::parse`] says about a window
+    /// bound, or [`castaway_update::policy::PolicyError::EmptyWindow`] for two that are
+    /// the same minute. A refused schedule is a config error rather than a silent
+    /// fallback to the default: an operator who wrote `3:30` meant something by it, and
+    /// updating at an hour they did not choose is the failure to avoid.
+    pub fn policy(
+        &self,
+    ) -> Result<castaway_update::policy::Policy, castaway_update::policy::PolicyError> {
+        use castaway_update::policy::{MinuteOfDay, Policy, Window};
+        let start = MinuteOfDay::parse(&self.window_start)?;
+        let end = MinuteOfDay::parse(&self.window_end)?;
+        Ok(Policy {
+            window: Window::new(start, end)?,
+            idle_after: std::time::Duration::from_secs(u64::from(self.idle_minutes) * 60),
+            ..Policy::default()
+        })
+    }
+
+    /// Where releases come from.
+    #[must_use]
+    pub fn source(&self) -> castaway_update::agent::ReleaseSource {
+        castaway_update::agent::ReleaseSource {
+            base_url: self.base_url.clone(),
+            repository: self.repository.clone(),
+        }
+    }
+}
+
 /// The remote-control web UI: watching the panel, and driving it (#18).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -1162,6 +1261,7 @@ impl Default for Config {
             matter: Matter::default(),
             initial_volume: default_initial_volume(),
             remote: Remote::default(),
+            update: Update::default(),
             audio: Audio::default(),
         }
     }

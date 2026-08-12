@@ -17,6 +17,7 @@ mod screen;
 // The network-surface registry (#22/#30): every socket, as data, generating the doc,
 // the firewall JSON, and the --network-surface query.
 mod surface;
+mod update;
 // What the panel can change about itself, and how it persists. The types are always
 // compiled — the store's tests are the config-file contract, and they must run in the
 // build CI tests — but only the render build has screens to press them from, so the
@@ -89,7 +90,10 @@ fn main() -> anyhow::Result<()> {
     // read soundly while the process is single-threaded, which stops being true the
     // moment the runtime is built. A box that will not say (no tz database, exotic
     // container) decorates on UTC dates, which is what it did before it was asked.
-    #[cfg(feature = "render")]
+    //
+    // No longer render-only: the auto-updater's window is a local-clock window for the
+    // same reason the seasons are local dates — it is trying to avoid *people*, and
+    // people keep local hours (#345).
     let utc_offset_secs: i32 =
         time::UtcOffset::current_local_offset().map_or(0, time::UtcOffset::whole_seconds);
     // Resolved once, and handed to both the loader and the settings store: the file the
@@ -346,6 +350,9 @@ fn main() -> anyhow::Result<()> {
         // that can be driven off the glass — a Miracast source with UIBC — to the loop
         // that owns the glass (#125).
         let touch_surface = manager.touch_handle();
+        // Same rule, for the same structural reason: `run` consumes the manager, so the
+        // auto-updater's "is anybody using this panel" has to be taken now or never.
+        let casting = manager.casting_handle();
         runtime.spawn(manager.run(event_rx));
 
         // Cloned before the DIAL closure takes ownership: Matter's launches go to the
@@ -664,6 +671,18 @@ fn main() -> anyhow::Result<()> {
         // `cef_initialize`, silently replacing ours, so this had to come after it. The
         // browser owns its own signals now.
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, wake.clone(), remote);
+        // Armed after the session manager, because it needs that handle, and before the
+        // kiosk loop takes the main thread, because after that there is nowhere to spawn
+        // from. Returns the code the process ends on: zero, unless an update activates.
+        let activation_exit = update::spawn(
+            &runtime,
+            &config.update,
+            casting,
+            utc_offset_secs,
+            Arc::clone(&shutdown),
+            Arc::clone(&kiosk_exit),
+            wake.clone(),
+        );
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
         // What the panel paints first. It has no FCast QR yet — the identity is loaded on
@@ -708,6 +727,9 @@ fn main() -> anyhow::Result<()> {
         // served by waiting. One second lets short blocking work (a screenshot encode, a
         // DNS lookup) finish, then the process leaves and the OS reclaims the rest.
         runtime.shutdown_timeout(Duration::from_secs(1));
+        // Last, and only after the runtime is down: the launcher reads this to tell an
+        // update handing over from a receiver that fell over.
+        hand_over_if_updating(&activation_exit);
     }
 
     #[cfg(not(feature = "render"))]
@@ -738,6 +760,7 @@ fn main() -> anyhow::Result<()> {
         let manager = SessionManager::new(media_pipeline, Some(display), SessionConfig::default())
             .with_osd(osd.clone());
         let remote = manager.remote_handle();
+        let casting = manager.casting_handle();
         runtime.spawn(manager.run(event_rx));
         // Headless: no renderer, so drain the OSD channel to the log.
         std::thread::spawn(move || drain_osd_to_log(&osd_rx));
@@ -748,6 +771,15 @@ fn main() -> anyhow::Result<()> {
             &kiosk_exit,
             castaway_core::Waker::new(),
             remote,
+        );
+        let activation_exit = update::spawn(
+            &runtime,
+            &config.update,
+            casting,
+            utc_offset_secs,
+            Arc::clone(&shutdown),
+            Arc::clone(&kiosk_exit),
+            castaway_core::Waker::new(),
         );
         // Headless: no renderer at all, so certainly no browser to launch YouTube in.
         let on_dial: Option<NoLauncher> = None;
@@ -768,9 +800,23 @@ fn main() -> anyhow::Result<()> {
             PipelineHandles::default(),
             abandoned_rx,
         ))?;
+        hand_over_if_updating(&activation_exit);
     }
 
     Ok(())
+}
+
+/// Exit with the launcher's handshake code, if the updater set it.
+///
+/// A bare `std::process::exit` rather than a returned `ExitCode`, because this is the end
+/// of a receiver that has already shut everything down and because `main` returns
+/// `anyhow::Result<()>` — an update activating is not an error and must not be reported
+/// as one. Zero means nothing activated, and the ordinary path falls through.
+fn hand_over_if_updating(code: &std::sync::atomic::AtomicI32) {
+    let code = code.load(std::sync::atomic::Ordering::SeqCst);
+    if code != 0 {
+        std::process::exit(code);
+    }
 }
 
 /// A stable per-protocol device UUID, derived from the receiver's configured one.

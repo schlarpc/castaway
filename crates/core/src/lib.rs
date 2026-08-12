@@ -41,7 +41,7 @@ pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
 pub use pipeline::{HostedPage, Pipeline};
 pub use playback::{PlaybackEnd, PlaybackProgress, PlaybackReport};
 pub use ports::{MediaPorts, PortRange, PortRangeError};
-pub use session::{RemoteHandle, SessionConfig, SessionManager};
+pub use session::{CastingHandle, RemoteHandle, SessionConfig, SessionManager};
 pub use source::SourceDescription;
 pub use touch::{SurfaceTouch, TouchHandle, TouchPhase, TouchSurface};
 pub use types::{

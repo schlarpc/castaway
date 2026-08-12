@@ -24,8 +24,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod manifest;
 pub mod minisign;
+pub mod policy;
 
 use thiserror::Error;
 
@@ -44,7 +46,17 @@ pub use minisign::{PublicKey, Signature, SignatureError};
 /// Before that has been run the file carries a comment and no payload, and
 /// [`release_key`] answers [`SignatureError::NoKey`]. That is a *state*, not a failure:
 /// a build with no key cannot verify a release, so it does not update, and it says so.
-pub const RELEASE_KEY: &str = include_str!("../release-key.pub");
+///
+/// `CASTAWAY_RELEASE_PUBKEY` overrides it at **compile** time, which is the same shape as
+/// `CASTAWAY_GIT_REV` and for the same reason: it is a property of the binary, decided by
+/// whoever built it. That is what lets the VM test build a receiver that trusts the
+/// checked-in *test* key and then drive the whole update loop against a release signed
+/// with its secret half — and it is also how somebody running their own fork points a
+/// panel at their own releases without editing the tree.
+pub const RELEASE_KEY: &str = match option_env!("CASTAWAY_RELEASE_PUBKEY") {
+    Some(key) => key,
+    None => include_str!("../release-key.pub"),
+};
 
 /// The key from [`RELEASE_KEY`].
 ///

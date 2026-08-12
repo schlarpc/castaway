@@ -18,6 +18,10 @@ castaway-paths.workspace = true
 # The build's own place in the release ordering, and (from #345) the updater that uses
 # it. Depended on unconditionally: knowing which build this is is not optional.
 castaway-update.workspace = true
+# One constant, and it has to be the launcher's own: the exit code that means "restart me
+# into the version `current.txt` names now". A second copy of it in the receiver is a
+# second thing that can drift, and the drift would be a panel that never takes an update.
+castaway-launcher.workspace = true
 substrate-ssdp.workspace = true
 substrate-mdns.workspace = true
 proto-dlna.workspace = true
@@ -190,3 +194,14 @@ gamestream = ["proto-gamestream/stream"]
 
 [lints]
 workspace = true
+
+# The panel's own idea of how long it has been untouched (#345). `GetLastInputInfo` is
+# the whole *session's* answer — keyboard, mouse and touch, including input to the browser
+# child, which the receiver itself never sees. There is no portable equivalent, and no
+# other platform is a deploy target for the updater.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_SystemInformation",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }

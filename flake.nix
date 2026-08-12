@@ -671,6 +671,16 @@
           windows-authenticode = releaseSigning.authenticode;
           windows-codesign-keygen = releaseSigning.codesignKeygen;
 
+          # The stable binary the panel's scheduled task points at (#342). Exposed here
+          # because the `update-vm` check runs it — the whole supervision loop is
+          # platform-independent, and only the job object is not.
+          launcher = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "castaway-launcher";
+            cargoExtraArgs = "--package castaway-launcher --bins";
+            doCheck = false;
+          });
+
           # A scripted phone, for the one path no VM test can cover: YouTube's Lounge
           # servers are a third party to the session, so this needs the real internet
           # and a running receiver. `nix run .#yt-selfplay -- http://<receiver>:8080`.
@@ -967,6 +977,16 @@
           # Check formatting
           fmt = craneLib.cargoFmt {
             src = commonArgs.src;
+          };
+
+          # The whole auto-update loop, in a VM: a real launcher, two real receivers a
+          # build number apart, a signed release, and a panel that ends up running newer
+          # bits than it started with — with no Windows and no network (#345).
+          update-vm = import ./nix/update-vm-test.nix {
+            inherit pkgs;
+            castaway = self.packages.${system}.castaway-portable;
+            launcher = self.packages.${system}.launcher;
+            releaseManifest = self.packages.${system}.release-manifest;
           };
 
           # The release manifest CI writes is the one the receiver reads (#343).

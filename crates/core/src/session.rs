@@ -52,11 +52,41 @@ pub struct SessionManager<P: Pipeline> {
     /// The active source's touch surface, for a router that owns the panel. Held here as
     /// well as pushed to the pipeline so a router that starts late can ask.
     touch: crate::touch::TouchHandle,
+    /// Whether *any* source is active, in a form something outside the manager can read.
+    /// [`Self::active`] cannot be: `run` consumes the manager.
+    casting: CastingHandle,
     description: SourceDescription,
     /// The pipeline saying an item ended or failed. Closed unless somebody called
     /// [`SessionManager::with_playback_ends`] — see there for why it is a receiver the manager
     /// owns rather than another `SessionEvent`.
     ended: tokio::sync::mpsc::Receiver<PlaybackEnd>,
+}
+
+/// A shared answer to "is anything casting right now?".
+///
+/// One bit, readable from anywhere, for the same structural reason [`RemoteHandle`]
+/// exists: `run(self, ..)` consumes the manager, so [`SessionManager::active`] is
+/// unreachable the moment the receiver is actually running.
+///
+/// It is deliberately *not* derived from `RemoteHandle::get().is_some()`, which is the
+/// tempting shortcut and the wrong answer: that is "the active source published a control
+/// surface", and a source that publishes none — a Miracast mirror — would read as an idle
+/// panel. The auto-updater (#345) restarts the receiver on the strength of this, so the
+/// difference between "nothing is casting" and "nothing is casting *that I can pause*" is
+/// the difference between a quiet restart and a screen going black mid-mirror.
+#[derive(Clone, Default, Debug)]
+pub struct CastingHandle(Arc<std::sync::atomic::AtomicBool>);
+
+impl CastingHandle {
+    /// Is a source active?
+    #[must_use]
+    pub fn casting(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set(&self, casting: bool) {
+        self.0.store(casting, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A shared view of the active source's control surface.
@@ -120,6 +150,7 @@ impl<P: Pipeline> SessionManager<P> {
             active: None,
             remote: RemoteHandle::default(),
             touch: crate::touch::TouchHandle::new(),
+            casting: CastingHandle::default(),
             description: SourceDescription::new(),
             ended,
         }
@@ -178,6 +209,14 @@ impl<P: Pipeline> SessionManager<P> {
     #[must_use]
     pub fn remote_handle(&self) -> RemoteHandle {
         self.remote.clone()
+    }
+
+    /// A handle onto "is anything casting", for whatever needs to not interrupt it.
+    ///
+    /// Same rule as [`Self::remote_handle`]: take it before `run` consumes `self`.
+    #[must_use]
+    pub fn casting_handle(&self) -> CastingHandle {
+        self.casting.clone()
     }
 
     /// A handle onto the active source's touch surface, for whatever owns the panel.
@@ -381,6 +420,7 @@ impl<P: Pipeline> SessionManager<P> {
                 if self.active.as_ref() == Some(&source) {
                     info!(%source, "session: end");
                     self.active = None;
+                    self.casting.set(false);
                     self.remote.set(None);
                     // …and the glass with them. A router still pointed at a session that
                     // ended sends touches into a closed socket at best, and at worst into
@@ -438,6 +478,7 @@ impl<P: Pipeline> SessionManager<P> {
             display.select_input(self.config.output_input).await?;
         }
         self.active = Some(source.clone());
+        self.casting.set(true);
         if let Some(osd) = &self.osd {
             osd.show(OsdMessage::banner(
                 format!("Now casting from {source}"),

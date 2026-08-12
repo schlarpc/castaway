@@ -163,9 +163,7 @@ impl InstallTree {
         let version_dir = exe
             .parent()
             .ok_or(LayoutError::NoInstallRoot { source: None })?;
-        let not_managed = || LayoutError::NotManaged {
-            exe: exe.clone(),
-        };
+        let not_managed = || LayoutError::NotManaged { exe: exe.clone() };
         let versions = version_dir.parent().ok_or_else(not_managed)?;
         let root = versions.parent().ok_or_else(not_managed)?;
         if versions.file_name().and_then(|n| n.to_str()) != Some("versions") {
