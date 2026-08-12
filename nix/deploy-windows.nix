@@ -491,10 +491,10 @@ let
       # The one elevated step, and the only one. Skipped rather than failed where the
       # certificate does not exist yet (#348): an unsigned artifact still runs, it just has
       # no publisher, and refusing to migrate over that would be refusing over cosmetics.
-      if grep -q 'BEGIN CERTIFICATE' ${../nix/windows-codesign.crt}; then
+      if grep -q 'BEGIN CERTIFICATE' ${./windows-codesign.crt}; then
         if on_box 'net session >nul 2>&1'; then
           say "trusting the castaway code-signing certificate"
-          scp "''${ssh_opts[@]}" -q ${../nix/windows-codesign.crt} "$host:castaway-codesign.crt"
+          scp "''${ssh_opts[@]}" -q ${./windows-codesign.crt} "$host:castaway-codesign.crt"
           on_box 'certutil -addstore -f Root castaway-codesign.crt' | unix | tail -2
           on_box 'del /q castaway-codesign.crt' || true
         else
