@@ -218,26 +218,33 @@ pub enum AttestationError {
 mod tests {
     use super::{AttestationError, Provenance, TRUSTED_ROOT};
 
-    /// A real release of this repository, and the real bundle GitHub's attestation API
-    /// returned for it. Both checked in verbatim (ground rule 9: findings land as
-    /// fixtures), so these tests run against genuine production bytes with no network.
+    /// A real release of this repository (`build-efc4316`), and the real bundle GitHub's
+    /// attestation API returned for its manifest. Both checked in verbatim (ground rule 9:
+    /// findings land as fixtures), so these tests run against genuine production bytes
+    /// with no network.
     ///
-    /// Regenerating them after a release — the manifest is byte-reproducible from the zip,
-    /// which is how this pair was obtained when the first attested release did not upload
-    /// its manifest:
+    /// Regenerating them after a release:
     ///
     /// ```text
-    /// gh release download <tag> --pattern '*.zip' --dir /tmp/f
-    /// nix run .#release-manifest -- /tmp/f/<zip> $(git rev-parse <tag>) \
-    ///   $(git rev-list --count <tag>) /tmp/f
-    /// cp /tmp/f/manifest.json crates/update/fixtures/attested-manifest.json
+    /// gh release download <tag> --pattern manifest.json --repo schlarpc/castaway
+    /// cp manifest.json crates/update/fixtures/attested-manifest.json
     /// d=$(sha256sum crates/update/fixtures/attested-manifest.json | cut -d' ' -f1)
     /// gh api "repos/schlarpc/castaway/attestations/sha256:$d" --jq '.attestations[0].bundle' \
     ///   > crates/update/fixtures/attested-manifest.json.sigstore
     /// ```
     const ATTESTED: &[u8] = include_bytes!("../fixtures/attested-manifest.json");
     const BUNDLE: &str = include_str!("../fixtures/attested-manifest.json.sigstore");
-    /// The identity that really signed the fixture, written down rather than read from
+
+    /// The `build-21ddb9e` pair, from before `release.yml` attested per asset: one
+    /// statement naming the zip first and this manifest second. Kept *because* it is
+    /// multi-subject — it is what a collapsed-back single attest step would produce, and
+    /// [`a_multisubject_statement_is_the_shape_sigstore_rs_cannot_use`] failing is the
+    /// signal that shape came back before upstream shipped its fix.
+    const MULTISUBJECT_ATTESTED: &[u8] = include_bytes!("../fixtures/multisubject-manifest.json");
+    const MULTISUBJECT_BUNDLE: &str =
+        include_str!("../fixtures/multisubject-manifest.json.sigstore");
+
+    /// The identity that really signed the fixtures, written down rather than read from
     /// [`super::RELEASE_IDENTITY`] — so a build compiled for a fork still tests the bytes
     /// it was made from.
     const FIXTURE_IDENTITY: &str =
@@ -249,26 +256,10 @@ mod tests {
             .expect("the embedded trusted root parses")
     }
 
-    /// What the panel will do once #349 is resolved.
-    ///
-    /// Ignored rather than deleted, and the fixture kept beside it, because everything
-    /// this needs is already here and correct: the trust root parses, the certificate
-    /// chains, the identity matches, the signature verifies over the PAE, and the tlog
-    /// entry is consistent. The one thing that fails is `sigstore-rs` matching the
-    /// artifact against only the *first* subject of the in-toto statement
-    /// (sigstore-rs#596), and this fixture's statement names the zip first and the
-    /// manifest second — see [`the_fixture_is_sound_and_the_failure_is_upstream`], which
-    /// pins that precisely. `release.yml` now attests each asset in its own step, so the
-    /// next release's manifest bundle is single-subject: regenerate the fixture pair from
-    /// it (recipe above, under a *new* name — the multi-subject pair stays for the pin
-    /// test), point these constants at it, and delete this attribute.
-    ///
-    /// The negative cases that belong beside it — a flipped byte, another workflow's
-    /// identity, a bundle that is not a bundle — are deliberately *absent* rather than
-    /// written and ignored. Each would assert `is_err()`, which is true today for a reason
-    /// that has nothing to do with what they claim to test, and a vacuous test that turns
-    /// green on the wrong evidence is worse than a missing one (docs/test-matrix.md §3.5).
-    #[ignore = "waiting on the first per-asset-attested release to regenerate the fixture from — #349"]
+    /// The whole point of D59, on production bytes: GitHub's provenance over a real
+    /// release of this repository verifies offline, against the checked-in trust root,
+    /// with no network. This is what the panel does to every release before parsing a
+    /// byte of it (#349 is the story of what it took to turn this test on).
     #[tokio::test]
     async fn a_real_release_of_this_repository_verifies_offline() {
         verifier()
@@ -277,35 +268,66 @@ mod tests {
             .expect("GitHub's own provenance over our own release");
     }
 
-    /// The fixture is good and the blocker is somebody else's, pinned so nobody re-derives
-    /// it and so the failure cannot quietly become a *different* failure.
-    ///
-    /// Two halves. First, the bundle's own numbers agree with its contents — Rekor's
-    /// `payloadHash` is the digest of the payload, and its `envelopeHash` is the digest of
-    /// the envelope as GitHub sent it. Second, verification nonetheless fails, for exactly
-    /// one reason, pinned by the subject assertions below.
-    ///
-    /// The mechanism, measured (#349): `actions/attest-build-provenance` puts every file
-    /// of `subject-path` into *one* statement — ours lists the zip first and the manifest
-    /// second — and `sigstore-rs` compares the artifact digest against `subject[0]` only
-    /// (sigstore-rs#596; its `intoto.rs` documents the gap). So the manifest, a genuine
-    /// subject of a genuine attestation, is rejected for not being the *first* one. The
-    /// error surfaces as `SignatureErrorKind::Transparency` — "transparency materials are
-    /// inconsistent" — which is why this was first misdiagnosed as a tlog-consistency
-    /// failure. It is not: verifying the released *zip* (subject[0]) against this same
-    /// bundle passes every check including the tlog ones, and upstream's multi-subject fix
-    /// (sigstore-rs#615) makes the manifest verify too, measured on 2026-08-12.
-    ///
-    /// `release.yml` sidesteps this by attesting each asset in its own step, so this
-    /// fixture pair is kept *because* it is multi-subject: it is what a collapsed-back
-    /// single attest step would produce, and this test failing on a regenerated fixture
-    /// is the signal that the workflow shape changed before upstream shipped.
+    /// A flipped byte is not the attested artifact, however genuine the bundle.
     #[tokio::test]
-    async fn the_fixture_is_sound_and_the_failure_is_upstream() {
+    async fn a_tampered_artifact_is_rejected() {
+        let mut tampered = ATTESTED.to_vec();
+        tampered[0] ^= 1;
+        let err = verifier()
+            .verify(&tampered, BUNDLE)
+            .await
+            .expect_err("a flipped byte must not verify");
+        assert!(matches!(err, AttestationError::Rejected { .. }), "{err}");
+    }
+
+    /// A genuine bundle by the wrong workflow is somebody else's release, not ours. The
+    /// identity is the trust anchor — this is the fork-points-a-panel-at-itself case.
+    #[tokio::test]
+    async fn another_workflows_identity_is_rejected() {
+        let other = Provenance::with_anchors(
+            TRUSTED_ROOT,
+            "https://github.com/schlarpc/castaway/.github/workflows/test.yml@refs/heads/main",
+            FIXTURE_ISSUER,
+        )
+        .expect("the embedded trusted root parses");
+        let err = other
+            .verify(ATTESTED, BUNDLE)
+            .await
+            .expect_err("a bundle signed by a different workflow must not verify");
+        assert!(matches!(err, AttestationError::Rejected { .. }), "{err}");
+    }
+
+    /// Bytes that are not a Sigstore bundle fail as [`AttestationError::Malformed`],
+    /// before any cryptography is asked for an opinion.
+    #[tokio::test]
+    async fn garbage_is_malformed_not_rejected() {
+        let err = verifier()
+            .verify(ATTESTED, r#"{"hello": "panel"}"#)
+            .await
+            .expect_err("an empty JSON object is not a bundle");
+        assert!(matches!(err, AttestationError::Malformed(_)), "{err}");
+    }
+
+    /// Why `release.yml` attests per asset, pinned on the bytes that forced it (#349) —
+    /// so nobody re-derives the diagnosis, and so collapsing the attest steps back into
+    /// one before upstream ships its fix fails here instead of wedging panels.
+    ///
+    /// Two halves. First, the multi-subject fixture is *sound* — Rekor's `payloadHash`
+    /// and `envelopeHash` both match its contents, and the manifest genuinely is a
+    /// subject of the statement, just not the first. Second, verification nonetheless
+    /// fails, because `sigstore-rs` compares the artifact digest against `subject[0]`
+    /// only (sigstore-rs#596; its `intoto.rs` documents the gap; sigstore-rs#615 is the
+    /// open fix, verified against this very fixture on 2026-08-12). The error surfaces as
+    /// `SignatureErrorKind::Transparency` — "transparency materials are inconsistent" —
+    /// which is why #349 was first misdiagnosed as a tlog-consistency failure. It is not:
+    /// the released *zip* (subject[0]) verifies end to end against this same bundle.
+    #[tokio::test]
+    async fn a_multisubject_statement_is_the_shape_sigstore_rs_cannot_use() {
         use base64::Engine as _;
         use sha2::{Digest as _, Sha256};
 
-        let bundle: serde_json::Value = serde_json::from_str(BUNDLE).expect("bundle parses");
+        let bundle: serde_json::Value =
+            serde_json::from_str(MULTISUBJECT_BUNDLE).expect("bundle parses");
         let body = bundle["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"]
             .as_str()
             .expect("a canonicalised body");
@@ -343,7 +365,7 @@ mod tests {
             .iter()
             .map(|s| s["digest"]["sha256"].as_str().expect("a sha256 digest"))
             .collect();
-        let artifact = format!("{:x}", Sha256::digest(ATTESTED));
+        let artifact = format!("{:x}", Sha256::digest(MULTISUBJECT_ATTESTED));
         assert!(
             subjects.contains(&artifact.as_str()),
             "the manifest is no longer a subject of the statement — the fixture is broken"
@@ -351,16 +373,21 @@ mod tests {
         assert_ne!(
             subjects.first().copied(),
             Some(artifact.as_str()),
-            "the manifest is now subject[0]; sigstore-rs would accept it and \
-             a_real_release_of_this_repository_verifies_offline should be un-ignored"
+            "the manifest is subject[0], so this fixture no longer exercises \
+             sigstore-rs#596 at all"
         );
 
         // And yet. Not `Malformed` (the bundle parses), and not a certificate, identity or
-        // signature failure — those all pass. Only the subject match.
+        // signature failure — those all pass. Only the subject match. The day this
+        // expect_err fires on a green upstream, sigstore-rs#596 is fixed in the version
+        // this tree pins, and the per-asset attest steps in release.yml may collapse
+        // back into one.
         let err = verifier()
-            .verify(ATTESTED, BUNDLE)
+            .verify(MULTISUBJECT_ATTESTED, MULTISUBJECT_BUNDLE)
             .await
-            .expect_err("#349: this is expected to fail until upstream is fixed");
+            .expect_err(
+                "sigstore-rs#596: multi-subject statements verify only their first subject",
+            );
         assert!(
             matches!(err, AttestationError::Rejected { .. }),
             "expected a rejection from the verifier, got {err}"

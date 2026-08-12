@@ -689,12 +689,13 @@ except the box-side migration and the keys:
   digest → extract, then activation only once no session is running and nobody has touched
   the panel. The trust root is embedded *and* refreshed over TUF before each look; the
   workflow identity is compiled in, deliberately not configurable. **The panel's own
-  verification awaits the first per-asset-attested release (#349)** — `sigstore-rs`
-  matches an artifact against only the first subject of a multi-subject statement
-  (sigstore-rs#596), so the release workflow now attests the zip and the manifest in
-  separate steps; until a release built that way exists, the panel refuses every release,
-  which is the right direction to fail in and no worse than the nothing it installed
-  before. `checks.update-vm`
+  verification works, on production bytes** (#349): `sigstore-rs` matches an artifact
+  against only the first subject of a multi-subject statement (sigstore-rs#596), so the
+  release workflow attests the zip and the manifest in separate steps, and the manifest
+  of a per-asset-attested release verifies offline — the acceptance test runs against
+  the real bundle of a real release. Releases attested before the split stay
+  unverifiable (immutable multi-subject bundles), which costs nothing: no panel had
+  installed one. `checks.update-vm`
   drives from a pre-staged tree through rediscovery, activation, health and GC; the
   fetch-and-verify leg is unit-tested against a **real** attestation for a real release of
   this repository, offline.
