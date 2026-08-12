@@ -609,6 +609,9 @@
         commonArgs = commonArgsFor system;
         rustToolchain = rustToolchainFor system;
         inherit gitRev buildNumber;
+        # For the Authenticode check beside the DLL-closure one (#344). The artifact and
+        # the signer have to meet somewhere, and the artifact is the expensive half.
+        authenticode = (import ./nix/release-signing.nix { pkgs = pkgsFor system; }).authenticode;
         ffmpegSrc = ffmpeg-windows-src;
         electronSrc = electron-windows-src;
         widevineSrc = widevine-windows-src;
@@ -627,6 +630,7 @@
           craneLib = cranelibFor system;
           commonArgs = commonArgsFor system;
           cargoArtifacts = cargoArtifactsFor system;
+          releaseSigning = import ./nix/release-signing.nix { inherit pkgs; };
         in
         {
           # No renderer, no browser, nothing platform-specific.
@@ -656,8 +660,16 @@
           # one key, so they live in one file: `release-keygen` runs once by hand and
           # writes the public half into the tree; `release-manifest` runs in CI on every
           # push and refuses to produce an unsigned manifest.
-          release-manifest = (import ./nix/release-signing.nix { inherit pkgs; }).manifest;
-          release-keygen = (import ./nix/release-signing.nix { inherit pkgs; }).keygen;
+          release-manifest = releaseSigning.manifest;
+          release-keygen = releaseSigning.keygen;
+
+          # Authenticode + castLabs VMP over the Windows artifact (#344), so the release
+          # asset arrives complete and the panel holds no credentials. Without it the
+          # first unattended update would replace a VMP-signed tree with an unsigned one
+          # and kill DRM playback silently.
+          sign-windows = releaseSigning.signWindows;
+          windows-authenticode = releaseSigning.authenticode;
+          windows-codesign-keygen = releaseSigning.codesignKeygen;
 
           # A scripted phone, for the one path no VM test can cover: YouTube's Lounge
           # servers are a third party to the session, so this needs the real internet
@@ -981,6 +993,11 @@
             } ''
             fixtures=${./crates/update/fixtures}
             export CASTAWAY_RELEASE_SECRET_KEY="$(cat "$fixtures/test-release.key")"
+            # Point the script's own verification at the fixture's public half, so the
+            # "does this signature check out against what the receiver trusts" branch is
+            # exercised rather than skipped. Without it the check would silently take the
+            # no-key path and assert nothing about the half that matters.
+            export CASTAWAY_RELEASE_PUBKEY="$fixtures/test-release.pub"
             castaway-release-manifest \
               "$fixtures/castaway-windows-electron-ae2f19e.zip" \
               ae2f19ef1f9d9a2488008f1075b252178ae7ef85 935 out

@@ -272,7 +272,36 @@ needs flattening into ours:
   runtime path (see `browser-host/stage-widevine.sh` and #66). Present only when the unfree
   gate allows it.
 - `bin/vmp-sign.sh` — the VMP signing step travels with the artifact rather than living only
-  in the repo: it runs on whoever deploys, after Authenticode, and needs the tree beside it.
+  in the repo: it needs the tree beside it, and a tree signed in CI and a tree signed by hand
+  then go through the same script. Since #344 the release workflow runs it, so a **release
+  asset arrives already signed** and the panel holds no credentials; a `deploy-windows` dev
+  deploy still ships the store artifact unsigned, where DRM needs the manual run exactly as
+  before.
+
+### Signing, and why it moved into CI
+
+Two signatures, applied in that order by `nix run .#sign-windows`:
+
+1. **Authenticode**, over our own executables (`castaway.exe`, and `launcher.exe` since #342)
+   and nothing else — the ECS tree is castLabs' bytes and re-signing them would invalidate the
+   VMP signature that is a hash of them. Self-signed, ten years, the box trusting the
+   certificate once (#346); `nix/windows-codesign.crt` is the public half both CI and the box
+   read. SmartScreen reputation is nil for a self-signed certificate, so what this buys is
+   narrow and worth naming: the panel's one autostart binary has a publisher, and the box can
+   tell that an unattended update came from the same one.
+2. **castLabs EVS VMP**, over `bin/browser/`. The order is castLabs' rule and the failure it
+   prevents is a licence refusal from the service rather than an error at signing time.
+
+Both run *outside* the derivation, the same carve-out `vmp-sign.sh` documents: EVS is a network
+service signing exact bytes, so inside the sandbox it would be non-reproducible and would fail
+closed on any machine without credentials. The consequence is honest and load-bearing — the
+release asset is re-zipped after signing and therefore no longer hash-matches the store zip.
+What binds its bytes instead is the signed manifest (#343).
+
+This moved into CI because the alternative was a landmine under auto-update: `vmp-sign.sh` used
+to run after a hand deploy, so the first unattended update would have replaced a signed tree
+with an unsigned one, and the symptom would have been licence refusals on an unattended panel
+— exactly the shape of failure the script's own comments warn about.
 
 ### The DLL closure is checked, not eyeballed
 

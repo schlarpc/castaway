@@ -39,6 +39,23 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Job level rather than step level, because a step's `if:` reads the *job's*
+    # environment: `env.EVS_ACCOUNT_NAME != ''` below is how the EVS install is skipped on
+    # a repository that has no castLabs account, and a step-scoped variable would be
+    # invisible to it.
+    env:
+      # The minisign secret key, whole, as `release-keygen` printed it (#343).
+      CASTAWAY_RELEASE_SECRET_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+      # The Authenticode certificate, base64 of a PKCS#12, and its password (#344).
+      CASTAWAY_CODESIGN_PFX: ${{ secrets.WINDOWS_CODESIGN_PFX }}
+      CASTAWAY_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+      # castlabs-evs reads these itself, from the environment, in both its account and its
+      # vmp module — so `vmp-sign.sh` needs no arguments and no cached login. `EVS_NO_ASK`
+      # is what keeps `sign-pkg` from stopping at a confirmation prompt on a runner with
+      # no tty.
+      EVS_ACCOUNT_NAME: ${{ secrets.EVS_ACCOUNT_NAME }}
+      EVS_PASSWD: ${{ secrets.EVS_PASSWD }}
+      EVS_NO_ASK: "1"
     permissions:
       id-token: write
       # The one departure from the Test workflow's read-only stance: creating the release
@@ -64,19 +81,44 @@ jobs:
       # the archive derivation is that tree as one reproducible zip (stable mtimes, sorted
       # entries) — the thing a release asset should be.
       - run: .github/scripts/nix-build.sh '.#castaway-windows-electron.archive'
+      # The castLabs EVS client, which signs the Electron tree for a verified media path
+      # (#344). pip rather than nixpkgs because there is no nixpkgs package, and because
+      # this is deliberately outside the derivation anyway: EVS is a network service that
+      # signs exact bytes, so it can be neither reproducible nor credential-free.
+      #
+      # `--user` so `python3 -m castlabs_evs` — which is how `vmp-sign.sh` invokes it —
+      # finds it with no activation step, and so nothing here has to know where the
+      # runner's python lives.
+      - name: Install the castLabs EVS client
+        if: ${{ env.EVS_ACCOUNT_NAME != '' }}
+        run: pip install --user castlabs-evs
       - name: Publish the commit-named release
         env:
           GH_TOKEN: ${{ github.token }}
-          # The minisign secret key, whole, as `release-keygen` printed it. Absent on a
-          # repository where that has never been run — see the branch below.
-          CASTAWAY_RELEASE_SECRET_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           short=$(git rev-parse --short "$GITHUB_SHA")
           # The sha in the asset's own filename, so a Downloads folder with three of them
           # still says which is which.
           zip="castaway-windows-electron-$short.zip"
-          cp "result/castaway-windows-electron.zip" "$zip"
+
+          # Signing comes first, because everything downstream describes the *signed*
+          # bytes: the manifest's digest, and the asset the panel downloads. Authenticode
+          # on our executables, then castLabs VMP over the Electron tree, then a re-zip —
+          # so the release asset no longer hash-matches the store zip, and the signed
+          # manifest is what binds its bytes instead.
+          if [ -n "${CASTAWAY_CODESIGN_PFX:-}" ] && [ -n "${EVS_ACCOUNT_NAME:-}" ]; then
+            nix run '.#sign-windows' -- "result/castaway-windows-electron.zip" "$zip"
+          else
+            # Loud, not fatal — same call as the manifest below. The thing this guards
+            # against is a *silent* unsigned release, because an artifact with no .sig
+            # files plays fine against Widevine UAT and fails against production, which
+            # is a failure nobody sees until they are standing in front of the panel.
+            echo "::error::no WINDOWS_CODESIGN_PFX / EVS_ACCOUNT_NAME secrets, so this" \
+                 "release is neither Authenticode- nor VMP-signed. Installing it on the" \
+                 "panel would strip the .sig files and kill DRM playback (#344)."
+            cp "result/castaway-windows-electron.zip" "$zip"
+          fi
           assets=("$zip")
 
           # The signed manifest an unattended panel needs (#343): the build number that

@@ -1,0 +1,5 @@
+# castaway's Authenticode certificate (#344) — none generated yet.
+#
+# `nix run .#windows-codesign-keygen` writes the certificate here and prints the two
+# Actions secrets that go with it. Until then the release publishes unsigned, loudly,
+# and #346 has nothing to import into the box's trust store.

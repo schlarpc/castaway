@@ -14,7 +14,7 @@
 # `ffmpegSrc`/`electronSrc` are the raw archives, pinned as flake inputs so they land in
 # flake.lock; the derivations beside this file unpack and rearrange them.
 { pkgs, craneLib, commonArgs, rustToolchain, gitRev, buildNumber, ffmpegSrc, electronSrc, widevineSrc
-, bluetoothFirmware }:
+, bluetoothFirmware, authenticode }:
 
 let
   inherit (pkgs) lib;
@@ -454,6 +454,74 @@ let
     echo "checked $(wc -l < imports.txt) imported DLLs" > "$out"
   '';
 
+  # Ground rule 6 again, for the other thing that only fails on the panel: an artifact
+  # whose Authenticode signature was never actually applied looks exactly like one that
+  # was, from here. This signs the *real* cross-built .exe with a throwaway certificate
+  # and reads the signature back.
+  #
+  # A throwaway rather than the release certificate, which is a secret this build cannot
+  # and should not have. What it proves is everything that is not the key: that
+  # `osslsigncode` accepts a PE this toolchain emits, that our flag set produces a
+  # signature `osslsigncode verify` reads back, that the code-signing EKU survives the
+  # PKCS#12 round trip, and that the publisher check refuses a certificate the box does
+  # not trust. The key itself is #347's problem and no check can stand in for it.
+  mkAuthenticodeCheck = pkg: pkgs.runCommand "${pkg.pname}-authenticode"
+    {
+      nativeBuildInputs = [ authenticode pkgs.openssl pkgs.osslsigncode pkgs.coreutils ];
+      meta.description = "${pkg.pname}'s executables take an Authenticode signature that verifies";
+    } ''
+    # Two certificates: the one that signs, and one that stands in for a rotation nobody
+    # updated the tree for.
+    for name in signer other; do
+      openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -noenc \
+        -keyout "$name.key" -out "$name.crt" -subj "/CN=castaway check $name" \
+        -addext 'basicConstraints=critical,CA:false' \
+        -addext 'keyUsage=critical,digitalSignature' \
+        -addext 'extendedKeyUsage=critical,codeSigning' 2>/dev/null
+    done
+    openssl pkcs12 -export -out signer.pfx -inkey signer.key -in signer.crt \
+      -name 'castaway check' -passout pass:check
+
+    export CASTAWAY_CODESIGN_PFX="$(base64 -w0 < signer.pfx)"
+    export CASTAWAY_CODESIGN_PASSWORD=check
+
+    # Both of ours — the receiver and the launcher (#342) — because they are built from
+    # different derivations and only one of them was ever going to be remembered.
+    ours=()
+    for exe in ${pkg}/bin/*.exe; do
+      install -m644 "$exe" "$(basename "$exe")"
+      ours+=("$(basename "$exe")")
+      # The store copies are unsigned, and `verify` says so — which is what makes the
+      # positive result below mean something rather than being true of any PE.
+      if osslsigncode verify -in "$(basename "$exe")" -CAfile signer.crt >/dev/null 2>&1; then
+        echo "an unsigned $(basename "$exe") verified; this check proves nothing" >&2
+        exit 1
+      fi
+    done
+    [ "''${#ours[@]}" -ge 2 ] || {
+      echo "expected the receiver and the launcher, found: ''${ours[*]}" >&2; exit 1; }
+
+    CASTAWAY_CODESIGN_CERT=signer.crt castaway-windows-authenticode "''${ours[@]}"
+    for exe in "''${ours[@]}"; do
+      osslsigncode verify -in "$exe" -CAfile signer.crt > "verify-$exe.txt" 2>&1 || {
+        cat "verify-$exe.txt" >&2; exit 1; }
+      grep -q 'Signature verification: ok' "verify-$exe.txt" \
+        || { cat "verify-$exe.txt" >&2; exit 1; }
+    done
+
+    # And the publisher check: signing with a key the checked-in certificate does not
+    # name has to fail here rather than on a box that then refuses the binary.
+    install -m644 ${pkg}/bin/castaway.exe again.exe
+    if CASTAWAY_CODESIGN_CERT=other.crt castaway-windows-authenticode again.exe \
+         >mismatch.txt 2>&1; then
+      echo "signing succeeded against a certificate the box does not trust" >&2
+      exit 1
+    fi
+    grep -q 'Refusing to sign' mismatch.txt || { cat mismatch.txt >&2; exit 1; }
+
+    cat verify-*.txt > "$out"
+  '';
+
 in
 rec {
   inherit sysroot crossEnv target toolchainBins;
@@ -481,9 +549,12 @@ rec {
     withLauncher = true;
   };
 
-  # One artifact, one check.
+  # One artifact, two checks: what the loader will look for, and what Windows will make
+  # of the signature. Both are static answers to questions that otherwise only get asked
+  # on the panel.
   checks = {
     castaway-windows-electron-dll-closure = mkBundleCheck castaway-electron;
+    castaway-windows-electron-authenticode = mkAuthenticodeCheck castaway-electron;
   };
 
   # Cross dev shell: `nix develop .#windows` then plain `cargo build`, which picks the

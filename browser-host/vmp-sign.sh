@@ -19,6 +19,11 @@
 #   vmp-sign.sh <dir containing electron.exe>            # sign
 #   vmp-sign.sh --check <dir>                            # verify only, no account needed
 #
+# Since #344 the release workflow runs both of these, in that order, so a release asset
+# arrives already signed and the panel holds no credentials. This is still the script that
+# does it — CI unpacks the artifact and runs the copy inside it — so a tree signed in CI
+# and a tree signed by hand after a `deploy-windows` go through exactly the same code.
+#
 # Requires the client: `pip install castlabs-evs`, then `python3 -m castlabs_evs.account
 # signup` once. The service is free; the account is not optional.
 set -euo pipefail
