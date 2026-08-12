@@ -213,7 +213,9 @@ let
     cp -r --no-preserve=mode,ownership ${../browser-host}/* "$out/bin/browser-host/"
     install -Dm644 ${./castaway.exe.manifest} "$out/bin/castaway.exe.manifest"
     # The signing step travels with the artifact rather than living only in the repo: it
-    # runs on whoever deploys this, after Authenticode, and needs the tree beside it.
+    # needs the tree beside it, and CI unpacks the artifact and runs *this* copy (#344),
+    # so a release signed in CI and a tree signed by hand after a deploy go through the
+    # same script.
     install -Dm755 ${../browser-host/vmp-sign.sh} "$out/bin/vmp-sign.sh"
   '' + lib.optionalString (widevine != null) ''
     # Staged for the receiver to copy into the browser profile on first run, not loaded
@@ -256,9 +258,29 @@ let
     cargoExtraArgs = "--package castaway --no-default-features";
   });
 
+  # The stable binary the box's scheduled task points at (#342). Its own derivation
+  # rather than a second `--package` on the receiver's: crane builds one package per
+  # derivation, and this one wants none of the receiver's features, none of ffmpeg and
+  # none of the browser — it is a few hundred lines that spawn a process and wait.
+  #
+  # It reuses the receiver's dependency tree because it shares nearly all of it
+  # (`castaway-paths`, `thiserror`, `time`); the `windows` crate is the only thing it
+  # compiles on its own.
+  launcher = craneLib.buildPackage (crossArgs // {
+    pname = "castaway-launcher-windows";
+    cargoArtifacts = crossBaseArtifacts;
+    cargoExtraArgs = "--package castaway-launcher --bins";
+  });
+
   # Cargo refuses `--features` at the root of a virtual workspace, so every feature-
   # selecting build has to name the package too.
-  mkCastaway = { pname, features ? [ ], withFfmpeg ? false, withBrowser ? false }:
+  mkCastaway =
+    { pname
+    , features ? [ ]
+    , withFfmpeg ? false
+    , withBrowser ? false
+    , withLauncher ? false
+    }:
     let
       # `--no-default-features` because the default set is now everything (D55), and two
       # of its entries are Linux-only: `audio-pipewire`, whose dependency table does not
@@ -298,6 +320,13 @@ let
         # binary dies at startup on the deploy box with a missing-DLL dialog.
         postInstall = lib.optionalString withFfmpeg ''
           cp ${ffmpeg}/bin/*.dll "$out/bin/"
+        '' + lib.optionalString withLauncher ''
+          # Beside the receiver, so a release zip carries both. The box installs the
+          # launcher once, at the install root (#346), and every version tree afterwards
+          # carries a copy it does not run — deliberately: it costs a few hundred
+          # kilobytes, and a launcher that ever does have to be replaced is then already
+          # sitting in the version that wants it rather than needing its own download.
+          cp ${launcher}/bin/launcher.exe "$out/bin/"
         '' + lib.optionalString withBrowser stageBrowser;
       });
 
@@ -387,12 +416,18 @@ let
   #
   # Covers delay-loaded imports too: llvm-readobj lists those under their own heading, and a
   # missing one merely defers the crash to whenever that symbol is first touched.
+  #
+  # Every `.exe` in the tree, not just the receiver's. `launcher.exe` (#342) is the one
+  # binary the box's scheduled task names, so a missing DLL *there* is a panel that never
+  # starts at all rather than one that starts and misbehaves.
   mkBundleCheck = pkg: pkgs.runCommand "${pkg.pname}-dll-closure"
     {
       nativeBuildInputs = [ pkgs.llvm ];
       meta.description = "Every DLL ${pkg.pname} imports is staged or OS-provided";
     } ''
-    llvm-readobj --coff-imports ${pkg}/bin/castaway.exe \
+    for exe in ${pkg}/bin/*.exe; do
+      llvm-readobj --coff-imports "$exe"
+    done \
       | grep -oP 'Name: \K\S+\.dll' | tr 'A-Z' 'a-z' | sort -u > imports.txt
 
     missing=""
@@ -443,6 +478,7 @@ rec {
     features = [ "electron" "audio-out" ];
     withFfmpeg = true;
     withBrowser = true;
+    withLauncher = true;
   };
 
   # One artifact, one check.

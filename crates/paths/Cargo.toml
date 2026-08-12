@@ -10,5 +10,8 @@ description = "Where castaway keeps its files: one per-user directory layout, re
 [dependencies]
 thiserror.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

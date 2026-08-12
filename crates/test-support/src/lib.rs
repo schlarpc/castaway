@@ -77,3 +77,38 @@ where
         tokio::time::sleep(POLL).await;
     }
 }
+
+/// [`eventually`] for a test with no runtime.
+///
+/// The launcher (#342) supervises real child processes from a synchronous loop, and its
+/// conditions are files appearing on disk. Adding a tokio runtime to a test whose whole
+/// subject is a blocking `wait()` would be a dependency bought for a sleep — but
+/// hand-rolling the poll again is exactly what this crate exists to stop, so the shared
+/// home grows a blocking door instead.
+///
+/// Wall time here is real, not virtual: there is no runtime to pause. That is the honest
+/// cost of testing a process supervisor end to end, and it is why the *decision* is
+/// tested separately in virtual time.
+pub fn eventually_blocking<T>(what: &str, check: impl FnMut() -> Option<T>) -> T {
+    eventually_blocking_within(what, DEADLINE, check)
+}
+
+/// [`eventually_blocking`] with the deadline chosen by the caller — for a condition that
+/// sits behind a real backoff ladder rather than a scheduler tick.
+pub fn eventually_blocking_within<T>(
+    what: &str,
+    deadline: Duration,
+    mut check: impl FnMut() -> Option<T>,
+) -> T {
+    let give_up = std::time::Instant::now() + deadline;
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < give_up,
+            "timed out after {deadline:?} waiting for {what}"
+        );
+        std::thread::sleep(POLL);
+    }
+}

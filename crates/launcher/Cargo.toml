@@ -1,0 +1,46 @@
+[package]
+name = "castaway-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The stable binary the panel's scheduled task points at: spawn the current version, restart forever, roll back one that never came up."
+
+# `launcher.exe` on the box, because that name is baked into a scheduled task that is
+# created once and must never need editing again.
+[[bin]]
+name = "launcher"
+path = "src/main.rs"
+
+[lib]
+name = "castaway_launcher"
+path = "src/lib.rs"
+
+[dependencies]
+castaway-paths.workspace = true
+thiserror.workspace = true
+# Timestamps on the launcher's own log lines, so they line up against the receiver's.
+# Already in the tree through rcgen, so this costs the build nothing.
+time = { workspace = true, features = ["formatting"] }
+
+# The job object, and nothing else. Kill-on-close is what stops an Electron child from
+# outliving the receiver that spawned it — the same failure `deploy-windows` handles with
+# `taskkill /T`, which there is no `/T` for here.
+[dev-dependencies]
+castaway-test-support.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  # `CreateJobObjectW` takes an optional SECURITY_ATTRIBUTES, so the whole function is
+  # gated behind this — nothing here wants a security descriptor, only the type that
+  # names its absence.
+  "Win32_Security",
+] }
+
+[lints]
+workspace = true

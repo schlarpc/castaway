@@ -20,8 +20,15 @@
 //!
 //! A resolution that found nothing to work from does not quietly pick somewhere: it is
 //! marked [`Origin::Fallback`] so the caller can say so out loud.
+//!
+//! [`install`] is the other half of "which directory?": not where a running receiver
+//! keeps its state, but which copies of the receiver are installed and which one runs.
+//! It lives here because the launcher (#342) and the updater (#345) must agree about it
+//! exactly, and a layout two programs disagree about is a panel that does not come back.
 
 #![forbid(unsafe_code)]
+
+pub mod install;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

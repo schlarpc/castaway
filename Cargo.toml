@@ -7,6 +7,7 @@ members = [
     "crates/core",
     "crates/paths",
     "crates/update",
+    "crates/launcher",
     "crates/test-support",
     "crates/substrate-hci",
     "crates/substrate-l2cap",
@@ -60,6 +61,7 @@ repository = "https://github.com/schlarpc/castaway"
 castaway-core = { path = "crates/core" }
 castaway-paths = { path = "crates/paths" }
 castaway-update = { path = "crates/update" }
+castaway-launcher = { path = "crates/launcher" }
 # Dev-dependency only, everywhere: the shared deadline poll (#236).
 castaway-test-support = { path = "crates/test-support" }
 substrate-mdns = { path = "crates/substrate-mdns" }
