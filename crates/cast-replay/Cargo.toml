@@ -35,7 +35,7 @@ prost.workspace = true
 rusqlite.workspace = true
 # Its BLOBs are libsodium secretboxes under a BLAKE2b-derived key.
 blake2b_simd.workspace = true
-crypto_secretbox.workspace = true
+xsalsa20poly1305.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Reads the peer certificate's validity, which is what bounds the credential.

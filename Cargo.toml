@@ -197,10 +197,19 @@ md-5 = "0.10"
 # `crypto_generichash_blake2b_salt_personal` sets the BLAKE2b parameter block's
 # *salt* and *personal* fields, and the `blake2` API does not expose them.
 blake2b_simd = "1"
-# XSalsa20-Poly1305, i.e. NaCl `crypto_secretbox`. A pre-release is the only
-# published version, but it is RustCrypto's own implementation of a frozen
-# construction, which beats composing salsa20 + poly1305 by hand here.
-crypto_secretbox = "0.2.0-pre.0"
+# XSalsa20-Poly1305, i.e. NaCl `crypto_secretbox` — RustCrypto's own implementation of a
+# frozen construction, which beats composing salsa20 + poly1305 by hand here.
+#
+# `xsalsa20poly1305` rather than its successor `crypto_secretbox`, and the deprecation
+# notice on it is worth reading past. `crypto_secretbox` has only ever published a
+# pre-release, and that pre-release pins an entire RustCrypto *pre-release generation*
+# exactly — `aead =0.6.0-rc.2`, `cipher =0.5.0-rc.1`, `salsa20 =0.11.0-rc.1`. Nothing else
+# in this tree can then use a released crate from that generation, which is what stopped
+# `sigstore` resolving at all (D59). This crate is the same authors' released
+# implementation of the same frozen construction, so the trade is a deprecation notice for
+# a dependency graph that resolves — and one fewer pre-release in a receiver that runs
+# unattended.
+xsalsa20poly1305 = "0.9"
 hmac = "0.12"
 hkdf = "0.12"
 rand = "0.10"
@@ -309,3 +318,4 @@ debug = true
 # rather than owned: the fork exists to be deleted.
 [patch.crates-io]
 mdns-sd = { path = "vendor/mdns-sd" }
+

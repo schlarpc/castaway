@@ -39,11 +39,11 @@
 use std::path::Path;
 
 use blake2b_simd::Params as Blake2bParams;
-use crypto_secretbox::aead::Aead as _;
-use crypto_secretbox::{KeyInit as _, XSalsa20Poly1305};
 use rsa::pkcs1::DecodeRsaPrivateKey as _;
 use rsa::pkcs8::EncodePrivateKey as _;
 use rsa::RsaPrivateKey;
+use xsalsa20poly1305::aead::Aead as _;
+use xsalsa20poly1305::{KeyInit as _, XSalsa20Poly1305};
 
 use crate::provider::Identity;
 use crate::window::Window;
@@ -367,8 +367,14 @@ fn open_box(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, ReplayError> {
         .filter(|b| b.len() >= TAG_LEN)
         .ok_or_else(|| ReplayError::Database("secretbox shorter than its tag".into()))?;
 
-    let nonce = crypto_secretbox::Nonce::try_from(nonce)
+    // Through a fixed-size array rather than the slice: this crate's `Nonce` is a
+    // `GenericArray`, whose only infallible conversion is from `[u8; 24]`. The slice
+    // `get(..NONCE_LEN)` already guarantees the length, so the `try_into` cannot fail —
+    // but saying so with a real error beats an indexing panic in a library crate.
+    let nonce: [u8; NONCE_LEN] = nonce
+        .try_into()
         .map_err(|_| ReplayError::Database("secretbox nonce is not 24 bytes".into()))?;
+    let nonce = xsalsa20poly1305::Nonce::from(nonce);
     XSalsa20Poly1305::new(key.into())
         .decrypt(&nonce, body)
         .map_err(|_| {
