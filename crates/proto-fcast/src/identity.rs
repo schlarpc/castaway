@@ -77,11 +77,18 @@ impl V4Identity {
 
         let key_der = rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der())
             .map_err(|e| FCastError::Tls(e.to_string()))?;
-        let config =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(vec![cert.der().clone()], key_der)
-                .map_err(tls_err)?;
+        // Name the provider rather than letting rustls pick one from its crate features:
+        // that path *panics* when the features are ambiguous, and since `castaway-update`
+        // brought `aws-lc-rs` into the tree beside our `ring` pin (D59), they are. TLS 1.3
+        // only, which is what the v4 protocol pins.
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(tls_err)?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key_der)
+        .map_err(tls_err)?;
 
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),

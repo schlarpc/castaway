@@ -59,17 +59,24 @@ impl NvHttpClient {
     ) -> Result<Self, GameStreamError> {
         let key_der = crate::pairing::pem_to_der(identity.key_pem())
             .ok_or_else(|| GameStreamError::Http("client key PEM did not parse".into()))?;
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedServerCert {
-                expected: server_cert_der.clone(),
-            }))
-            .with_client_auth_cert(
-                vec![CertificateDer::from(identity.cert_der().to_vec())],
-                PrivateKeyDer::try_from(key_der)
-                    .map_err(|e| GameStreamError::Http(format!("client key: {e}")))?,
-            )
-            .map_err(|e| GameStreamError::Http(e.to_string()))?;
+        // Name the provider rather than letting rustls pick one from its crate features:
+        // that path *panics* when the features are ambiguous, and since `castaway-update`
+        // brought `aws-lc-rs` into the tree beside our `ring` pin (D59), they are.
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| GameStreamError::Http(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerCert {
+            expected: server_cert_der.clone(),
+        }))
+        .with_client_auth_cert(
+            vec![CertificateDer::from(identity.cert_der().to_vec())],
+            PrivateKeyDer::try_from(key_der)
+                .map_err(|e| GameStreamError::Http(format!("client key: {e}")))?,
+        )
+        .map_err(|e| GameStreamError::Http(e.to_string()))?;
         self.https_port = https_port;
         self.agent_tls = Some(
             ureq::AgentBuilder::new()

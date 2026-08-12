@@ -228,11 +228,16 @@ impl V4Sender {
         assert_eq!(body[0], Opcode::Version.to_wire());
         assert_eq!(&body[1..], br#"{"version":4}"#);
 
-        let config =
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(PinVerifier { expected: None }))
-                .with_no_client_auth();
+        // Named, not defaulted, for the reason `V4Identity` names it: two provider
+        // features are enabled in this tree and rustls will not choose between them.
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinVerifier { expected: None }))
+        .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let name = rustls::pki_types::ServerName::from(addr.ip());
         let stream = connector.connect(name, stream).await.unwrap();
