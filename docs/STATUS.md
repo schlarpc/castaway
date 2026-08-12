@@ -64,6 +64,8 @@ upstream and then deleted.
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. Browser: the Electron subprocess host behind `electron` (D36). What is on the glass is one model — `panel` (screens, surfaces, focus; everything else derived) — and how it *moves* between those states is `motion` (springs, one choreography table), both pure and unit-tested with no GPU (D46). The compositor grew an animatable corner radius and an independent source rect so a container of the wrong shape crops rather than stretches. The composited output is also *readable*: `/screenshot.png` is a one-shot CPU readback, and `/stream/*` is a live HLS duplicate of the glass (#101, D49) — RGBA→NV12 in a wgpu pass at the stream's own size, whichever H.264 encoder the box turns out to have, and fMP4/HLS boxing that is ours and byte-tested. Nothing is encoded until something fetches the playlist, and the tap retires ten seconds after the last request: measured on the dev box, zero CPU with nobody watching and ~5.4% of one core streaming 1080p30 off a 4K panel. The duplicate carries the panel's **sound** as well (D50, D52): tapped on the panel's one **audio mixer** — every source, and the browser's page audio, writes into a `MixInput` and the mixer owns the single device (#111) — and muxed as a second track in the same segments, both measured against one wall-clock origin so they cannot drift. The tap is fed the samples the device was given rather than a reconstruction of them, and the mixer is also what paces every source: a `Pull` source's `MixInput::write` blocks while it is already `OUTPUT_LEAD` ahead of the speakers, in flight across the ring *and* the device queue, while a `Live` source sheds its oldest frames instead — parking a live sender just moved the loss upstream into protocol queues, measured at 21–22% before #174. A device that refuses or vanishes — the panel sleeping and taking the HDMI sink with it (#55) — is the mixer's problem to retry behind sources that keep draining, not a session-ending error. The same encoded pictures are also fanned out live, in Annex-B with the parameter sets in band, to **WebRTC peers** (#18): `/remote/` is the panel made *touchable* from a phone, over one PeerConnection carrying the duplicate out and that peer's contacts back. Since the row was written: the visualizer taps the same mixer (16 Goertzel bands, D56); the video decoder is fed on dts so B-frames no longer arrive in bursts (#234); the scrubber interpolates between clock readings and follows a finger mid-drag (#165, #97); `[audio] record` writes the post-mix, post-gain stream to a WAV (#186); and `mixer-vm` measures the mixer against a clock that is not its own (#204). The remote track carries the same mix as **Opus** beside the pictures (#259) — encoded only while a peer is listening, negotiated under the offerer's payload type, and read back out of a real Chromium's decoder as the test tone's own waveform (`remote_browser.rs`). **Not done:** the upload to the hardware encoder is a readback, not a zero-copy handle export (#101); audio is stereo only, and leads the panel's own speakers by the output queue's depth. |
 | `control-display` | **Trait and encoder only — no backend reaches hardware.** `NullDisplay` logs, and it is what `app` constructs unconditionally. `dell.rs` builds the RS-232 command frame (header/id/category/opcode/len/data/XOR) with **placeholder opcodes**, and nothing sends it. The `serial` and `ddc` features are empty feature lists — no `serialport`, no `ddc-hi`, no module behind either (#21). |
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. The kiosk now routes each press to the browser *or* to the panel's transport strip, whichever owns the point touched (D33). |
+| `update` | **The whole self-update path except the key** (#343/#345). Two halves: the release *manifest* — a schema-1 JSON carrying the commit, a monotonic build number, and the artifact's digest, verified against a minisign signature and a key compiled into the binary before the JSON is parsed at all — and the agent that acts on it. The schedule is pure (window, idle, phase → wait/check/activate) and asserted in virtual time against the shipped 03:30–05:00 window; the agent is the thin shell that reads one clock, downloads on `spawn_blocking`, and stages under a name the launcher cannot spawn until the tree is complete. Every runtime failure degrades to "keep running what you are running". **Not done:** no signing key exists yet (#347), so on this tree it stands down as `NoKey` and says so — and no release has ever been installed by it on the real box (#346). |
+| `launcher` | **Done, and driven end to end on Linux.** The one binary the panel's scheduled task points at: read `current.txt`, spawn `versions/<sha>/castaway.exe` inside a kill-on-close job object, restart forever with capped backoff, follow one reserved exit code as "re-read the pointer", and roll back to `previous.txt` when a version that *never* wrote its health marker keeps dying young. The decision is pure and asserted in virtual time including the backoff cap; `tests/kiosk_loop.rs` drives a real launcher against real child processes through all four cases. **Not done:** it has never met real schtasks, real Defender, or the real console session (#346). |
 | `app` | **Runs.** One HTTP host (DLNA+Spotify+DIAL) + one SSDP + one mDNS + session mgr. TOML config. The network surface is a registry (D45): `surface.rs` generates `docs/network-surface.md` and `nix/network-surface.json` (freshness-tested), the NixOS firewall derives from the JSON, media planes bind from `[media_ports]`, raw binds are clippy-denied outside registered sites, and `--network-surface[=json\|netsh]` prints the resolved view. |
 
 ## The panel's own controls (`cargo run -p pipeline --features render --example card_preview <out.png> [cover.png]`)
@@ -661,6 +663,38 @@ Files land as `castaway.2026-07-28.log`, dated so a restart appends to today's r
 truncating it. Writes are synchronous: the release profile is `panic = "abort"`, and an
 aborting process never flushes a background writer's buffer — which is exactly the tail
 worth having.
+
+## Auto-update (`[update]` in castaway.toml, on by default; #26's five slices)
+
+The panel replaces itself, at night, when nobody is using it. Five pieces, all landed
+except the box-side migration and the keys:
+
+- **A release says what it is** (#343). Every release carries `manifest.json` and a
+  detached minisign signature. A commit sha identifies a tree without ordering two of
+  them, so the manifest's monotonic build number (`git rev-list --count`, sound because
+  this repo commits linearly) is what lets the panel answer "is this newer than me"; the
+  signature is what stops that answer being rewritten in transit. The threat model is
+  stated honestly in `crates/update/src/lib.rs`: this defends the CDN and mitm path, not
+  the account that holds the signing secret.
+- **A release is signed before it is published** (#344). Authenticode over our own
+  executables, then castLabs EVS VMP over the Electron tree, both in CI so the panel holds
+  no credentials — because `vmp-sign.sh` running after a hand deploy meant the first
+  unattended update would have stripped the `.sig` files and killed DRM silently.
+- **A launcher owns the tree** (#342). Side-by-side `versions/<sha>/` directories under
+  `%LOCALAPPDATA%\castaway`, a `current.txt`/`previous.txt` pointer pair, and a stable
+  `launcher.exe` that the scheduled task names and nothing else does.
+- **The receiver updates itself** (#345). One `releases/latest` call a night inside the
+  window, signature → build number → digest → extract, then activation only once no
+  session is running and nobody has touched the panel. `checks.update-vm` runs the whole
+  loop against a fake release API with two real receivers a build number apart.
+- **The box moves onto it** (#346, open). The tooling is written — `nix run
+  .#windows-migrate` — and the acceptance needs the panel.
+
+What is *not* done, and both are the same shape: **no signing key exists yet** (#347 for
+the release manifest, #348 for Authenticode and EVS). Until they do, releases publish
+unsigned with a red annotation and the updater stands down rather than installing
+anything. That is the correct degradation, and it means nothing in this section has been
+exercised against a real GitHub release.
 
 ## Where files live (`castaway-paths`, D39)
 | | Linux (XDG) | Windows |
