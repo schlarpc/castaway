@@ -76,21 +76,35 @@ impl ReleaseSource {
 #[derive(Debug, Error)]
 pub enum StandDown {
     /// `[update] enabled = false`.
-    #[error("the updater is switched off in castaway.toml")]
+    #[error("switched off by `[update] enable = false` in castaway.toml")]
     Disabled,
     /// This build carries no release signing key, so it can verify nothing (#347).
-    #[error("this build carries no release signing key")]
+    #[error(
+        "this build carries no release signing key, so it can verify no release at all \
+         (#347). Until that key exists this panel updates only by hand."
+    )]
     NoKey,
     /// A dirty tree, a shallow clone, or no history: this build cannot order itself
     /// against a release, so it must not take one. Exactly the hand-built receiver
     /// somebody is mid-bisect on.
-    #[error("this build does not know its own build number, so it cannot be ordered")]
+    #[error(
+        "this build does not know its own build number — a dirty tree, a shallow clone, or \
+         no history — so it cannot tell whether a release is newer than itself, and will \
+         not take one. A build from a clean checkout knows."
+    )]
     UnknownBuild,
     /// A `hold` file at the install root. A hand deploy wrote it; deleting it re-arms.
-    #[error("a hold file at the install root: a human deployed this by hand")]
+    #[error(
+        "a `hold` file at the install root: somebody deployed this by hand, and the updater \
+         stands down until they delete it"
+    )]
     Hold,
     /// Not running under a launcher, so there is nothing to hand over to.
-    #[error("not installed under a launcher")]
+    #[error(
+        "not installed under a launcher: this receiver is not inside a `versions/<sha>/` \
+         tree, so there is nothing to hand over to. `nix run .#windows-migrate` is what puts \
+         a box onto that layout; a development build is expected to land here."
+    )]
     Unmanaged(#[source] LayoutError),
 }
 
@@ -115,7 +129,20 @@ pub struct Agent {
     /// Whether the `hold` file was there last time round, so its appearance and its
     /// removal are each one log line rather than one per look.
     held: bool,
+    /// How many looks in a row have come to nothing because something failed.
+    ///
+    /// The whole design fails closed — every error means "keep running what you are
+    /// running, try again tomorrow" — and the cost of that is a panel which can stop
+    /// updating for a month without ever saying anything louder than one `warn` a night,
+    /// each indistinguishable from the last. This counter is what makes a wedge legible:
+    /// the log line grows a count and, past a week, tells a human what to do about it.
+    consecutive_failures: u32,
 }
+
+/// After this many failed nights, the log stops describing tonight and starts describing
+/// the *situation*. A week is long enough that a flaky uplink has recovered and short
+/// enough that somebody still remembers deploying whatever broke it.
+const WEDGED_AFTER: u32 = 7;
 
 /// A release that has been downloaded, verified and extracted under its final name.
 #[derive(Debug, Clone)]
@@ -171,6 +198,7 @@ impl Agent {
             staged: None,
             phase: Phase::Fresh,
             held: false,
+            consecutive_failures: 0,
         })
     }
 
@@ -242,12 +270,16 @@ impl Agent {
                         );
                         self.staged = Some(staged);
                     }
-                    Ok(None) => self.phase = Phase::UpToDate,
+                    Ok(None) => {
+                        self.consecutive_failures = 0;
+                        self.phase = Phase::UpToDate;
+                    }
                     Err(e) => {
                         // Every one of these — the API down, a bad signature, a corrupt
                         // zip, a full disk — has the same answer, and it is the answer a
                         // kiosk wants: nothing changes and it tries again tomorrow.
-                        warn!(error = %Chain(&e), "auto-update: nothing taken tonight");
+                        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                        self.report_failure(&e);
                         self.phase = Phase::UpToDate;
                     }
                 },
@@ -273,6 +305,39 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Say what went wrong tonight — and, once it has been going on long enough to be a
+    /// state rather than a bad night, say *that* instead, in terms somebody standing at
+    /// the panel can act on.
+    ///
+    /// Failing closed was chosen deliberately: a panel that has not updated in months
+    /// wants a human, not a receiver that gets cleverer. The cost of that choice is paid
+    /// here, in saying so plainly rather than leaving it to whoever thinks to read a log.
+    fn report_failure(&self, error: &UpdateError) {
+        let nights = self.consecutive_failures;
+        if nights < WEDGED_AFTER {
+            warn!(
+                error = %Chain(error),
+                nights,
+                "auto-update: nothing taken tonight; the panel keeps running what it has"
+            );
+            return;
+        }
+        warn!(
+            error = %Chain(error),
+            nights,
+            running = %self.running.short(),
+            build = %self.installed,
+            source = %self.source.latest_url(),
+            "auto-update has taken nothing for {nights} nights running and needs a person. \
+             This receiver keeps working — it is only the *updating* that is stuck. Check, \
+             in this order: can the panel reach the release API at all (the URL above); does \
+             that release carry manifest.json and manifest.json.minisig (a release published \
+             before the signing key existed does not — see #347); and does the signature \
+             verify against the key this build was compiled with. Every one of those fails \
+             closed on purpose, so none of them will resolve itself."
+        );
     }
 
     /// Is a human driving? One log line when it appears and one when it goes, because

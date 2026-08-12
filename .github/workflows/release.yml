@@ -57,7 +57,11 @@ jobs:
       EVS_PASSWD: ${{ secrets.EVS_PASSWD }}
       EVS_NO_ASK: "1"
     permissions:
+      # The OIDC token `attest-build-provenance` exchanges with Fulcio for a short-lived
+      # signing certificate. Already requested before this — the Nix installer uses it too.
       id-token: write
+      # Storing the provenance attestation against this repository.
+      attestations: write
       # The one departure from the Test workflow's read-only stance: creating the release
       # and uploading the zip is a write to this repo's contents.
       contents: write
@@ -92,7 +96,8 @@ jobs:
       - name: Install the castLabs EVS client
         if: ${{ env.EVS_ACCOUNT_NAME != '' }}
         run: pip install --user castlabs-evs
-      - name: Publish the commit-named release
+      - name: Assemble the release assets
+        id: assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -141,6 +146,49 @@ jobs:
                  "with 'nix run .#release-keygen' and set the secret (#343)."
           fi
 
+          # Handed to the next two steps as one line, because the attestation has to cover
+          # exactly the bytes the release will carry — naming them twice is how the two
+          # come to disagree.
+          # One per line: `subject-path` takes a newline-separated list, and the publish
+          # step's `read -a` splits on newlines too, so one output serves both without
+          # either having to know how the other quotes.
+          {
+            echo "short=$short"
+            echo "assets<<ASSET_LIST"
+            printf '%s\n' "${assets[@]}"
+            echo "ASSET_LIST"
+          } >> "$GITHUB_OUTPUT"
+
+      # Provenance, from GitHub's own machinery: a Sigstore bundle signed with a
+      # short-lived certificate bound to *this workflow's* identity, and logged in the
+      # public Rekor transparency log. No secret exists for anyone to steal, and the
+      # forgery a signing secret cannot stop — someone with write access swapping a
+      # release asset — becomes a visible commit to this file rather than a silent swap.
+      #
+      # `gh attestation verify castaway-windows-electron-<sha>.zip --repo schlarpc/castaway`
+      # is the whole verification story for a human or a CI gate.
+      #
+      # The panel does *not* check this, and that is a decision rather than an oversight:
+      # the Rust Sigstore client links 326 packages including a second HTTP stack and a
+      # browser launcher, against 113 for the whole updater today. What the panel checks
+      # is in `crates/update`.
+      #
+      # Between assembling and publishing, so a release only exists once its provenance
+      # does. A failure here is a failed job and no release, which is the right way round.
+      - name: Attest what this workflow built
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: ${{ steps.assets.outputs.assets }}
+
+      - name: Publish the commit-named release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.assets.outputs.short }}
+          ASSETS: ${{ steps.assets.outputs.assets }}
+        run: |
+          set -euo pipefail
+          short="$SHORT"
+          read -r -a assets <<< "$ASSETS"
           # `build-<sha>` rather than the bare sha: a tag that *is* a commit id shadows
           # the commit in every ref-vs-object ambiguity git and the API have.
           # `--prerelease` and `--latest=false` are the same claim twice, deliberately.

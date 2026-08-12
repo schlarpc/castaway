@@ -2459,3 +2459,59 @@ libavformat an `fcomp` protocol: an AVIO callback is `unsafe` FFI on the decode 
 transfer a loopback socket already does, and serving inline content the same way is what
 gives a pushed DASH manifest a real base URL for its relative segment references — the one
 thing a `data:` URI cannot provide.
+
+### D59 — GitHub's own provenance, checked where `gh` already lives, and not on the panel
+
+`RELEASE_SIGNING_KEY` (#343) is a minisign secret sitting in an Actions secret, and the
+obvious question is why the release path does not just use the keyless machinery GitHub
+gives away: an OIDC token exchanged with Fulcio for a ten-minute certificate bound to the
+workflow identity, the signature logged in Rekor, and no secret for anybody to steal.
+
+The answer is that it now does — in CI. `release.yml` runs `actions/attest-build-provenance`
+over every release asset, and the Test workflow's `promote` job refuses to move **Latest**
+onto a release whose provenance does not verify against
+`--signer-workflow <repo>/.github/workflows/release.yml`. `promote` is the one job in this
+repository that claims a commit is good, and the panel does nothing but follow the pointer
+it sets, so that is where the check earns its keep. The chain is attestation → `manifest.json`
+→ the zip's SHA-256 → the artifact, which is why the small file is the one verified: the
+manifest names the digest, and the receiver checks that digest when it downloads.
+
+**The receiver does not verify the attestation, and the reason is one line of somebody
+else's `Cargo.toml`:**
+
+```toml
+[target.'cfg(not(target_arch = "powerpc64"))'.dependencies.aws-lc-rs]
+version = "1"
+```
+
+`sigstore` 0.14 depends on `aws-lc-rs` unconditionally — not optional, not feature-gated,
+and `cert = ["rustls-webpki/aws-lc-rs"]` wires the same provider into the one feature a
+verifier needs. So there is no feature combination that reaches it through `ring`, and
+putting it on the panel means building `aws-lc-sys` — C, cmake, and NASM for x86-64 Windows
+assembly — through the hand-rolled clang-cl/lld-link MSVC sysroot. The workspace pins `ring`
+everywhere for exactly this reason, in a comment that names this exact scenario. Everything
+else about the crate is fine: it cross-compiles, it verifies offline (`offline: bool` is a
+parameter), `Verifier::new` takes any `TrustRoot` so the trust root can be embedded, and it
+adds 35 packages to an application that already links 572. The blocker is the C library, and
+nothing else.
+
+**Two objections raised against keyless during the design were wrong, and are recorded
+because they are the ones that will be raised again.** The first was package weight: measured
+badly (`cargo tree` marks repeated subtrees `(*)`, which `sort -u` counts twice) and measured
+against the wrong baseline (`castaway-update` alone rather than the application). Corrected,
+it is 35 new packages, and `reqwest`/`hyper` are not among them because the app already
+carries both. The second was that Sigstore's TUF trust root rotates and a stale embedded copy
+fails closed. That is true and almost irrelevant: the trusted root is *cumulative*, so time
+alone never invalidates anything, and the panel is by definition online when it updates —
+refreshing the root is the same class of dependency as the release fetch it is already making,
+with the same benign failure ("no update tonight"). It is also the tradeoff the minisign key
+already has, since that public half is compiled in too and rotating it is a hand deploy.
+
+What remains open is whether the panel keeps a signature check of its own at all. The honest
+reading of the current one is that it is thin: `RELEASE_SIGNING_KEY` is readable by any
+workflow in this repository, so it does not defend against the attacker who motivates
+signing — someone with write access swapping a release asset — and against a network attacker
+it adds little to TLS plus a digest fetched over TLS. The attestation gate in `promote` does
+defend against that attacker, because forging it requires a visible commit to `release.yml`
+rather than a silent asset swap. Recorded here rather than acted on, because dropping a
+working check is a decision, not a cleanup.

@@ -151,8 +151,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       # As in the Release workflow, and for the same reason: editing a release is a write
-      # to this repository's contents. Nothing else here needs more than the default.
+      # to this repository's contents.
       contents: write
+      # Reading the build provenance before the pointer moves.
+      attestations: read
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -191,6 +193,29 @@ jobs:
                    "finished out of order. Leaving the pointer where it is."
               exit 0
             fi
+          fi
+
+          # Provenance, checked before the pointer moves. `promote` is the one job in this
+          # repository that claims a commit is good, and the panel does nothing but follow
+          # the pointer it sets — so this is where "GitHub itself vouched for these bytes"
+          # belongs. The receiver links no Sigstore client: `sigstore-rs` depends on
+          # `aws-lc-rs` unconditionally, and a second C crypto build through the hand-rolled
+          # MSVC sysroot is exactly what the workspace's `ring` pin exists to prevent.
+          #
+          # `manifest.json` rather than the 250 MB zip, deliberately and not just for speed:
+          # the manifest carries the zip's SHA-256, and the panel checks that digest when it
+          # downloads. So verifying the small file's provenance covers the large one, and the
+          # chain is attestation → manifest → digest → artifact.
+          gh release download "$tag" --pattern manifest.json --dir attest --clobber
+          if ! gh attestation verify attest/manifest.json \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"; then
+            echo "::error::$tag has no verifiable build provenance, so Latest stays where" \
+                 "it is. Either the Release workflow did not attest it (a release published" \
+                 "before #26's attestation step), or something other than release.yml on" \
+                 "this repository produced that manifest — which is the case this check" \
+                 "exists for."
+            exit 1
           fi
 
           # Both halves: out of prerelease, because it has now been validated, and onto
