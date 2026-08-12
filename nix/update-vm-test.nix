@@ -174,13 +174,15 @@ pkgs.testers.runNixOSTest {
         receiver.succeed("date -s '04:00:00'")
 
     receiver.succeed("systemctl start castaway-launcher")
-    log = "${root}/castaway.log"
+    # Not `log`: the test driver already has one of those, and shadowing it is a type
+    # error rather than a mystery, which is the good outcome.
+    LOG = "${root}/castaway.log"
 
     with subtest("the launcher starts the version current.txt names, and it arms"):
-        receiver.wait_until_succeeds(f"grep -q 'auto-update is armed' {log}", timeout=120)
+        receiver.wait_until_succeeds(f"grep -q 'auto-update is armed' {LOG}", timeout=120)
         # The build number reached the binary: without it the updater stands down as
         # `UnknownBuild` and nothing below could happen.
-        receiver.succeed(f"grep -q 'build=${toString buildA}' {log}")
+        receiver.succeed(f"grep -q 'build=${toString buildA}' {LOG}")
 
     with subtest("this version reports itself healthy, which is what stops a rollback"):
         receiver.wait_until_succeeds(
@@ -189,10 +191,10 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the signed release is verified, ordered, and staged"):
         receiver.wait_until_succeeds(
-            f"grep -q 'the release is signed' {log}", timeout=180
+            f"grep -q 'the release is signed' {LOG}", timeout=180
         )
         receiver.wait_until_succeeds(
-            f"grep -q 'staged and waiting for the panel' {log}", timeout=300
+            f"grep -q 'staged and waiting for the panel' {LOG}", timeout=300
         )
         # Named only once it was complete: the staging directory is gone and the tree is
         # under a name `VersionId::parse` accepts.
@@ -201,7 +203,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the panel is quiet, so it hands over to the launcher"):
         receiver.wait_until_succeeds(
-            f"grep -q 'restarting into the new version' {log}", timeout=180
+            f"grep -q 'restarting into the new version' {LOG}", timeout=180
         )
         # The pointers moved together and in the right order: the new version is current,
         # and the one that was running is the rollback target.
@@ -212,10 +214,10 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the launcher notices the handshake and starts the new tree"):
         receiver.wait_until_succeeds(
-            f"grep -q 'asked to be reloaded' {log}", timeout=120
+            f"grep -q 'asked to be reloaded' {LOG}", timeout=120
         )
         receiver.wait_until_succeeds(
-            f"grep -q 'now running version ${shortB}' {log}", timeout=120
+            f"grep -q 'now running version ${shortB}' {LOG}", timeout=120
         )
         # And the new one comes all the way up, which is the claim the whole exercise is
         # for: an unattended panel is running newer bits than it was, by itself.
@@ -225,7 +227,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("and it stops: the same release is no longer newer than what is running"):
         receiver.wait_until_succeeds(
-            f"grep -q 'Latest is not newer' {log}", timeout=300
+            f"grep -q 'Latest is not newer' {LOG}", timeout=300
         )
         # The rollback target is kept, not collected — a panel with nothing to fall back to
         # is the state this whole design exists to avoid.

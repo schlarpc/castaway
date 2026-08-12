@@ -129,10 +129,18 @@ fn requested_console_filter(log: &Log, rust_log: Option<String>) -> String {
 /// opened degrades to console-only with a `warn!` naming the directory and the reason —
 /// the one thing the old silently-unwritable-directory behaviour never did (G31).
 pub fn init(log: &Log, dirs: &Dirs) {
-    let console = tracing_subscriber::fmt::layer().with_filter(filter(&requested_console_filter(
-        log,
-        std::env::var(EnvFilter::DEFAULT_ENV).ok(),
-    )));
+    // Colour only when somebody is there to see it. On the panel the "console" is a
+    // *file*: the launcher redirects the receiver's stdout into the shared `castaway.log`
+    // (#342), and escape codes there make `type castaway.log` on the box unreadable —
+    // which is the one diagnostic anyone has when the panel misbehaves. The file layer
+    // has always set `with_ansi(false)`; this is the same decision, made from the
+    // stream's own answer rather than assumed.
+    let console = tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .with_filter(filter(&requested_console_filter(
+            log,
+            std::env::var(EnvFilter::DEFAULT_ENV).ok(),
+        )));
 
     let file = if log.to_file {
         match file_layer(log, dirs) {
