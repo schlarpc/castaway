@@ -137,6 +137,17 @@ jobs:
           # before it could ask whether the bytes were genuine, with nothing trustworthy to
           # bound the download by. Verifying the 240-byte manifest first yields the digest
           # and the size, and the zip is then fetched against both.
+          # `rev-list --count` on a shallow clone counts what it can see and says nothing
+          # about it, so ask git directly rather than inferring from the answer. The old
+          # guard — refusing a count below 2 — only ever caught `fetch-depth: 1`; a depth
+          # of 50 would have produced 50, passed, and permanently wedged every panel that
+          # had already installed a real build, because nothing afterwards can look newer.
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "::error::this checkout is shallow, so the build number would be wrong" \
+                 "and every future release would look like a downgrade. release.yml needs" \
+                 "fetch-depth: 0 (#343)."
+            exit 1
+          fi
           build=$(git rev-list --count "$GITHUB_SHA")
           nix run '.#release-manifest' -- "$zip" "$GITHUB_SHA" "$build" .
           assets+=(manifest.json)

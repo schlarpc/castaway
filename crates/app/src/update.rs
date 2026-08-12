@@ -132,10 +132,10 @@ pub fn spawn(
         Ok(agent) => agent,
         Err(reason) => {
             // Each of these is a state rather than a fault, so they are `info` — except
-            // the one that means a release cannot be verified at all, which somebody
-            // should fix (#347).
+            // damaged trust anchors, which mean this build can verify nothing at all and
+            // is somebody's to fix.
             match &reason {
-                StandDown::NoKey => warn!("auto-update: {reason}"),
+                StandDown::TrustAnchors(_) => warn!("auto-update: {reason}"),
                 _ => info!("auto-update: {reason}"),
             }
             return exit_code;

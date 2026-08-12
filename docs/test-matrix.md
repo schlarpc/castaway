@@ -117,10 +117,11 @@ answer.
 Three checks were added after this audit and are in the table below without a per-protocol
 matrix section, because auto-update is not a protocol: `release-manifest`,
 `castaway-windows-electron-authenticode` and `update-vm` (#26's slices). What each is worth
-is in its row, and what it deliberately does *not* prove is worth stating once here: none of
-them has ever seen a real signing key or a real GitHub release, because neither exists yet
-(#347, #348). They prove the format, the ordering and the loop; the first real release is
-still the first real release.
+is in its row, and what they do *not* prove is worth stating once here: no panel has ever
+taken a release by itself, because that needs the box (#346), and no release yet carries
+Authenticode or VMP signatures because those credentials do not exist (#348). The build
+provenance, by contrast, needs no secret and is real today — `castaway_update::attestation`
+verifies a genuine bundle for a genuine release of this repository.
 
 `android-cast` is the one check with a **host requirement beyond the `kvm` system
 feature**: it builds a TAP inside the sandbox's network namespace, and the sandbox's
@@ -166,8 +167,8 @@ So the question is never "did CI run it". It is **"is there a check for it"**.
 | `moonlight-bindings` | the same for `moonlight-sys/src/bindings.rs` against the pinned `Limelight.h` | T3 | <1m |
 | `castaway-windows-electron-dll-closure` | cross-build + static import-table closure, over **every** `.exe` in the artifact — the receiver and, since #342, the launcher | T2 | 51–70m |
 | `castaway-windows-electron-authenticode` | signs the real cross-built executables with a throwaway certificate and reads the signature back. It cannot say anything about the *release* key (#348) — what it proves is that `osslsigncode` accepts a PE this toolchain emits, that the code-signing EKU survives the PKCS#12 round trip, that an **unsigned** copy fails the same verification (so the positive result is not true of any PE), and that signing against a certificate the box does not trust is refused (#344) | T2 | shares the cross tree |
-| `release-manifest` | regenerates `crates/update/fixtures/` with the release script CI calls and demands byte-identical output. Ed25519 signing is deterministic and minisign does not salt, so this pins the **signature format** as well as the JSON field names — a rename on either side is a red check rather than a release no panel can install (#343) | **T3-ish** | seconds |
-| `update-vm` | 1 node; a real launcher, **two real receivers a build number apart**, a release signed by the very script `release.yml` calls, and a fake release API on loopback. Drives the whole loop: arm, health marker, verify, order, stage, activate on the handshake, restart into the new tree — with the guest's clock moved into the **shipped** 03:30–05:00 window rather than the window widened to suit the test. Ends by asserting it *stops*: the same release is no longer newer than what is running (#345) | T2 | 19s + build |
+| `release-manifest` | regenerates `crates/update/fixtures/manifest.json` with the release script CI calls and demands byte-identical output — field names, ordering, and every value's exact rendering. A rename on either side is a red check rather than a release no panel can install (#343) | **T3-ish** | seconds |
+| `update-vm` | 1 node; a real launcher and **two real receivers a build number apart**, starting from a pre-staged tree. Drives rediscovery → idle policy → activation on the handshake → the launcher restarting into the new tree → health marker → GC keeping the rollback target, with the guest's clock moved into the **shipped** 03:30–05:00 window rather than the window widened to suit the test. **What it deliberately does not cover:** fetch and verify. A fake release API cannot mint a Sigstore bundle (that needs a fake Fulcio and Rekor), so `base_url` points at a dead port and that leg is unit-tested instead — against a *real* attestation for a *real* release of this repository, offline (#345, D59) | T2 | build + ~20s |
 
 **Gone in D55**, and worth knowing where their coverage went, because the names appear
 throughout the per-protocol matrices below: `audio`, `render-pixels`, `media-plane`,

@@ -16,6 +16,28 @@ serde_json.workspace = true
 ed25519-dalek.workspace = true
 blake2b_simd.workspace = true
 base64.workspace = true
+
+# GitHub's build provenance (D59): a Sigstore bundle signed by a certificate bound to the
+# release workflow's identity. The receiver verifies that rather than a signature of ours,
+# so no signing secret exists in the repository at all.
+#
+# `default-features = false` keeps the signing and OAuth halves out — a verifier has no
+# business linking a browser launcher. `sigstore-trust-root` is on for exactly one
+# function, `from_trusted_root_json_unchecked`, which parses the root we embed; nothing
+# here ever fetches over TUF.
+#
+# It brings `aws-lc-rs` with it unconditionally, which is what the workspace's `ring` pin
+# exists to avoid. Measured before it was accepted: `aws-lc-sys` cross-compiles to the
+# Windows target through this tree's own sysroot with neither cmake nor NASM, taking its
+# `cc_builder` path with the prebuilt objects the crate ships (D59). It also forced the
+# `crypto_secretbox` patch in the workspace manifest — see there for why.
+sigstore = { version = "0.14", default-features = false, features = [
+  "bundle",
+  "verify",
+  "cert",
+  "sigstore-trust-root",
+  "rustls-tls",
+] }
 # The artifact digest the manifest carries.
 sha2.workspace = true
 
@@ -32,6 +54,9 @@ ureq.workspace = true
 # zstd — three C libraries — into a cross-build that has no need of any of them.
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 tokio = { workspace = true, features = ["rt", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "time", "macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

@@ -2476,54 +2476,71 @@ it sets, so that is where the check earns its keep. The chain is attestation →
 → the zip's SHA-256 → the artifact, which is why the small file is the one verified: the
 manifest names the digest, and the receiver checks that digest when it downloads.
 
-**The receiver does not verify the attestation *yet*, and — this is the important part —
-not for any of the three reasons first advanced against it.** All three were measurement
-errors, and they are written down here because they are exactly the objections that will be
-raised again:
+**The receiver verifies the attestation itself**, and minisign is gone: the module, the
+embedded key, the keygen, and the `RELEASE_SIGNING_KEY` secret. `promote`'s gate stays as
+the outer ring — it keeps the Latest pointer off a release whose provenance does not check
+out — but the panel no longer takes anything on trust from it.
 
-1. *"It links 326 packages."* Measured badly and against the wrong baseline. `cargo tree`
-   marks repeated subtrees `(*)`, so `sort -u` counted `hyper v1.11.0` and
-   `hyper v1.11.0 (*)` as two packages; and the comparison was against `castaway-update`
-   alone rather than against the application. Corrected: **35 new packages on top of the
-   572 the app already links**, and `reqwest`/`hyper` are not among them, because webrtc
-   and axum already carry both.
+Three objections were raised against getting here, **all three were measurement errors**,
+and they are written down because they are exactly what will be raised again:
+
+1. *"It links 326 packages."* `cargo tree` marks repeated subtrees `(*)`, so `sort -u`
+   counted `hyper v1.11.0` and `hyper v1.11.0 (*)` as two; and the baseline was
+   `castaway-update` alone rather than the application. Corrected: **35 new packages on top
+   of the 572 the app already links**, and `reqwest`/`hyper` are not among them because
+   webrtc and axum already carry both.
 2. *"Sigstore's TUF trust root rotates, so a stale embedded copy fails closed."* True and
-   nearly irrelevant. The trusted root is *cumulative* — old keys stay with validity
-   windows precisely so old signatures keep verifying — so elapsed time alone never
-   invalidates anything. And the panel is online by definition when it updates: refreshing
-   the root is the same class of dependency as the release fetch it is already making, with
-   the same benign failure ("no update tonight, try tomorrow"). It is also the tradeoff the
-   minisign key *already* has, since that public half is compiled in and rotating it is a
-   hand deploy either way.
-3. *"`aws-lc-sys` will not cross-build."* Simply false, and the run that appeared to prove
-   it was self-inflicted: `env PATH="…:$PATH"` expanded in the outer shell and clobbered the
-   dev shell's own PATH, so `llvm-lib` "disappeared" and a `No such file or directory` was
-   read as a toolchain limitation. Measured properly, `aws-lc-sys` 0.44 cross-compiles to
+   nearly irrelevant — see the trust-root design below.
+3. *"`aws-lc-sys` will not cross-build."* False, and the run that appeared to prove it was
+   self-inflicted: `env PATH="…:$PATH"` expanded in the *outer* shell and clobbered the dev
+   shell's own PATH, so `llvm-lib` "disappeared" and a `No such file or directory` was read
+   as a toolchain limitation. Measured properly, `aws-lc-sys` 0.44 cross-compiles to
    `x86_64-pc-windows-msvc` from Linux through this tree's own sysroot **with neither cmake
    nor NASM on PATH** — it takes its `cc_builder` path with the prebuilt NASM objects the
-   crate ships — producing a real 13.8 MB `aws_lc_0_44_0_crypto.lib` in 24 seconds for the
-   whole 232-crate graph.
+   crate ships — producing a real 13.8 MB library in 24 seconds for the whole graph.
 
-So `sigstore` 0.14 *is* usable here. What it costs, honestly: 35 packages, ~14 MB of static
-library, and a second crypto provider compiled into `rustls` alongside `ring` — because
-`sigstore` depends on `aws-lc-rs` unconditionally (not optional, not feature-gated, and
-`cert = ["rustls-webpki/aws-lc-rs"]` wires it into the one feature a verifier needs), so
-feature unification lands both. The workspace's `ring` pin was written to keep a second C
-crypto build out of the cross-toolchain; that cost turns out to be affordable, and the pin's
-remaining force is about audit surface rather than buildability.
+**What it actually cost**, which is the part no estimate predicted: `sigstore` declares an
+*optional* `scrypt ^0.12`, needing released `salsa20 ^0.11`, while `crypto_secretbox
+0.2.0-pre.0` — the NaCl secretbox that opens AirServer's credential database (D44) — pins
+`=0.11.0-rc.1`. Cargo will hold neither both nor either, so **the workspace would not
+resolve at all**, over a crate that is never compiled (optional dependencies are still
+resolved). The fix is ours rather than a patch to anyone else's tree: `xsalsa20poly1305`,
+the same authors' *released* implementation of the same frozen construction. Its deprecation
+notice points at `crypto_secretbox`, which has never shipped a release — and a receiver that
+runs unattended for weeks is better served by a deprecated-but-released dependency than by a
+release-candidate one.
 
-Everything else about the crate suits this use: `offline: bool` is a parameter on
-`verify_digest`, and `Verifier::new` takes any `TrustRoot`, so the trust root can be embedded
-exactly the way `release-key.pub` is today.
+**The trust root is embedded *and* refreshed**, and the distinction the second objection
+missed is worth keeping. The root is *cumulative*: retired Fulcio CAs and Rekor logs stay in
+it with `validFor` windows, so a release signed years ago verifies for ever — the copy
+shipped here already carries two of each, one retired. Elapsed time therefore breaks
+nothing. What a stale copy cannot cover is the other direction: Sigstore adding a log or an
+intermediate *after* the build was made. So the live root is tried first — the panel is
+online when it updates, it is fetching a release — with the embedded copy as the floor
+underneath. That does not escape embedding a trust anchor and does not pretend to: TUF
+bootstraps from its own root, which `sigstore` ships. It swaps a file that rotates every few
+years for one built to renew itself.
 
-What remains open, therefore, is a straight choice rather than a constraint: whether the
-panel verifies the Sigstore bundle itself (35 packages, ~14 MB, a second crypto provider) or
-keeps the small minisign check and leans on `promote`'s gate. What remains open alongside it
-is whether the panel keeps a signature check of its own at all. The honest
-reading of the current one is that it is thin: `RELEASE_SIGNING_KEY` is readable by any
-workflow in this repository, so it does not defend against the attacker who motivates
-signing — someone with write access swapping a release asset — and against a network attacker
-it adds little to TLS plus a digest fetched over TLS. The attestation gate in `promote` does
-defend against that attacker, because forging it requires a visible commit to `release.yml`
-rather than a silent asset swap. Recorded here rather than acted on, because dropping a
-working check is a decision, not a cleanup.
+**The identity is compiled in, deliberately not configured.** `[update] repository` says
+where to *fetch* from; `CASTAWAY_RELEASE_IDENTITY` says whose signature counts. If the
+identity came from the config file, pointing a panel at a fork would make that fork's own
+attestations valid — the trust anchor has to be a property of the binary, exactly as the key
+it replaces was.
+
+**Order of operations.** The manifest is fetched, its provenance checked, and only then
+parsed; the artifact is downloaded afterwards, bounded by the size that verified manifest
+declared and compared against the digest it named. Verifying the small file first is
+structural rather than thrifty: attestations are keyed by artifact digest, so verifying the
+zip directly would mean downloading a quarter of a gigabyte before anything could say
+whether the bytes were genuine, with nothing trustworthy to bound the download by.
+
+**What this cost the test suite, stated plainly.** `checks.update-vm` used to drive the
+whole loop against a fake release API. A fake API cannot mint a Sigstore bundle — that needs
+a fake Fulcio and a fake Rekor — so the fetch-and-verify leg moved to unit tests over a
+*real* bundle for a *real* release of this repository, checked offline against the real
+trust root. The VM check now starts from a pre-staged tree and exercises rediscovery,
+the idle policy, the handshake, the launcher restart, health and GC. Two alternatives were
+rejected: making a non-default `base_url` skip verification (an edit to a URL must never
+disable signature checking, whatever the threat model says about config access), and
+standing up a fake Fulcio and Rekor in the VM (a great deal of machinery to maintain for one
+check).

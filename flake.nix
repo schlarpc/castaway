@@ -329,11 +329,12 @@
               || (pkgs.lib.hasSuffix ".png" path)
               || (pkgs.lib.hasSuffix ".svg" path)
               || (pkgs.lib.hasSuffix ".txt" path)
-              # The release signing key's public half (crates/update/release-key.pub),
-              # which `castaway-update` `include_str!`s. Without this clause the sandbox
-              # build fails outright rather than subtly, which is the good failure — but
-              # it fails in a crate nobody was editing, so: it is here on purpose.
-              || (pkgs.lib.hasSuffix ".pub" path)
+              # Sigstore's trusted root (crates/update/sigstore-trusted-root.json), which
+              # `castaway-update` `include_str!`s as the floor under its TUF refresh. A
+              # `.json` is not a Cargo source, so without this clause the sandbox build
+              # fails outright — which is the *good* failure, but it fails in a crate
+              # nobody was editing, so it is named here on purpose.
+              || (pkgs.lib.hasSuffix "sigstore-trusted-root.json" path)
               # The Windows resource script and the .exe icon it embeds (app/build.rs).
               || (pkgs.lib.hasSuffix ".rc" path)
               || (pkgs.lib.hasSuffix ".ico" path)

@@ -26,13 +26,16 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::attestation::{AttestationError, Provenance};
 use crate::manifest::{InstalledBuild, Manifest, Offer, Sha256Digest};
-use crate::minisign::PublicKey;
 use crate::policy::{decide, Action, MinuteOfDay, Observation, Phase, Policy};
 
-/// The name the release workflow gives the manifest, and its detached signature.
+/// The name the release workflow gives the manifest.
 const MANIFEST_ASSET: &str = "manifest.json";
-const SIGNATURE_ASSET: &str = "manifest.json.minisig";
+
+/// How large an attestation bundle is allowed to be. Ours are a few kilobytes; the bound
+/// is here because this is fetched before anything about it has been checked.
+const MAX_BUNDLE_BYTES: u64 = 256 * 1024;
 
 /// What the panel says about itself when the receiver is asked.
 ///
@@ -78,12 +81,10 @@ pub enum StandDown {
     /// `[update] enabled = false`.
     #[error("switched off by `[update] enable = false` in castaway.toml")]
     Disabled,
-    /// This build carries no release signing key, so it can verify nothing (#347).
-    #[error(
-        "this build carries no release signing key, so it can verify no release at all \
-         (#347). Until that key exists this panel updates only by hand."
-    )]
-    NoKey,
+    /// The trust anchors compiled into this build could not be read, so nothing can be
+    /// verified. Only reachable if the checked-in Sigstore trusted root was damaged.
+    #[error("the trust anchors compiled into this build")]
+    TrustAnchors(#[source] AttestationError),
     /// A dirty tree, a shallow clone, or no history: this build cannot order itself
     /// against a release, so it must not take one. Exactly the hand-built receiver
     /// somebody is mid-bisect on.
@@ -115,7 +116,7 @@ pub struct Agent {
     installed: InstalledBuild,
     policy: Policy,
     source: ReleaseSource,
-    key: PublicKey,
+    provenance: Provenance,
     activity: Arc<dyn PanelActivity>,
     /// The machine's UTC offset, read once while the process was single-threaded. On unix
     /// that is the only moment it can be read soundly, which is why the app reads it in
@@ -126,6 +127,8 @@ pub struct Agent {
     /// Where tonight has got to. Derived state the loop keeps between turns — the policy
     /// is a function and does not remember anything.
     phase: Phase,
+    /// Where the TUF client keeps its cached metadata between refreshes.
+    trust_cache: PathBuf,
     /// Whether the `hold` file was there last time round, so its appearance and its
     /// removal are each one log line rather than one per look.
     held: bool,
@@ -178,7 +181,7 @@ impl Agent {
         if !enabled {
             return Err(StandDown::Disabled);
         }
-        let key = crate::release_key().map_err(|_| StandDown::NoKey)?;
+        let provenance = Provenance::embedded().map_err(StandDown::TrustAnchors)?;
         if matches!(installed, InstalledBuild::Unknown) {
             return Err(StandDown::UnknownBuild);
         }
@@ -192,7 +195,8 @@ impl Agent {
             installed,
             policy,
             source,
-            key,
+            provenance,
+            trust_cache: castaway_paths::host().cache().join("sigstore"),
             activity,
             utc_offset_secs,
             staged: None,
@@ -394,29 +398,36 @@ impl Agent {
     }
 
     /// One look at the release API. `Ok(None)` means there was nothing newer.
-    async fn check(&self) -> Result<Option<Staged>, UpdateError> {
+    async fn check(&mut self) -> Result<Option<Staged>, UpdateError> {
+        // Freshen the trust root before looking. Sigstore adds logs and intermediates over
+        // time — the embedded copy already carries two of each, one retired — and a panel
+        // that has been up for months would otherwise still be judging releases by the
+        // root it booted with. A failed refresh keeps the embedded one and says so.
+        if let Ok(provenance) = Provenance::refreshed(Some(&self.trust_cache)).await {
+            self.provenance = provenance;
+        }
+
         let source = self.source.clone();
         let release = tokio::task::spawn_blocking(move || fetch_latest(&source))
             .await
             .map_err(|_| UpdateError::Cancelled)??;
 
+        // The manifest first, and it is the *small* file for a reason that is structural
+        // rather than thrifty. GitHub keys attestations by artifact digest, so verifying
+        // the zip directly would mean downloading a quarter of a gigabyte before anything
+        // could say whether the bytes were genuine — with no trustworthy size to bound
+        // that download by. Verifying 240 bytes first yields both the digest and the size.
         let manifest_url = release.asset(MANIFEST_ASSET)?;
-        let signature_url = release.asset(SIGNATURE_ASSET)?;
-        let (manifest_json, signature) = tokio::task::spawn_blocking(move || {
-            // Both small, both fetched before anything is trusted.
-            let manifest = fetch_bytes(&manifest_url, 64 * 1024)?;
-            let signature = fetch_bytes(&signature_url, 64 * 1024)?;
-            Ok::<_, UpdateError>((manifest, signature))
-        })
-        .await
-        .map_err(|_| UpdateError::Cancelled)??;
+        let manifest_json =
+            tokio::task::spawn_blocking(move || fetch_bytes(&manifest_url, 64 * 1024))
+                .await
+                .map_err(|_| UpdateError::Cancelled)??;
 
-        let signature = String::from_utf8(signature).map_err(|_| UpdateError::SignatureNotText)?;
-        // Signature, then parse. The order is the point (see `crate::verify_release`).
-        let verified = crate::verify_release(&self.key, &manifest_json, &signature)?;
-        info!(trusted = %verified.trusted_comment, "auto-update: the release is signed");
-
-        let manifest = verified.manifest;
+        // Provenance, then parse. The order is the point: a JSON parser is a lot of code
+        // to aim at bytes a stranger chose, and the attestation is checkable against the
+        // raw file.
+        self.verify_provenance(&manifest_json).await?;
+        let manifest = Manifest::parse(&manifest_json)?;
         match manifest.offer_to(self.installed) {
             Offer::Newer => {}
             Offer::NotNewer => {
@@ -449,6 +460,53 @@ impl Agent {
         let url = release.asset(manifest.artifact.as_str())?;
         let staged = self.stage(&version, &manifest, url).await?;
         Ok(Some(staged))
+    }
+
+    /// Fetch the build provenance for exactly these bytes and check it.
+    ///
+    /// The attestation is looked up by the artifact's own digest, which is what makes this
+    /// safe to do over an API response nothing has yet vouched for: a server that returns
+    /// somebody else's bundle fails the digest comparison inside the verifier, and one that
+    /// returns nothing fails here. Neither can make us accept the wrong bytes.
+    ///
+    /// A release may carry more than one attestation, so each is tried and the first that
+    /// verifies wins. That is not laxity — every one of them has to be a bundle signed by
+    /// the trusted workflow *over this digest*; being offered several wrong ones is
+    /// indistinguishable from being offered none.
+    async fn verify_provenance(&self, artifact: &[u8]) -> Result<(), UpdateError> {
+        use sha2::Digest as _;
+        let digest = format!("sha256:{:x}", sha2::Sha256::digest(artifact));
+        let url = format!(
+            "{}/repos/{}/attestations/{digest}",
+            self.source.base_url.trim_end_matches('/'),
+            self.source.repository
+        );
+        let body = tokio::task::spawn_blocking(move || fetch_bytes(&url, MAX_BUNDLE_BYTES))
+            .await
+            .map_err(|_| UpdateError::Cancelled)??;
+        let listing: AttestationListing =
+            serde_json::from_slice(&body).map_err(UpdateError::AttestationListing)?;
+        if listing.attestations.is_empty() {
+            return Err(UpdateError::NoAttestation { digest });
+        }
+
+        let mut last = None;
+        for entry in listing.attestations {
+            let bundle = entry.bundle.to_string();
+            match self.provenance.verify(artifact, &bundle).await {
+                Ok(()) => {
+                    info!(
+                        signer = %self.provenance.identity(),
+                        "auto-update: the release carries provenance from the trusted workflow"
+                    );
+                    return Ok(());
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(UpdateError::Attestation {
+            source: Box::new(last.expect("the listing was not empty")),
+        })
     }
 
     /// Download, verify and extract, then name it — in that order, and never sooner.
@@ -636,6 +694,22 @@ fn has_vmp_signatures(browser: &Path) -> bool {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("sig"))
         })
     })
+}
+
+/// GitHub's attestation listing: `{"attestations": [{"bundle": {...}}]}`.
+///
+/// The bundle is kept as raw JSON rather than parsed here, because the thing that parses
+/// a Sigstore bundle is the verifier, and handing it the bytes it was given keeps this
+/// from becoming a second opinion about the format.
+#[derive(Debug, Deserialize)]
+struct AttestationListing {
+    #[serde(default)]
+    attestations: Vec<AttestationEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttestationEntry {
+    bundle: serde_json::Value,
 }
 
 /// The two fields of a GitHub release this receiver reads.
@@ -903,12 +977,26 @@ pub enum UpdateError {
         /// Which release.
         release: String,
     },
-    /// The signature file was not text.
-    #[error("the signature file is not text")]
-    SignatureNotText,
-    /// The release did not verify, or was not a manifest.
-    #[error("the release")]
-    Release(#[from] crate::ReleaseError),
+    /// The attestation listing was not the JSON this build reads.
+    #[error("the attestation listing")]
+    AttestationListing(#[source] serde_json::Error),
+    /// GitHub has no attestation for these bytes. The usual cause is a release published
+    /// before the workflow attested anything.
+    #[error("no build provenance exists for {digest}")]
+    NoAttestation {
+        /// The digest that was looked up.
+        digest: String,
+    },
+    /// There was provenance and it did not check out.
+    #[error("the build provenance")]
+    Attestation {
+        /// What the verifier objected to.
+        #[source]
+        source: Box<AttestationError>,
+    },
+    /// The manifest was not one this build understands.
+    #[error("the release manifest")]
+    Manifest(#[from] crate::ManifestError),
     /// The artifact's digest is not the one the signed manifest names.
     #[error("the artifact hashes {actual}, the manifest says {expected}")]
     DigestMismatch {

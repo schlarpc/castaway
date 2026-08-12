@@ -170,13 +170,12 @@ in
         || { echo "commit must be a full lowercase 40-character sha, got '$commit'" >&2; exit 1; }
       printf '%s' "$build" | grep -qEx '[0-9]+' \
         || { echo "build must be a positive integer, got '$build'" >&2; exit 1; }
-      # `git rev-list --count` on a *shallow* clone answers 1, and a build number of 1
-      # would make every subsequent release look like a downgrade to a panel that had
-      # already taken a real one. Catching it here is the difference between a failed
-      # release job and an auto-updater that silently stops.
+      # A floor, not a shallow-clone detector — release.yml asks git whether the checkout
+      # is shallow, which is the exact question and catches every depth rather than only
+      # depth 1. This is the backstop for a caller that is not release.yml.
       if [ "$build" -lt 2 ]; then
-        echo "build number is $build — is this a shallow clone? release.yml needs" >&2
-        echo "fetch-depth: 0 for 'git rev-list --count HEAD' to mean anything." >&2
+        echo "build number is $build, which no real release has. If this is CI, the" >&2
+        echo "checkout is shallow and 'git rev-list --count' counted what it could see." >&2
         exit 1
       fi
 

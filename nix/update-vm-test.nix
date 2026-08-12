@@ -1,24 +1,21 @@
-# The whole auto-update loop, end to end, with no Windows and no network (#345).
+# The auto-update loop from a staged tree onwards, in a VM (#345).
 #
-# What a nixosTest can carry here is more than it looks like, because the parts that are
-# Windows-specific are small and well fenced: the job object, `GetLastInputInfo`, and
-# schtasks. Everything else — the launcher's supervision, the pointer files, the release
-# API call, signature verification, the build-number ordering, staging, the atomic rename,
-# the handshake exit, and the launcher restarting into the new tree — is the same code on
-# both platforms, and this runs all of it.
+# **What this cannot cover, and why, stated first because it used to.** The receiver now
+# requires GitHub build provenance — a Sigstore bundle signed by a certificate Fulcio
+# issued to this repository's release workflow (D59). A fake release API cannot mint one;
+# that would need a fake Fulcio and a fake Rekor. So the fetch-and-verify leg is covered by
+# `castaway_update::attestation`'s unit tests, which check a *real* bundle for a *real*
+# release of this repository against the real trust root, offline.
 #
-# The one thing that could not be faked is the *key*. A receiver that trusts nothing
-# refuses every release, so the two builds here are compiled against the checked-in test
-# key (`CASTAWAY_RELEASE_PUBKEY`, the same compile-time knob an operator running their own
-# fork would use), and the release is signed with its secret half by `release-manifest` —
-# the very script `release.yml` calls. So this check also fails if the release workflow and
-# the receiver ever stop agreeing about the format.
+# What is left here is still most of the machine, and none of it is reachable by a unit
+# test: a real launcher supervising real processes, the rediscovery of a tree staged on a
+# night the panel never went quiet, the idle policy against the *shipped* window, the
+# handshake exit, the launcher restarting into the new tree, the health marker, and the
+# version GC keeping the rollback target.
 #
 # Two builds, not one, and that is what makes the ordering real: the running receiver is
-# stamped build 100 and the release is build 101, so `Offer::Newer` is a fact about the
-# binaries rather than something the test asserted into existence. It is also why the loop
-# terminates — after activating, the new receiver reports 101, reads the same manifest, and
-# concludes there is nothing to do.
+# stamped build 100 and the staged one 101, so `Offer::Newer` is a fact about the binaries
+# rather than something the test asserted into existence.
 { pkgs, castaway, launcher, releaseManifest }:
 
 let
@@ -30,60 +27,36 @@ let
   buildA = 100;
   buildB = 101;
 
-  testKey = ../crates/update/fixtures/test-release.key;
-  testPub = ../crates/update/fixtures/test-release.pub;
-
-  # The port the fake release API answers on, and the address it answers at. Loopback on
-  # the receiver itself rather than a second node: the asset URLs have to be baked into
-  # the release JSON at build time, and localhost is the one address a build can know.
-  apiPort = 8099;
-  apiBase = "http://127.0.0.1:${toString apiPort}";
-
-  # A receiver that knows which build it is and which key it trusts. Overriding the
-  # package rather than adding a feature: both are already build-time inputs of every real
-  # artifact, so this configures the same knobs the release build uses (D55 — nothing here
-  # is a compile-time gate on behaviour).
+  # A receiver that knows which build it is. Overriding the package rather than adding a
+  # feature: `CASTAWAY_BUILD` is already a build-time input of every real artifact, so this
+  # configures the same knob the release build uses (D55 — nothing here is a compile-time
+  # gate on behaviour).
+  #
+  # Nothing overrides the *trust anchors*: both receivers carry the ones this tree ships,
+  # because the point of the rediscovery path is that a staged tree needs no verification —
+  # it was verified when it was staged, which is why it was named.
   receiver = { build, rev }: castaway.overrideAttrs (_: {
     CASTAWAY_BUILD = toString build;
     CASTAWAY_GIT_REV = rev;
-    CASTAWAY_RELEASE_PUBKEY = builtins.readFile testPub;
   });
   receiverA = receiver { build = buildA; rev = builtins.substring 0 7 shaA; };
   receiverB = receiver { build = buildB; rev = shortB; };
 
-  artifact = "castaway-portable-${shortB}.zip";
-
-  # The release, as GitHub would serve it: a zip with one wrapping directory (exactly what
-  # `nix/windows.nix`'s `mkArchive` produces), the signed manifest beside it, and the API
-  # response that points at both.
-  release = pkgs.runCommand "castaway-test-release"
-    {
-      nativeBuildInputs = [ pkgs.zip pkgs.jq releaseManifest pkgs.coreutils ];
-    } ''
-    mkdir -p tree/castaway-portable
-    install -m755 ${receiverB}/bin/castaway tree/castaway-portable/castaway
-    ( cd tree \
-      && find castaway-portable -exec touch -d '1980-01-01 00:00:00 UTC' {} + \
-      && find castaway-portable | sort | zip -qX ../${artifact} -@ )
-
-    export CASTAWAY_RELEASE_SECRET_KEY="$(cat ${testKey})"
-    # The script checks its own output against the key the receiver carries. Pointing it at
-    # the fixture's public half is what makes that check run here rather than be skipped.
-    export CASTAWAY_RELEASE_PUBKEY=${testPub}
-    castaway-release-manifest ${artifact} ${shaB} ${toString buildB} .
-
-    mkdir -p "$out/assets" "$out/repos/schlarpc/castaway/releases"
-    cp ${artifact} manifest.json manifest.json.minisig "$out/assets/"
-    # The two fields the receiver reads, and nothing else — it takes the asset URLs from
-    # here and the *truth* from the signature.
-    jq -n --arg base '${apiBase}' --arg artifact '${artifact}' '{
-      tag_name: "build-${shortB}",
-      assets: [
-        { name: "manifest.json", browser_download_url: ($base + "/assets/manifest.json") },
-        { name: "manifest.json.minisig", browser_download_url: ($base + "/assets/manifest.json.minisig") },
-        { name: $artifact, browser_download_url: ($base + "/assets/" + $artifact) }
-      ]
-    }' > "$out/repos/schlarpc/castaway/releases/latest"
+  # A staged version, exactly as `Agent::stage` leaves one: the tree under its final name,
+  # with the manifest that describes it written inside. That manifest is what
+  # `rediscover_staged` reads at boot to conclude a newer version is already waiting — the
+  # real path for an update that finished downloading on a night the panel stayed busy.
+  #
+  # Generated by the *real* release script, so the JSON this test relies on is the JSON CI
+  # produces rather than a hand-written lookalike.
+  stagedManifest = pkgs.runCommand "castaway-staged-manifest"
+    { nativeBuildInputs = [ releaseManifest pkgs.coreutils ]; } ''
+    # The manifest's digest and size describe the artifact a real staging downloaded. Only
+    # `build` is read back here, but it has to be a manifest that parses, so it is made
+    # from a real file rather than faked.
+    printf 'a staged artifact' > castaway-portable-${shortB}.zip
+    castaway-release-manifest castaway-portable-${shortB}.zip ${shaB} ${toString buildB} out
+    mkdir -p "$out" && cp out/manifest.json "$out/"
   '';
 
   # The panel's config. The window is the *shipped* one — the test moves the guest's clock
@@ -101,7 +74,10 @@ let
 
     [update]
     enable = true
-    base_url = "${apiBase}"
+    # Unreachable on purpose: nothing in this test should be fetching a release. If the
+    # updater ever *does* reach the network here, the check that follows would be testing
+    # something other than what it claims.
+    base_url = "http://127.0.0.1:9"
     repository = "schlarpc/castaway"
     window_start = "03:30"
     window_end = "05:00"
@@ -128,16 +104,7 @@ pkgs.testers.runNixOSTest {
     time.timeZone = "UTC";
     services.timesyncd.enable = false;
 
-    environment.systemPackages = [ pkgs.python3 pkgs.jq ];
-
-    # GitHub, for the purposes of one panel.
-    systemd.services.release-api = {
-      description = "a release API with one release in it";
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig.ExecStart =
-        "${pkgs.python3}/bin/python3 -m http.server ${toString apiPort} "
-        + "--bind 127.0.0.1 --directory ${release}";
-    };
+    environment.systemPackages = [ pkgs.jq ];
 
     # The launcher, exactly as the box will run it: one binary, one argument, and
     # everything else read off the tree beneath it.
@@ -157,15 +124,22 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     start_all()
     receiver.wait_for_unit("multi-user.target")
-    receiver.wait_for_unit("release-api.service")
-    receiver.wait_for_open_port(${toString apiPort})
 
-    with subtest("the install tree, as the box's one-time migration leaves it"):
-        receiver.succeed("mkdir -p ${root}/versions/${shaA}")
+    with subtest("the install tree, with an update already staged and waiting"):
+        receiver.succeed("mkdir -p ${root}/versions/${shaA} ${root}/versions/${shaB}")
         receiver.succeed(
             "install -m755 ${receiverA}/bin/castaway ${root}/versions/${shaA}/castaway"
         )
         receiver.succeed("printf '${shaA}\\n' > ${root}/current.txt")
+        # The staged tree, as a completed download leaves it: under its final name, with
+        # the manifest inside. Its provenance was checked when it was staged; rediscovery
+        # trusts the tree on disk, which is the whole point of naming it only when complete.
+        receiver.succeed(
+            "install -m755 ${receiverB}/bin/castaway ${root}/versions/${shaB}/castaway"
+        )
+        receiver.succeed(
+            "install -m644 ${stagedManifest}/manifest.json ${root}/versions/${shaB}/manifest.json"
+        )
 
     with subtest("the clock is inside the shipped update window"):
         # 04:00, in the middle of the 03:30–05:00 window `Policy::default` ships. Moving
@@ -189,17 +163,11 @@ pkgs.testers.runNixOSTest {
             "test -f ${root}/versions/${shaA}/.healthy", timeout=120
         )
 
-    with subtest("the signed release is verified, ordered, and staged"):
+    with subtest("the staged tree is rediscovered and ordered against what is running"):
         receiver.wait_until_succeeds(
-            f"grep -q 'the release is signed' {LOG}", timeout=180
+            f"grep -q 'a staged update from an earlier night is still waiting' {LOG}",
+            timeout=180,
         )
-        receiver.wait_until_succeeds(
-            f"grep -q 'staged and waiting for the panel' {LOG}", timeout=300
-        )
-        # Named only once it was complete: the staging directory is gone and the tree is
-        # under a name `VersionId::parse` accepts.
-        receiver.succeed("test -x ${root}/versions/${shaB}/castaway")
-        receiver.succeed("test ! -e ${root}/versions/.staging-${shaB}")
 
     with subtest("the panel is quiet, so it hands over to the launcher"):
         receiver.wait_until_succeeds(
@@ -225,12 +193,17 @@ pkgs.testers.runNixOSTest {
             "test -f ${root}/versions/${shaB}/.healthy", timeout=180
         )
 
-    with subtest("and it stops: the same release is no longer newer than what is running"):
+    with subtest("and it settles: nothing further is staged, and the way back is kept"):
+        # The new version finds no *newer* tree to rediscover — the one it replaced is
+        # older — so it stops rather than looping. With no reachable release API it also
+        # reports that it took nothing, which is the correct kiosk answer and is what the
+        # panel would log every night the network was down.
         receiver.wait_until_succeeds(
-            f"grep -q 'Latest is not newer' {LOG}", timeout=300
+            f"grep -q 'nothing taken tonight' {LOG}", timeout=300
         )
-        # The rollback target is kept, not collected — a panel with nothing to fall back to
-        # is the state this whole design exists to avoid.
+        # The rollback target survives the version GC — a panel with nothing to fall back
+        # to is the state this whole design exists to avoid.
         receiver.succeed("test -d ${root}/versions/${shaA}")
+        receiver.succeed("test \"$(cat ${root}/previous.txt)\" = ${shaA}")
   '';
 }
