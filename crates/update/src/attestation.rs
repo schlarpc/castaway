@@ -93,7 +93,7 @@ impl Provenance {
         // fetched over a network, and this one never is.
         let trust_root = SigstoreTrustRoot::from_trusted_root_json_unchecked(root.as_bytes())
             .map_err(|source| AttestationError::TrustRoot { source })?;
-        let verifier = Verifier::new(rekor_config(), trust_root)
+        let verifier = Verifier::new(rekor_config()?, trust_root)
             .map_err(|source| AttestationError::TrustRoot { source })?;
         Ok(Self {
             verifier,
@@ -145,7 +145,7 @@ impl Provenance {
     /// A verifier over an already-built trust root, with this build's identity policy.
     fn from_root(root: SigstoreTrustRoot) -> Result<Self, AttestationError> {
         Ok(Self {
-            verifier: Verifier::new(rekor_config(), root)
+            verifier: Verifier::new(rekor_config()?, root)
                 .map_err(|source| AttestationError::TrustRoot { source })?,
             policy: Identity::new(RELEASE_IDENTITY, OIDC_ISSUER),
         })
@@ -189,9 +189,37 @@ impl Provenance {
 
 /// Rekor's endpoint configuration. Only consulted when verification is *not* offline,
 /// which here it never is — every bundle carries its own inclusion proof.
-fn rekor_config() -> sigstore::rekor::apis::configuration::Configuration {
-    sigstore::rekor::apis::configuration::Configuration::default()
+///
+/// Written out field by field rather than taken from `Configuration::default()`, because
+/// that default builds its client with `reqwest::Client::new()` — which *panics* when a
+/// TLS backend will not initialise. `sigstore`'s `rustls-tls` feature selects
+/// `rustls-platform-verifier`, and that reports "No CA certificates were loaded from the
+/// system" on a host with no trust store: precisely the Nix build sandbox every test in
+/// this crate runs inside. So the one client this crate is answerable for names its own
+/// root set — empty, matching a Rekor endpoint that is never called — and never asks the
+/// platform for one.
+///
+/// # Errors
+/// [`AttestationError::RekorClient`] if even that client cannot be built. Verification
+/// then fails closed: no verifier, so nothing installs.
+fn rekor_config() -> Result<sigstore::rekor::apis::configuration::Configuration, AttestationError> {
+    Ok(sigstore::rekor::apis::configuration::Configuration {
+        base_path: REKOR_BASE_PATH.to_owned(),
+        user_agent: Some(format!("castaway/{}", env!("CARGO_PKG_VERSION"))),
+        client: reqwest::Client::builder()
+            .tls_certs_only([])
+            .build()
+            .map_err(|source| AttestationError::RekorClient { source })?,
+        basic_auth: None,
+        oauth_access_token: None,
+        bearer_access_token: None,
+        api_key: None,
+    })
 }
+
+/// Rekor's public instance — the endpoint `sigstore`'s own default names, kept because an
+/// offline verification still carries it around.
+const REKOR_BASE_PATH: &str = "https://rekor.sigstore.dev";
 
 /// Why an attestation was not accepted.
 #[derive(Debug, Error)]
@@ -206,6 +234,15 @@ pub enum AttestationError {
     /// The bytes offered were not a Sigstore bundle at all.
     #[error("the attestation bundle is not JSON this build understands")]
     Malformed(#[source] serde_json::Error),
+    /// The HTTP client the Rekor endpoint would be reached through could not be built.
+    /// Nothing here ever reaches it — see [`rekor_config`] — but a verifier cannot be
+    /// constructed without one.
+    #[error("the Rekor client this build never calls")]
+    RekorClient {
+        /// What the builder objected to.
+        #[source]
+        source: reqwest::Error,
+    },
     /// It was a bundle, and it did not check out.
     #[error("the attestation does not verify")]
     Rejected {

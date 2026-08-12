@@ -40,6 +40,11 @@ sigstore = { version = "0.14", default-features = false, features = [
 ] }
 # The artifact digest the manifest carries.
 sha2.workspace = true
+# Named directly for one reason: `sigstore`'s Rekor `Configuration::default()` builds its
+# client with `reqwest::Client::new()`, which panics where no system trust store exists.
+# `attestation::rekor_config` builds that client itself instead. No features of our own —
+# the TLS backend is `sigstore`'s choice, and this must not become a second opinion on it.
+reqwest = { version = "0.13", default-features = false }
 
 # --- the agent: the I/O half (#345) ---
 # The install tree the launcher and this both write into.
