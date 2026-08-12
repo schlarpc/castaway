@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 castaway-core.workspace = true
 castaway-paths.workspace = true
+# The build's own place in the release ordering, and (from #345) the updater that uses
+# it. Depended on unconditionally: knowing which build this is is not optional.
+castaway-update.workspace = true
 substrate-ssdp.workspace = true
 substrate-mdns.workspace = true
 proto-dlna.workspace = true

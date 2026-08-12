@@ -13,7 +13,7 @@
 #
 # `ffmpegSrc`/`electronSrc` are the raw archives, pinned as flake inputs so they land in
 # flake.lock; the derivations beside this file unpack and rearrange them.
-{ pkgs, craneLib, commonArgs, rustToolchain, gitRev, ffmpegSrc, electronSrc, widevineSrc
+{ pkgs, craneLib, commonArgs, rustToolchain, gitRev, buildNumber, ffmpegSrc, electronSrc, widevineSrc
 , bluetoothFirmware }:
 
 let
@@ -279,6 +279,11 @@ let
         # The revision the idle screen's footer shows — final builds only, never
         # `crossArgs`, where the deps trees would inherit it and rebuild each commit.
         CASTAWAY_GIT_REV = gitRev;
+
+        # The build number the auto-updater orders against (#343). Same placement and
+        # the same reason as the revision above: a value that moves every commit must
+        # not reach the dependency trees.
+        CASTAWAY_BUILD = buildNumber;
 
         # Where `hci-transport`'s build.rs finds controller firmware to embed. Windows has
         # no /lib/firmware, so the blobs have to ride inside the .exe (architecture 11.3b).

@@ -117,6 +117,17 @@ fn main() -> anyhow::Result<()> {
         origin = ?location.origin(),
         "config"
     );
+    // Which bits these are, in the two forms that answer different questions: the
+    // revision says *which tree*, and the build number says *where in the history* —
+    // the one thing a sha cannot say, and the one the auto-updater orders against
+    // (#343). `build=unknown` is an ordinary state, not an error: it is what a dirty
+    // tree stamps, and it is what makes a hand-deployed debugging build ineligible for
+    // replacement at 4 a.m.
+    info!(
+        revision = env!("CASTAWAY_GIT_REV"),
+        build = %castaway_update::InstalledBuild::from_stamp(env!("CASTAWAY_BUILD")),
+        "castaway"
+    );
     // A category name that is not one of SponsorBlock's parses to "unknown" rather than
     // failing, which for a *response* is the point and for *config* is a silent typo.
     if config.unknown_sponsorblock_categories() > 0 {

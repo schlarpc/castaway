@@ -922,6 +922,7 @@ dependencies = [
  "castaway-core",
  "castaway-paths",
  "castaway-test-support",
+ "castaway-update",
  "cbc",
  "clap",
  "control-display",
@@ -998,6 +999,19 @@ name = "castaway-test-support"
 version = "0.1.0"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "castaway-update"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.0",
+ "blake2b_simd",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

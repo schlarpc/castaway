@@ -1,0 +1,23 @@
+[package]
+name = "castaway-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The receiver's self-update: the signed release manifest that authenticates and orders a Latest pointer."
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+# The signature. minisign is Ed25519 over either the message or its BLAKE2b-512 digest,
+# so both of these are the format rather than a choice we made.
+ed25519-dalek.workspace = true
+blake2b_simd.workspace = true
+base64.workspace = true
+# The artifact digest the manifest carries.
+sha2.workspace = true
+
+[lints]
+workspace = true

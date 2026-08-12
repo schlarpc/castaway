@@ -329,6 +329,11 @@
               || (pkgs.lib.hasSuffix ".png" path)
               || (pkgs.lib.hasSuffix ".svg" path)
               || (pkgs.lib.hasSuffix ".txt" path)
+              # The release signing key's public half (crates/update/release-key.pub),
+              # which `castaway-update` `include_str!`s. Without this clause the sandbox
+              # build fails outright rather than subtly, which is the good failure — but
+              # it fails in a crate nobody was editing, so: it is here on purpose.
+              || (pkgs.lib.hasSuffix ".pub" path)
               # The Windows resource script and the .exe icon it embeds (app/build.rs).
               || (pkgs.lib.hasSuffix ".rc" path)
               || (pkgs.lib.hasSuffix ".ico" path)
@@ -403,6 +408,19 @@
       # source-insensitivity crane's dummy-src machinery exists to prevent. The checks
       # build with the "unknown" fallback instead; nothing shipped comes out of a check.
       gitRev = self.shortRev or self.dirtyShortRev or "unknown";
+
+      # The build's position in the linear history of `main` — `git rev-list --count
+      # HEAD`, which is what `self.revCount` is. Stamped in beside `gitRev` and passed
+      # around with it, because it answers the one question the sha cannot: a sha
+      # identifies a tree, it does not order two of them, and an updater offered a
+      # release has to know whether it is *newer* (#343).
+      #
+      # `0` where nix has no answer — a dirty tree, or a source tree with no history.
+      # A real build number starts at 1, so zero is unambiguous, and the receiver reads
+      # it as "this build cannot order itself" and stands the updater down. That lines
+      # up exactly with `dirtyShortRev` above: a hand-built receiver mid-bisect is
+      # precisely the one that must not be replaced at 4 a.m.
+      buildNumber = toString (self.revCount or 0);
 
       # Where `cast-replay`'s build.rs finds the carved Cast identities and the
       # constants that open them. Both offline identities — SoftMedia's and App
@@ -575,7 +593,7 @@
         commonArgs = commonArgsFor system;
         baseCargoArtifacts = cargoArtifactsFor system;
         depsOnlyFrom = depsOnlyFromFor system;
-        inherit gitRev;
+        inherit gitRev buildNumber;
         electron = electronLinuxFor system;
         widevineCdm = widevineLinuxFor system;
         bluetoothFirmware = bluetoothFirmwareFor system;
@@ -590,7 +608,7 @@
         craneLib = cranelibFor system;
         commonArgs = commonArgsFor system;
         rustToolchain = rustToolchainFor system;
-        inherit gitRev;
+        inherit gitRev buildNumber;
         ffmpegSrc = ffmpeg-windows-src;
         electronSrc = electron-windows-src;
         widevineSrc = widevine-windows-src;
@@ -625,6 +643,7 @@
             inherit cargoArtifacts;
             cargoExtraArgs = "--package castaway --no-default-features";
             CASTAWAY_GIT_REV = gitRev;
+            CASTAWAY_BUILD = buildNumber;
             # Only run tests during the check phase, not during build
             doCheck = false;
           });
@@ -632,6 +651,13 @@
           default = self.packages.${system}.castaway-portable;
 
           castaway = self.packages.${system}.default;
+
+          # Signing a release, and making the key that signs it (#343). Both halves of
+          # one key, so they live in one file: `release-keygen` runs once by hand and
+          # writes the public half into the tree; `release-manifest` runs in CI on every
+          # push and refuses to produce an unsigned manifest.
+          release-manifest = (import ./nix/release-signing.nix { inherit pkgs; }).manifest;
+          release-keygen = (import ./nix/release-signing.nix { inherit pkgs; }).keygen;
 
           # A scripted phone, for the one path no VM test can cover: YouTube's Lounge
           # servers are a third party to the session, so this needs the real internet
@@ -930,6 +956,43 @@
           fmt = craneLib.cargoFmt {
             src = commonArgs.src;
           };
+
+          # The release manifest CI writes is the one the receiver reads (#343).
+          #
+          # Two halves that could drift apart without either side noticing: a shell script
+          # in `nix/release-signing.nix` emits `manifest.json`, and `castaway-update`
+          # parses it — with `deny_unknown_fields` and a typed schema, so a renamed key is
+          # a refused release at 4 a.m. rather than a failing test. This check closes that
+          # by regenerating the crate's fixtures with the real script and the checked-in
+          # test key, and demanding they come back byte-identical.
+          #
+          # Byte-identical is available because Ed25519 signing is deterministic (RFC
+          # 8032) and minisign does not salt: the same key over the same bytes always
+          # produces the same signature. So this also pins the *signature format* — a
+          # minisign that switched back from `ED` to `Ed`, or changed its base64 layout,
+          # fails here rather than on the panel.
+          #
+          # If it fails because the format changed on purpose: run the same command the
+          # check runs and copy the three outputs over `crates/update/fixtures/`.
+          release-manifest = pkgs.runCommand "release-manifest-fixtures"
+            {
+              nativeBuildInputs = [ self.packages.${system}.release-manifest pkgs.diffutils ];
+              meta.description = "The manifest release.yml writes round-trips through castaway-update's fixtures";
+            } ''
+            fixtures=${./crates/update/fixtures}
+            export CASTAWAY_RELEASE_SECRET_KEY="$(cat "$fixtures/test-release.key")"
+            castaway-release-manifest \
+              "$fixtures/castaway-windows-electron-ae2f19e.zip" \
+              ae2f19ef1f9d9a2488008f1075b252178ae7ef85 935 out
+
+            for f in manifest.json manifest.json.minisig; do
+              diff -u "$fixtures/$f" "out/$f" || {
+                echo "crates/update/fixtures/$f is not what the release script writes." >&2
+                exit 1
+              }
+            done
+            echo "the release script and crates/update agree byte for byte" > "$out"
+          '';
 
           # Every test in the workspace, with every feature on, in a sandbox that can
           # actually run them: lavapipe supplies an adapter and ffmpeg is on `PATH`, and
