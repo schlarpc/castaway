@@ -234,17 +234,23 @@ impl Agent {
                     }
                 },
                 Action::Activate => {
+                    // `decide` only reaches this arm when `self.staged` is `Some` — but
+                    // the `else` is not decoration: without it a `None` here would spin
+                    // the loop with nothing to sleep on, and so would a pointer write
+                    // that keeps failing on a full disk. Every path out of this arm waits.
                     if let Some(staged) = self.staged.take() {
                         match self.activate(&staged.version) {
                             Ok(activation) => return activation,
                             Err(e) => {
                                 warn!(error = %Chain(&e), "auto-update: could not activate");
                                 // Put it back: the tree is fine, the pointer write was
-                                // not, and next window is a perfectly good time to retry.
+                                // not, and the next look is a perfectly good time to retry.
                                 self.staged = Some(staged);
-                                self.phase = Phase::UpToDate;
+                                tokio::time::sleep(self.policy.recheck).await;
                             }
                         }
+                    } else {
+                        tokio::time::sleep(self.policy.recheck).await;
                     }
                 }
             }
