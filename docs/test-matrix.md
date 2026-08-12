@@ -114,6 +114,14 @@ structural note below. What that set *is* on any given day is
 table below names them and says what each one is worth, which is the part a command cannot
 answer.
 
+Three checks were added after this audit and are in the table below without a per-protocol
+matrix section, because auto-update is not a protocol: `release-manifest`,
+`castaway-windows-electron-authenticode` and `update-vm` (#26's slices). What each is worth
+is in its row, and what it deliberately does *not* prove is worth stating once here: none of
+them has ever seen a real signing key or a real GitHub release, because neither exists yet
+(#347, #348). They prove the format, the ordering and the loop; the first real release is
+still the first real release.
+
 `android-cast` is the one check with a **host requirement beyond the `kvm` system
 feature**: it builds a TAP inside the sandbox's network namespace, and the sandbox's
 `/dev` has no `net/tun` unless nix.conf says `extra-sandbox-paths = /dev/net/tun`
@@ -156,7 +164,10 @@ So the question is never "did CI run it". It is **"is there a check for it"**.
 | `android-cast` | the same emulator on a **TAP segment** instead of a radio; the sender is Android's own system Cast picker, i.e. **Play Services**, not the openscreen lineage every other Cast check uses. Asserts the picker *lists* us (the #226 surface), that the CASTv2 connection arrives **from the guest's address** rather than around the tap, that device auth against real Play Services passes (#40), and that a mirroring OFFER/ANSWER completes — then counts the phone's RTP out of the segment capture, because "negotiated and silent" is a real failure mode a log line cannot rule out (#225) | **T3** | minutes + build |
 | `ldac-bindings` | regenerate `ldac-sys/src/bindings.rs` with bindgen and `diff -u` | T3 | 3m |
 | `moonlight-bindings` | the same for `moonlight-sys/src/bindings.rs` against the pinned `Limelight.h` | T3 | <1m |
-| `castaway-windows-electron-dll-closure` | cross-build + static import-table closure | T2 | 51–70m |
+| `castaway-windows-electron-dll-closure` | cross-build + static import-table closure, over **every** `.exe` in the artifact — the receiver and, since #342, the launcher | T2 | 51–70m |
+| `castaway-windows-electron-authenticode` | signs the real cross-built executables with a throwaway certificate and reads the signature back. It cannot say anything about the *release* key (#348) — what it proves is that `osslsigncode` accepts a PE this toolchain emits, that the code-signing EKU survives the PKCS#12 round trip, that an **unsigned** copy fails the same verification (so the positive result is not true of any PE), and that signing against a certificate the box does not trust is refused (#344) | T2 | shares the cross tree |
+| `release-manifest` | regenerates `crates/update/fixtures/` with the release script CI calls and demands byte-identical output. Ed25519 signing is deterministic and minisign does not salt, so this pins the **signature format** as well as the JSON field names — a rename on either side is a red check rather than a release no panel can install (#343) | **T3-ish** | seconds |
+| `update-vm` | 1 node; a real launcher, **two real receivers a build number apart**, a release signed by the very script `release.yml` calls, and a fake release API on loopback. Drives the whole loop: arm, health marker, verify, order, stage, activate on the handshake, restart into the new tree — with the guest's clock moved into the **shipped** 03:30–05:00 window rather than the window widened to suit the test. Ends by asserting it *stops*: the same release is no longer newer than what is running (#345) | T2 | 19s + build |
 
 **Gone in D55**, and worth knowing where their coverage went, because the names appear
 throughout the per-protocol matrices below: `audio`, `render-pixels`, `media-plane`,
