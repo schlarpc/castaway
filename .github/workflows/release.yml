@@ -24,6 +24,14 @@ name: Release
 # Which makes Latest mean "the newest commit CI validated" and keeps every commit
 # downloadable for a panel-side bisect. It also means Latest can sit several commits
 # behind the tip, and that is the honest reading rather than a defect.
+#
+# Since #343 each release also carries `manifest.json` and its detached minisign
+# signature. The panel follows Latest unattended, and two things it cannot work out for
+# itself live there: whether the release is *newer* than the one running (a sha
+# identifies a tree, it does not order two of them) and whether the bytes are the ones
+# this repository built (TLS authenticates the host, not the artifact). The threat model
+# is stated honestly in `crates/update/src/lib.rs`: this defends the CDN and mitm path,
+# not a compromise of the account that holds the signing secret.
 on:
   push:
     branches: [main]
@@ -38,6 +46,15 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          # The whole history, because the release carries a **build number** and that
+          # number is `git rev-list --count` (#343). The default shallow checkout has one
+          # commit, so it would answer 1 — and a panel that had already installed a real
+          # build would then read every future release as a downgrade and stop updating,
+          # silently and permanently. `nix build` reads `self.revCount` off the same
+          # history for the number it stamps into the binary, so both halves of the
+          # ordering depend on this line.
+          fetch-depth: 0
       - uses: ./.github/actions/nix-runner
         with:
           # The cross tree's snapshot; saved by the Test workflow's dll-closure check,
@@ -50,11 +67,38 @@ jobs:
       - name: Publish the commit-named release
         env:
           GH_TOKEN: ${{ github.token }}
+          # The minisign secret key, whole, as `release-keygen` printed it. Absent on a
+          # repository where that has never been run — see the branch below.
+          CASTAWAY_RELEASE_SECRET_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
+          set -euo pipefail
           short=$(git rev-parse --short "$GITHUB_SHA")
           # The sha in the asset's own filename, so a Downloads folder with three of them
           # still says which is which.
-          cp result/castaway-windows-electron.zip "castaway-windows-electron-$short.zip"
+          zip="castaway-windows-electron-$short.zip"
+          cp "result/castaway-windows-electron.zip" "$zip"
+          assets=("$zip")
+
+          # The signed manifest an unattended panel needs (#343): the build number that
+          # orders this release against the one already installed, the zip's digest, and
+          # an ed25519 signature over both. Detached rather than embedded, so
+          # `minisign -Vm manifest.json -p crates/update/release-key.pub` inspects a
+          # release with none of our code involved.
+          if [ -n "${CASTAWAY_RELEASE_SECRET_KEY:-}" ]; then
+            build=$(git rev-list --count "$GITHUB_SHA")
+            nix run '.#release-manifest' -- "$zip" "$GITHUB_SHA" "$build" .
+            assets+=(manifest.json manifest.json.minisig)
+          else
+            # Loud, and not fatal. A release with no manifest is exactly what every
+            # release was before #343 — downloadable, deployable by hand, and invisible
+            # to the auto-updater, which refuses an unsigned one. Failing the job instead
+            # would make `main` unbuildable on a repository that has simply not had its
+            # key generated yet, which is a worse trade than a red annotation.
+            echo "::error::no RELEASE_SIGNING_KEY secret, so this release carries no" \
+                 "signed manifest and no panel will auto-update to it. Generate the key" \
+                 "with 'nix run .#release-keygen' and set the secret (#343)."
+          fi
+
           # `build-<sha>` rather than the bare sha: a tag that *is* a commit id shadows
           # the commit in every ref-vs-object ambiguity git and the API have.
           # `--prerelease` and `--latest=false` are the same claim twice, deliberately.
@@ -69,6 +113,6 @@ jobs:
             --latest=false \
             --title "castaway $short" \
             --notes "$(git log -1 --format='%s%n%n%H')" \
-            "castaway-windows-electron-$short.zip"
+            "${assets[@]}"
       - uses: ./.github/actions/postmortem
         if: failure()
