@@ -8,9 +8,9 @@
 //! therefore rises by one per commit.
 //!
 //! Everything else in the manifest exists to bind the bytes: the zip's SHA-256, its
-//! size, and its exact asset name. The signature over the whole file is a detached
-//! `manifest.json.minisig` beside it (see [`crate::minisign`]), so `minisign -Vm
-//! manifest.json -p release-key.pub` inspects a release with no code of ours involved.
+//! size, and its exact asset name. Nothing here is signed — the file's authenticity comes
+//! from GitHub's build provenance over it (see [`crate::attestation`]), which is checked
+//! before these bytes are ever handed to a parser.
 //!
 //! Parse, don't validate (ground rule 1): every field is a type that cannot hold a
 //! nonsense value, so nothing downstream re-checks a hex string's length or wonders

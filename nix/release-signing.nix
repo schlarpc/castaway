@@ -17,10 +17,10 @@
 # so the first unattended update would have replaced a signed tree with an unsigned one
 # and killed DRM playback silently, with nobody standing at the panel.
 #
-# Each key's public half is checked into the tree — `crates/update/release-key.pub` and
-# `nix/windows-codesign.crt` — which is what makes each trust anchor a property of the
-# thing that checks it (the binary; the box's certificate store) rather than of whatever
-# was downloaded alongside the artifact.
+# The Authenticode certificate's public half is checked into the tree
+# (`nix/windows-codesign.crt`), which is what makes that trust anchor a property of the
+# thing that checks it — the box's certificate store — rather than of whatever was
+# downloaded alongside the artifact. The manifest needs no key of ours at all (D59).
 #
 # Why any of this exists: a commit sha identifies a tree without ordering it. The panel
 # already knows which commit it is; what it cannot work out on its own is whether the

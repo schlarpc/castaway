@@ -11,8 +11,8 @@ description = "The receiver's self-update: the signed release manifest that auth
 thiserror.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
-# The signature. minisign is Ed25519 over either the message or its BLAKE2b-512 digest,
-# so both of these are the format rather than a choice we made.
+# Ed25519 and BLAKE2b are the *format's* choices, not ours: they are what a Sigstore
+# bundle and its Rekor inclusion proof are built from.
 ed25519-dalek.workspace = true
 blake2b_simd.workspace = true
 base64.workspace = true

@@ -337,10 +337,10 @@ impl Agent {
             "auto-update has taken nothing for {nights} nights running and needs a person. \
              This receiver keeps working — it is only the *updating* that is stuck. Check, \
              in this order: can the panel reach the release API at all (the URL above); does \
-             that release carry manifest.json and manifest.json.minisig (a release published \
-             before the signing key existed does not — see #347); and does the signature \
-             verify against the key this build was compiled with. Every one of those fails \
-             closed on purpose, so none of them will resolve itself."
+             that release carry manifest.json (a release published before the workflow \
+             attested anything does not); and does GitHub hold provenance for that manifest \
+             from the workflow this build trusts (`gh attestation verify`). Every one of \
+             those fails closed on purpose, so none of them will resolve itself."
         );
     }
 
@@ -969,7 +969,7 @@ pub enum UpdateError {
     #[error("the release listing")]
     ReleaseJson(#[source] serde_json::Error),
     /// A release without the asset the updater needs. The usual cause is a release
-    /// published before the signing secret existed (#347).
+    /// published before the release workflow attested anything.
     #[error("release {release} carries no {name}")]
     NoAsset {
         /// Which asset.

@@ -7,5 +7,5 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CASTAWAY_RELEASE_PUBKEY");
-    println!("cargo:rerun-if-changed=release-key.pub");
+    println!("cargo:rerun-if-changed=sigstore-trusted-root.json");
 }

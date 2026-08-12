@@ -464,7 +464,7 @@ let
   # `osslsigncode` accepts a PE this toolchain emits, that our flag set produces a
   # signature `osslsigncode verify` reads back, that the code-signing EKU survives the
   # PKCS#12 round trip, and that the publisher check refuses a certificate the box does
-  # not trust. The key itself is #347's problem and no check can stand in for it.
+  # not trust. The certificate itself is #348's problem and no check can stand in for it.
   mkAuthenticodeCheck = pkg: pkgs.runCommand "${pkg.pname}-authenticode"
     {
       nativeBuildInputs = [ authenticode pkgs.openssl pkgs.osslsigncode pkgs.coreutils ];

@@ -204,8 +204,8 @@ jobs:
           #
           # The **zip**, not `manifest.json`. The manifest is the tempting subject — it is
           # 240 bytes and it carries the zip's digest — but it only exists when a release
-          # signing key does (#347), and gating the Latest pointer on an optional asset is
-          # how the pointer stops moving for ever the first time the key is absent. The zip
+          # signing key did, before D59 removed that key entirely — and gating the Latest
+          # pointer on an optional asset is how it stops moving for ever. The zip
           # is what every release has and is what the panel installs, so it is the honest
           # subject anyway. It is a fast download between two GitHub hosts.
           gh release download "$tag" --pattern '*.zip' --dir attest --clobber
