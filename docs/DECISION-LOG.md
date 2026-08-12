@@ -2476,10 +2476,38 @@ it sets, so that is where the check earns its keep. The chain is attestation →
 → the zip's SHA-256 → the artifact, which is why the small file is the one verified: the
 manifest names the digest, and the receiver checks that digest when it downloads.
 
-**The receiver verifies the attestation itself**, and minisign is gone: the module, the
-embedded key, the keygen, and the `RELEASE_SIGNING_KEY` secret. `promote`'s gate stays as
-the outer ring — it keeps the Latest pointer off a release whose provenance does not check
-out — but the panel no longer takes anything on trust from it.
+**The receiver is built to verify the attestation itself**, and minisign is gone: the
+module, the embedded key, the keygen, and the `RELEASE_SIGNING_KEY` secret. `promote`'s
+gate stays as the outer ring — it keeps the Latest pointer off a release whose provenance
+does not check out.
+
+**The panel's check was blocked at first, and the diagnosis it was blocked on was wrong
+(#349).** The first reading blamed `sigstore-rs` re-serialising the DSSE envelope with a
+`"keyid":""` Rekor never hashed. Measured properly, that theory dies twice over: the
+protobuf `Envelope` serialises through `prost_reflect`, which skips default-valued fields —
+its output is byte-identical to GitHub's envelope and hashes to exactly what Rekor logged.
+The real blocker: `actions/attest-build-provenance` puts every `subject-path` file into
+*one* statement — the zip first, the manifest second — and `sigstore-rs` 0.14 matches an
+artifact against `subject[0]` only (sigstore-rs#596; the misleadingly-named
+`SignatureErrorKind::Transparency` it raises is what sent the first diagnosis to the tlog
+check). The decisive measurement: the released *zip* verifies end to end against the very
+same bundle; only the manifest, subject[1], is refused. Upstream's fix (sigstore-rs#615)
+was verified against our fixture and passes — but it sat unreviewed in a repository with no
+human merge in months and a ~six-month release cadence, so waiting on it meant waiting
+indefinitely.
+
+**So the workflow attests per asset instead: one `attest-build-provenance` step for the
+zip, one for the manifest.** Each file gets its own single-subject statement, which every
+verifier handles today, stock. This is packaging, not a weakened design — the zip↔manifest
+binding lives *inside* the manifest (it names the zip's digest), never in the statement
+structure, and a second signing event mints no new secret and no new trust anchor; the
+same-run co-attestation a shared statement implied was never load-bearing. Releases attested
+before the split remain unverifiable by the panel (their bundles are immutable and
+multi-subject), which costs nothing: no panel had installed one. Verification stays
+*required* — the updater refuses what it cannot verify — and the acceptance test un-ignores
+once a per-asset release exists to regenerate the fixture from. The multi-subject fixture
+stays checked in beside it, pinning sigstore-rs#596 so the single-step form is not
+innocently restored before upstream ships.
 
 Three objections were raised against getting here, **all three were measurement errors**,
 and they are written down because they are exactly what will be raised again:

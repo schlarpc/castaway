@@ -152,14 +152,13 @@ jobs:
           nix run '.#release-manifest' -- "$zip" "$GITHUB_SHA" "$build" .
           assets+=(manifest.json)
 
-          # Handed to the next two steps as one line, because the attestation has to cover
-          # exactly the bytes the release will carry — naming them twice is how the two
-          # come to disagree.
-          # One per line: `subject-path` takes a newline-separated list, and the publish
-          # step's `read -a` splits on newlines too, so one output serves both without
-          # either having to know how the other quotes.
+          # `zip` names the zip for its own attest step; `assets` is the publish step's
+          # upload list. Both come from the same variables that produced the files, so the
+          # attested bytes and the released bytes cannot drift apart. One per line in
+          # `assets`, because the publish step's `mapfile` splits on newlines.
           {
             echo "short=$short"
+            echo "zip=$zip"
             echo "assets<<ASSET_LIST"
             printf '%s\n' "${assets[@]}"
             echo "ASSET_LIST"
@@ -172,19 +171,30 @@ jobs:
       # release asset — becomes a visible commit to this file rather than a silent swap.
       #
       # `gh attestation verify castaway-windows-electron-<sha>.zip --repo schlarpc/castaway`
-      # is the whole verification story for a human or a CI gate.
+      # is the verification story for a human and for the `promote` gate; the panel
+      # verifies the *manifest's* bundle itself, in Rust (`crates/update`, D59).
       #
-      # The panel does *not* check this, and that is a decision rather than an oversight:
-      # the Rust Sigstore client links 326 packages including a second HTTP stack and a
-      # browser launcher, against 113 for the whole updater today. What the panel checks
-      # is in `crates/update`.
+      # One attest step per asset, deliberately not one step over both. A `subject-path`
+      # list produces a single statement naming every file as a subject, and `sigstore-rs`
+      # matches an artifact against `subject[0]` only (sigstore-rs#596) — so the manifest,
+      # listed second, was a genuine subject of a genuine attestation the panel could not
+      # use (#349). Per-asset steps give each file its own single-subject statement, which
+      # every verifier handles. Collapse them back into one step only after upstream's fix
+      # (sigstore-rs#615) has shipped in a release this tree has picked up.
       #
       # Between assembling and publishing, so a release only exists once its provenance
       # does. A failure here is a failed job and no release, which is the right way round.
-      - name: Attest what this workflow built
+      - name: Attest the zip this workflow built
         uses: actions/attest-build-provenance@v4.2.2
         with:
-          subject-path: ${{ steps.assets.outputs.assets }}
+          subject-path: ${{ steps.assets.outputs.zip }}
+      # `manifest.json` written literally rather than plumbed: `release-manifest` fixes the
+      # name, and if that ever changes this step fails on a missing file — a failed job and
+      # no release, the same right-way-round as above.
+      - name: Attest the manifest that names it
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: manifest.json
 
       - name: Publish the commit-named release
         env:
@@ -194,7 +204,11 @@ jobs:
         run: |
           set -euo pipefail
           short="$SHORT"
-          read -r -a assets <<< "$ASSETS"
+          # `mapfile`, not `read -a`. `read` is line-oriented: it consumes one line and
+          # splits *that* into the array, so a newline-separated list silently became its
+          # first element — the manifest was generated, attested, and then not uploaded,
+          # and the job went green because nothing had failed.
+          mapfile -t assets <<< "$ASSETS"
           # `build-<sha>` rather than the bare sha: a tag that *is* a commit id shadows
           # the commit in every ref-vs-object ambiguity git and the API have.
           # `--prerelease` and `--latest=false` are the same claim twice, deliberately.
