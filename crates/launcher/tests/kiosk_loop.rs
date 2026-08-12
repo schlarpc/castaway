@@ -60,25 +60,39 @@ fn current(tree: &InstallTree) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-/// Start the launcher against `root`. Killed on drop, so a failing assertion does not
-/// leave a supervisor running against a temporary directory that is about to vanish.
+/// Start the launcher against `root`. Killed on drop — the *whole* process group, which is
+/// the point: killing the launcher alone orphans whatever receiver it had running, and a
+/// `sleep 600` standing in for a kiosk would then outlive the test by ten minutes. On the
+/// panel that job is the Windows job object's; here it is this.
 struct Launcher(Child);
 
 impl Launcher {
     fn start(root: &Path) -> Self {
         let exe = env!("CARGO_BIN_EXE_launcher");
-        Self(
-            Command::new(exe)
-                .arg("--root")
-                .arg(root)
-                .spawn()
-                .expect("start the launcher"),
-        )
+        let mut command = Command::new(exe);
+        command.arg("--root").arg(root);
+        #[cfg(unix)]
+        {
+            // Its own group, so the group id is the launcher's own pid and everything it
+            // spawns joins by inheritance.
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        Self(command.spawn().expect("start the launcher"))
     }
 }
 
 impl Drop for Launcher {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // `kill -- -<pgid>`, rather than a libc dependency for one signal in one test.
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg("--")
+                .arg(format!("-{}", self.0.id()))
+                .status();
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
