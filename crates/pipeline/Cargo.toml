@@ -129,7 +129,7 @@ rtc = "0.20"
 # compatibility shim can express. Linux-only by nature — the Windows panel reaches
 # WASAPI through cpal — hence the target table below.
 [target.'cfg(target_os = "linux")'.dependencies]
-pipewire = { version = "0.8", optional = true }
+pipewire = { version = "0.10", optional = true }
 
 # --- hwaccel interop (optional; per-platform) ---
 # Version-locked to what `wgpu-hal` 22 itself links, because these types cross the
