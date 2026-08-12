@@ -71,33 +71,19 @@ let
     Write-Host "close it again with: castaway-windows-firewall --close"
   '';
 
-  # The launcher. It lives beside the exe rather than being inlined into the scheduled task's
-  # `/TR`, because a task action carrying `cmd /c` plus redirection plus two `set`s has to
-  # survive bash, ssh, cmd and schtasks quoting in series, and every layer disagrees.
-  runCmd = pkgs.writeText "castaway-run.cmd" ''
-    @echo off
-    setlocal
-    rem `%~dp0` keeps a trailing backslash, which `cd /d "..."` chokes on — hence the `.`.
-    cd /d "%~dp0."
-    rem Deliberately sets no CASTAWAY_ELECTRON / CASTAWAY_BROWSER_APP / CASTAWAY_WIDEVINE_CDM:
-    rem the receiver finds all three beside its own executable. If that ever regresses, this
-    rem script is where it would be papered over, so it is left bare on purpose.
-    if exist "%~dp0castaway.log" del /q "%~dp0castaway.log"
-    if exist "%~dp0castaway.exit" del /q "%~dp0castaway.exit"
-    castaway.exe > "%~dp0castaway.log" 2>&1
-    rem Captured before the `echo`, which resets %errorlevel% to 0 on its way out.
-    set "rc=%errorlevel%"
-    echo [run.cmd] castaway.exe exited with code %rc% >> "%~dp0castaway.log"
-    rem The exit status has to cross back to the Linux side somehow, and a scheduled task's
-    rem is not worth reading: `schtasks /query` reports the *task*, which succeeded in
-    rem starting the thing that failed.
-    (echo %rc%)> "%~dp0castaway.exit"
-  '';
+  # `run.cmd` is gone with #346. It existed to redirect the receiver's output into a log and
+  # carry its exit status back across four layers of quoting; the launcher (#342) does both,
+  # and it is the only thing the scheduled task points at now. Its history is in this file's
+  # git log if the redirection trick is ever wanted again.
 
-  # Streaming the log back. `Get-Content -Wait` would do, except for two things it gets wrong
-  # here: it takes a lock the writer can trip over, and it never returns — so a receiver that
-  # died on startup leaves you staring at a prompt that looks like it is still working.
-  # Opening with FileShare.ReadWrite fixes the first; polling for the process fixes the second.
+  # Streaming the shared log back. `Get-Content -Wait` would do, except that it takes a lock
+  # the writer can trip over; opening with FileShare.ReadWrite fixes that.
+  #
+  # It follows the *launcher's* lifetime, not the receiver's, and that is the change #346
+  # makes to what a tail means. A receiver that dies on startup no longer ends the stream —
+  # the launcher restarts it, forever, and says so. The exit code this used to hand back went
+  # with `run.cmd`: the launcher's own lines carry it now (`version a1a1a1a exited with code
+  # 3 after 0.4s`), which is a thing to read rather than a number to infer.
   tailPs1 = pkgs.writeText "castaway-tail.ps1" ''
     $ErrorActionPreference = 'Stop'
     $log = Join-Path $PSScriptRoot 'castaway.log'
@@ -112,7 +98,7 @@ let
       while ($true) {
         $line = $sr.ReadLine()
         if ($null -ne $line) { Write-Output $line; continue }
-        if (-not (Get-Process -Name castaway -ErrorAction SilentlyContinue)) {
+        if (-not (Get-Process -Name launcher -ErrorAction SilentlyContinue)) {
           # Drain whatever it managed to write between the last read and dying.
           while ($null -ne ($line = $sr.ReadLine())) { Write-Output $line }
           break
@@ -121,19 +107,10 @@ let
       }
     } finally { $sr.Dispose(); $fs.Dispose() }
 
-    # Hand the receiver's own exit code back, so a launch that died on startup is a failed
-    # deploy rather than a successful one that happens to have printed an error.
-    $codeFile = Join-Path $PSScriptRoot 'castaway.exit'
-    $deadline = (Get-Date).AddSeconds(5)
-    while (-not (Test-Path -LiteralPath $codeFile) -and (Get-Date) -lt $deadline) {
-      Start-Sleep -Milliseconds 100
-    }
-    $rc = 0
-    if (Test-Path -LiteralPath $codeFile) {
-      $rc = [int](Get-Content -LiteralPath $codeFile -Raw).Trim()
-    }
-    Write-Output "--- castaway.exe exited with code $rc ---"
-    exit $rc
+    # Reaching here means the *launcher* stopped, which on a kiosk is a failure by
+    # definition: it restarts everything else, so nothing restarts it but a logon.
+    Write-Output '--- the launcher is no longer running ---'
+    exit 1
   '';
 
   # Both scripts talk to the same box the same way.
@@ -230,10 +207,108 @@ let
     '';
   };
 
+  # Everything that knows about the versioned layout (#346) shares these. The install root
+  # moved from `%USERPROFILE%\castaway` to `%LOCALAPPDATA%\castaway` with the layout, which
+  # is where `castaway-paths` already puts Windows state — one directory for the receiver's
+  # files and the copies of the receiver itself, rather than two conventions.
+  layout = ''
+    resolve_root() {
+      local base
+      base=$(on_box 'echo %LOCALAPPDATA%' | unix)
+      base="''${base%"''${base##*[![:space:]]}"}"
+      [ -n "$base" ] || die "could not resolve %LOCALAPPDATA% on $host"
+      root="$base\\castaway"
+      user=$(on_box 'echo %USERNAME%' | unix)
+      user="''${user%"''${user##*[![:space:]]}"}"
+      [ -n "$user" ] || die "could not resolve %USERNAME% on $host"
+    }
+
+    # Stop the whole tree, launcher first. Order matters: killing the receiver while the
+    # launcher is alive gets it restarted a second later, which then holds the very files
+    # about to be replaced. Ending the *task* first is what makes this deterministic.
+    stop_everything() {
+      on_box 'schtasks /end /TN castaway >nul 2>&1 & taskkill /F /T /IM launcher.exe 2>&1 & taskkill /F /T /IM castaway.exe 2>&1 & taskkill /F /T /IM electron.exe 2>&1' \
+        | unix | grep -Ev '^(INFO: No tasks|ERROR: The process)' || true
+      local left
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        left=$(on_box 'tasklist /FI "IMAGENAME eq launcher.exe" /FO CSV /NH & tasklist /FI "IMAGENAME eq castaway.exe" /FO CSV /NH & tasklist /FI "IMAGENAME eq electron.exe" /FO CSV /NH' \
+          | unix | grep -c '^"' || true)
+        [ "$left" -eq 0 ] && break
+        sleep 1
+      done
+      [ "$left" -eq 0 ] || die "$left launcher/castaway/electron process(es) survived taskkill on $host"
+    }
+
+    # Copy the archive over, check it arrived intact, and extract it into `versions\<id>\`
+    # with the wrapper directory stripped — which is what makes `versions\<id>\castaway.exe`
+    # true, and is exactly what the in-app updater does with the same archive (#345).
+    stage_version() {
+      local zip="$1" zip_sha="$2" exe_sha="$3" id="$4"
+      local dest="$root\\versions\\$id"
+
+      say "copying $(basename "$zip") to $host"
+      scp "''${ssh_opts[@]}" "$zip" "$host:castaway-deploy.zip"
+      local got
+      got=$(remote_sha256 'castaway-deploy.zip')
+      [ "$got" = "$zip_sha" ] \
+        || die "archive hash mismatch after transfer: box says '$got', built '$zip_sha'"
+
+      say "extracting into $dest"
+      # A version directory is replaced wholesale, never merged: a tree half of which is
+      # from another build is the one state neither the launcher nor a human can diagnose.
+      on_box "if exist \"$dest\" rmdir /s /q \"$dest\"" || true
+      on_box "if exist \"$dest\" exit 1" \
+        || die "$dest still exists after rmdir — something holds a handle on it"
+      # bsdtar ships in Windows since 1809 and reads zip; there is no unzip on the box.
+      # `--strip-components=1` drops the archive's one wrapping directory.
+      on_box "mkdir \"$dest\" && tar -xf castaway-deploy.zip --strip-components=1 -C \"$dest\"" \
+        || die "extract failed"
+      on_box 'del /q castaway-deploy.zip' || true
+
+      on_box "if not exist \"$dest\\castaway.exe\" exit 1" \
+        || die "$dest\\castaway.exe missing after extract"
+      got=$(remote_sha256 "$dest\\castaway.exe")
+      [ "$got" = "$exe_sha" ] \
+        || die "deployed castaway.exe hashes $got, built one hashes $exe_sha"
+
+      # Written last, and only once everything above passed: the stamp means "this exact
+      # archive extracted cleanly here", so a half-finished deploy leaves no stamp and the
+      # next run cannot take the fast path.
+      # Parenthesised because cmd binds a trailing digit to the redirect: `echo abc1> f`
+      # writes "abc" and redirects handle 1, and a hex digest ends in a digit more often
+      # than not — which would have made the fast path silently never match.
+      on_box "(echo $zip_sha)> \"$dest\\.deployed-sha256\"" \
+        || die "could not write the deploy stamp"
+    }
+
+    # Move `current.txt`, keeping whatever it named as `previous.txt` — the same order the
+    # in-app updater uses, and for the same reason: losing power between the two writes
+    # costs one unavailable rollback rather than a pointer pair that names nothing.
+    point_at() {
+      local id="$1" was
+      was=$(on_box "type \"$root\\current.txt\" 2>nul" | unix | tr -d '[:space:]' || true)
+      if [ -n "$was" ] && [ "$was" != "$id" ]; then
+        on_box "(echo $was)> \"$root\\previous.txt\"" || die "could not write previous.txt"
+      fi
+      on_box "(echo $id)> \"$root\\current.txt\"" || die "could not write current.txt"
+    }
+  '';
+
+  # A hand deploy, onto the versioned layout (#346).
+  #
+  # What changed with the layout: a deploy no longer wipes the install root, because the
+  # root is now where `previous.txt` and the other versions live and losing those is losing
+  # the rollback. It replaces one version directory, moves the pointers, and restarts the
+  # launcher — which is exactly what the in-app updater does, minus the part where it waits
+  # for the panel to be idle.
+  #
+  # It also writes `hold`. A hand deploy means a human is driving, and the 4 a.m. updater
+  # must not replace what they are looking at; deleting that file is the re-arm, and there
+  # is no flag for it here on purpose — re-arming should be a thing somebody does knowingly.
   deploy = pkgs.writeShellApplication {
     name = "castaway-deploy-windows";
     runtimeInputs = [ pkgs.openssh pkgs.coreutils pkgs.unzip ];
-    text = preamble + ''
+    text = preamble + layout + ''
       artifact="castaway-windows-electron"
       force=""
       no_launch=""
@@ -266,22 +341,23 @@ let
       [ "''${#exe_sha}" -eq 64 ] || die "no $artifact/castaway.exe inside $zip"
       printf '    %s (%s bytes)\n' "$zip" "$(stat -c%s "$zip")"
 
-      home_dir=$(on_box 'echo %USERPROFILE%' | unix)
-      home_dir="''${home_dir%"''${home_dir##*[![:space:]]}"}"
-      [ -n "$home_dir" ] || die "could not resolve %USERPROFILE% on $host"
-      user=$(on_box 'echo %USERNAME%' | unix)
-      user="''${user%"''${user##*[![:space:]]}"}"
-      root="$home_dir\\castaway"
-      dest="$root\\$artifact"
-      stamp="$dest\\.deployed-sha256"
+      # The version id has to be forty lowercase hex characters, because that is what the
+      # launcher and the updater both parse a directory name as — and `dirtyShortRev` is
+      # neither. The archive's own digest, truncated, is the honest answer: it names *these
+      # bits*, it never collides with the release sha of the commit they were built from,
+      # and two deploys of the same tree land in the same directory.
+      version="''${zip_sha:0:40}"
+
+      resolve_root
+      dest="$root\\versions\\$version"
 
       # Is the box already carrying exactly these bits? Two independent answers have to
-      # agree: the stamp this script wrote after a verified extract, and a fresh hash of
+      # agree: the stamp `stage_version` wrote after a verified extract, and a fresh hash of
       # the exe itself. The stamp alone would survive someone editing the tree; the exe
       # hash alone says nothing about the 235 MB of browser beside it.
       fresh=""
       if [ -z "$force" ]; then
-        have_stamp=$(on_box "type \"$stamp\" 2>nul" | unix | tr -d '[:space:]' || true)
+        have_stamp=$(on_box "type \"$dest\\.deployed-sha256\" 2>nul" | unix | tr -d '[:space:]' || true)
         have_exe=$(remote_sha256 "$dest\\castaway.exe")
         if [ "$have_stamp" = "$zip_sha" ] && [ "$have_exe" = "$exe_sha" ]; then
           fresh=1
@@ -291,91 +367,161 @@ let
       fi
 
       say "stopping anything running on $host"
-      # /T so the Electron children go with the parent; without them the tree stays locked
-      # and the delete below fails in a way that looks like a permissions problem.
-      # "not found" is the normal case on a box that is not currently running anything;
-      # only what was actually killed is worth a line.
-      # `2>&1` inside the cmd line, not outside: taskkill's "not found" goes to *its* stderr,
-      # which ssh forwards straight to ours, where the filter below never sees it.
-      on_box 'schtasks /end /TN castaway >nul 2>&1 & taskkill /F /T /IM castaway.exe 2>&1 & taskkill /F /T /IM electron.exe 2>&1' \
-        | unix | grep -Ev '^(INFO: No tasks|ERROR: The process)' || true
-      for _ in 1 2 3 4 5 6 7 8 9 10; do
-        left=$(on_box 'tasklist /FI "IMAGENAME eq castaway.exe" /FO CSV /NH & tasklist /FI "IMAGENAME eq electron.exe" /FO CSV /NH' \
-          | unix | grep -c '^"' || true)
-        [ "$left" -eq 0 ] && break
-        sleep 1
-      done
-      [ "$left" -eq 0 ] || die "$left castaway/electron process(es) survived taskkill on $host"
+      stop_everything
 
       if [ -z "$fresh" ]; then
-        say "wiping $root"
-        on_box "if exist \"$root\" rmdir /s /q \"$root\"" || true
-        # rmdir reports success while leaving the tree behind if a handle is open, so the
-        # only trustworthy check is asking again. A stale tree is the exact failure this
-        # script exists to make impossible.
-        on_box "if exist \"$root\" exit 1" \
-          || die "$root still exists after rmdir — something holds a handle on it"
-
-        say "copying $(basename "$zip") to $host"
-        scp "''${ssh_opts[@]}" "$zip" "$host:castaway-deploy.zip"
-
-        got=$(remote_sha256 'castaway-deploy.zip')
-        [ "$got" = "$zip_sha" ] \
-          || die "archive hash mismatch after transfer: box says '$got', built '$zip_sha'"
-
-        say "extracting into $root"
-        # bsdtar ships in Windows since 1809 and reads zip; there is no unzip on the box.
-        on_box "mkdir \"$root\" && tar -xf castaway-deploy.zip -C \"$root\"" \
-          || die "extract failed"
-        on_box 'del /q castaway-deploy.zip' || true
-
-        on_box "if not exist \"$dest\\castaway.exe\" exit 1" \
-          || die "$dest\\castaway.exe missing after extract"
-        got=$(remote_sha256 "$dest\\castaway.exe")
-        [ "$got" = "$exe_sha" ] \
-          || die "deployed castaway.exe hashes $got, built one hashes $exe_sha"
-
-        # Written last, and only once everything above passed: the stamp means "this exact
-        # archive extracted cleanly here", so a half-finished deploy leaves no stamp and the
-        # next run cannot take the fast path.
-        # Parenthesised because cmd binds a trailing digit to the redirect: `echo abc1> f`
-        # writes "abc" and redirects handle 1, and a hex digest ends in a digit more often
-        # than not — which would have made the fast path silently never match.
-        on_box "(echo $zip_sha)> \"$stamp\"" || die "could not write $stamp"
+        on_box "mkdir \"$root\\versions\" 2>nul" || true
+        stage_version "$zip" "$zip_sha" "$exe_sha" "$version"
         say "deployed and verified: $dest"
       fi
 
+      # The launcher at the root is what the scheduled task points at, and it is *not*
+      # replaced by an ordinary deploy — it is installed once by `windows-migrate`. Copying
+      # it here anyway would mean a hand deploy could break the one thing that survives
+      # everything else. If it is missing, the box has not been migrated and says so.
+      on_box "if not exist \"$root\\launcher.exe\" exit 1" \
+        || die "no launcher at $root\\launcher.exe — run 'nix run .#windows-migrate' first"
+
+      say "pointing current.txt at $version"
+      point_at "$version"
+      # A human is driving. The updater stands down until somebody deletes this.
+      on_box "(echo hand deploy)> \"$root\\hold\"" || die "could not write the hold file"
+
       # sftp mangles backslashes; it takes the same path with forward slashes, and so does
       # every Windows API the other side of it.
-      dest_fwd="''${dest//\\//}"
-      scp "''${ssh_opts[@]}" -q ${runCmd} "$host:$dest_fwd/run.cmd"
-      scp "''${ssh_opts[@]}" -q ${tailPs1} "$host:$dest_fwd/tail.ps1"
+      root_fwd="''${root//\\//}"
+      scp "''${ssh_opts[@]}" -q ${tailPs1} "$host:$root_fwd/tail.ps1"
 
       if [ -n "$no_launch" ]; then
-        say "not launching (--no-launch); run.cmd is staged at $dest"
+        say "not launching (--no-launch); current.txt points at $version"
         exit 0
       fi
 
-      say "launching on the console session"
-      # /IT is the whole point: it runs the task with the interactive token of the logged-on
-      # user, which is the only way from here to reach the desktop the panel is showing.
-      # A plain `ssh ... run.cmd` lands in session 0 and renders to nothing.
-      on_box "schtasks /create /TN castaway /TR \"$dest\\run.cmd\" /SC ONCE /ST 23:59 /RU $user /IT /F" \
-        | unix | grep -v '^WARNING: Task may not run' || true
+      say "starting the launcher on the console session"
+      # The task already exists and already points at the launcher (`windows-migrate`), so
+      # this only has to run it. `/IT` and the rest of that story live there.
       on_box 'schtasks /run /TN castaway' | unix
       for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         up=$(on_box 'tasklist /FI "IMAGENAME eq castaway.exe" /FO CSV /NH' | unix | grep -c '^"' || true)
         [ "$up" -gt 0 ] && break
         sleep 1
       done
-      [ "$up" -gt 0 ] || die "castaway.exe never appeared; check $dest\\castaway.log"
+      [ "$up" -gt 0 ] || die "castaway.exe never appeared; check $root\\castaway.log"
 
-      say "streaming $dest\\castaway.log  (Ctrl-C detaches; the panel keeps running)"
+      say "streaming $root\\castaway.log  (Ctrl-C detaches; the panel keeps running)"
       echo
       # -t so Ctrl-C reaches the remote tail instead of orphaning a PowerShell on the box.
       ssh -t "''${ssh_opts[@]}" "$host" \
-        "powershell -NoProfile -ExecutionPolicy Bypass -File \"$dest\\tail.ps1\""
+        "powershell -NoProfile -ExecutionPolicy Bypass -File \"$root\\tail.ps1\""
     '';
   };
+
+  # The one-time migration onto the layout (#346). Idempotent, so re-running it after a
+  # launcher change or a certificate rotation is the supported way to do those.
+  #
+  # Three things, and only the third needs elevation:
+  #
+  #   1. build the install root and seed it from the current artifact;
+  #   2. replace the scheduled task with an **ONLOGON** one pointing at `launcher.exe` —
+  #      which also fixes an adjacent gap nobody had filed: today's `/SC ONCE /ST 23:59` is
+  #      run by hand, so a Windows reboot left the panel dead until somebody re-ran it;
+  #   3. trust the Authenticode certificate (#344) once.
+  #
+  # **Firewall: nothing to do, and that is a decision rather than an omission.** The rules
+  # `nix run .#windows-firewall` writes are port-scoped from `nix/network-surface.json`, so
+  # they survive version-directory flips untouched. Auto-update stays low-privilege and
+  # never touches firewall rules or persistence; a port-config change still wants the
+  # elevated one-shot, exactly as before.
+  migrate = pkgs.writeShellApplication {
+    name = "castaway-windows-migrate";
+    runtimeInputs = [ pkgs.openssh pkgs.coreutils pkgs.unzip ];
+    text = preamble + layout + ''
+      artifact="castaway-windows-electron"
+
+      say() { printf '\n==> %s\n' "$*"; }
+      die() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
+
+      say "building .#$artifact.archive"
+      store=$(nix build --no-link --print-out-paths ".#$artifact.archive")
+      zip="$store/$artifact.zip"
+      [ -f "$zip" ] || die "no archive at $zip"
+      zip_sha=$(sha256sum "$zip" | cut -d' ' -f1)
+      exe_sha=$(unzip -p "$zip" "$artifact/castaway.exe" | sha256sum | cut -d' ' -f1)
+      [ "''${#exe_sha}" -eq 64 ] || die "no $artifact/castaway.exe inside $zip"
+      version="''${zip_sha:0:40}"
+
+      resolve_root
+      say "install root: $root  (user $user)"
+
+      say "stopping anything running on $host"
+      stop_everything
+
+      on_box "mkdir \"$root\" 2>nul & mkdir \"$root\\versions\" 2>nul" || true
+      stage_version "$zip" "$zip_sha" "$exe_sha" "$version"
+
+      # The launcher is installed at the *root*, from inside the version tree that carries
+      # it — so the one binary the scheduled task names came out of the same archive as
+      # everything else, rather than from a second build nobody can point at.
+      say "installing the launcher at the root"
+      on_box "copy /y \"$root\\versions\\$version\\launcher.exe\" \"$root\\launcher.exe\" >nul" \
+        || die "no launcher.exe in the artifact — is this build older than #342?"
+
+      point_at "$version"
+      # Seeded, so the launcher has somewhere to roll back to from its first boot: itself.
+      # A `previous.txt` naming the current version costs one unavailable rollback and is
+      # strictly better than one naming nothing, which the launcher would read as "no
+      # target" for as long as it takes the first update to land.
+      on_box "if not exist \"$root\\previous.txt\" (echo $version)> \"$root\\previous.txt\"" \
+        || die "could not seed previous.txt"
+      # This is a *managed* install from here on, so the updater is armed.
+      on_box "if exist \"$root\\hold\" del /q \"$root\\hold\"" || true
+
+      root_fwd="''${root//\\//}"
+      scp "''${ssh_opts[@]}" -q ${tailPs1} "$host:$root_fwd/tail.ps1"
+
+      say "replacing the scheduled task with an ONLOGON launcher task"
+      # ONLOGON rather than ONCE: the panel has to come back after a reboot by itself, and
+      # nothing else on the box will start it. `/IT` is the load-bearing part and is
+      # unchanged — it runs with the interactive token of the logged-on user, which is the
+      # only way to reach the desktop the panel is showing. A task without it lands in
+      # session 0 and renders to nothing (docs/cross-build.md).
+      on_box "schtasks /create /TN castaway /TR \"$root\\launcher.exe\" /SC ONLOGON /RU $user /IT /F" \
+        | unix | grep -v '^WARNING: Task may not run' || true
+
+      # The one elevated step, and the only one. Skipped rather than failed where the
+      # certificate does not exist yet (#348): an unsigned artifact still runs, it just has
+      # no publisher, and refusing to migrate over that would be refusing over cosmetics.
+      if grep -q 'BEGIN CERTIFICATE' ${../nix/windows-codesign.crt}; then
+        if on_box 'net session >nul 2>&1'; then
+          say "trusting the castaway code-signing certificate"
+          scp "''${ssh_opts[@]}" -q ${../nix/windows-codesign.crt} "$host:castaway-codesign.crt"
+          on_box 'certutil -addstore -f Root castaway-codesign.crt' | unix | tail -2
+          on_box 'del /q castaway-codesign.crt' || true
+        else
+          echo "warning: the SSH session is not elevated, so the code-signing certificate" >&2
+          echo "was not imported. Re-run this with an elevated session (#346 step 3)." >&2
+        fi
+      else
+        echo "note: nix/windows-codesign.crt carries no certificate yet (#348), so there" >&2
+        echo "is nothing to trust. Re-run this after the keygen." >&2
+      fi
+
+      say "starting the launcher on the console session"
+      on_box 'schtasks /run /TN castaway' | unix
+      for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        up=$(on_box 'tasklist /FI "IMAGENAME eq castaway.exe" /FO CSV /NH' | unix | grep -c '^"' || true)
+        [ "$up" -gt 0 ] && break
+        sleep 1
+      done
+      [ "$up" -gt 0 ] || die "castaway.exe never appeared; check $root\\castaway.log"
+
+      say "migrated. The box now runs $root\\launcher.exe at logon."
+      echo "    versions\\$version is current, and the updater is armed."
+      echo "    Acceptance, by hand: reboot (the panel comes back), taskkill castaway.exe"
+      echo "    (the launcher relaunches it), and point current.txt at a tree that dies"
+      echo "    on boot (the launcher rolls back within three attempts)."
+    '';
+  };
+
 in
-{ inherit deploy firewall winusb; }
+{ inherit deploy migrate firewall winusb; }

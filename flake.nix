@@ -831,6 +831,11 @@
             # landed, launch on the *console* session, stream the log back.
             deploy-windows = windowsDeploy.deploy;
 
+            # The one-time move onto the versioned auto-update layout (#346):
+            # `nix run .#windows-migrate`. Idempotent, so it is also how a launcher
+            # change or a certificate rotation gets onto the box.
+            windows-migrate = windowsDeploy.migrate;
+
             # The same hole-punching as `open-firewall`, from the same
             # nix/network-surface.json, against the Windows box's firewall:
             # `nix run .#windows-firewall` (`-- --close` to take it down again).

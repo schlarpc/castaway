@@ -65,10 +65,39 @@ machine on one LAN — so both scripts read `CASTAWAY_WINDOWS_HOST=user@address`
 ```
 export CASTAWAY_WINDOWS_HOST=user@panel
 nix run .#windows-firewall            # once per box; --close takes it down again
-nix run .#deploy-windows              # build → wipe → copy → verify → launch → stream the log
+nix run .#windows-migrate             # once per box; installs the launcher + the logon task
+nix run .#deploy-windows              # build → copy → verify → point → launch → stream the log
 nix run .#deploy-windows -- --force   # re-copy even if the box already has these bits
 nix run .#deploy-windows -- --no-launch castaway-windows-electron
 ```
+
+### The install layout
+
+Since #346 the box runs a **side-by-side versioned tree** under `%LOCALAPPDATA%\castaway\` —
+the pattern Chrome, Squirrel and Velopack converge on, and the one that makes unattended update
+possible at all (the decision, and why MSI and MSIX were both rejected, is in #26's closing
+comment):
+
+```
+launcher.exe          stable; the scheduled task points here and nowhere else
+current.txt           the version to run — written atomically, and written last
+previous.txt          the last known-healthy version, the rollback target
+hold                  present ⇒ a human is driving; the updater stands down
+castaway.log          the receiver's stdout, shared across versions
+versions\<sha>\        a release tree, extracted; `.healthy` appears once it is up
+```
+
+Two properties fall out of it, and they are why nothing is ever overwritten in place: Windows
+permits renaming a running image and forbids only deleting or overwriting it, so the file
+locking that makes in-place updaters miserable simply does not arise; and steady-state updates
+need **no elevation at all**, because everything they touch is per-user.
+
+`windows-migrate` is the one-time move onto that layout — install root, launcher, the seeded
+version, the pointer pair, an **ONLOGON** `/IT` scheduled task, and the code-signing certificate
+into `LocalMachine\Root`. It is idempotent, so it is also how a launcher change or a certificate
+rotation gets onto the box. The ONLOGON task fixes an adjacent gap that predates auto-update:
+the old `/SC ONCE /ST 23:59` task was run by hand, so a Windows reboot left the panel dead until
+somebody re-ran it.
 
 `deploy-windows` is built around the assumption that **a stale tree that looks deployed is the
 expensive failure**: you change something, the copy silently doesn't land, and you spend the
@@ -79,6 +108,16 @@ transferred zip is hashed on the box against the local one, and the extracted `c
 hashed against the one in the store. Only after all of that does it write
 `.deployed-sha256`, which is what lets the *next* run skip the 235 MB copy — a half-finished
 deploy leaves no stamp, so the fast path cannot inherit a lie.
+
+What the layout changed about a hand deploy: it replaces **one version directory** rather than
+wiping the install root, because the root is now where `previous.txt` and the other versions
+live and wiping it would be wiping the rollback. The version id is the archive's own SHA-256
+truncated to forty hex characters — a directory name has to parse as a `VersionId`, and
+`dirtyShortRev` does not; the digest names *these bits*, never collides with the release sha of
+the commit they came from, and puts two deploys of the same tree in the same directory. And it
+writes `hold`, because a hand deploy means a human is driving and the 4 a.m. updater must not
+replace what they are looking at. Deleting that file is the re-arm; there is deliberately no
+flag for it.
 
 Three things about the box drove the design, all measured rather than assumed:
 
@@ -93,17 +132,21 @@ Three things about the box drove the design, all measured rather than assumed:
   flat directory, and a receiver that only knew the environment variable looked for a bare
   `electron` on `PATH`. Fixed in the receiver rather than in the launcher: `Config::
   browser_program`/`browser_app_dir` fall back to `browser/electron[.exe]` and `browser-host/`
-  beside `current_exe()`, and `stageWidevine()` finds `WidevineCdm/` the same way. `run.cmd`
-  therefore sets nothing, on purpose — if the sibling resolution regresses, it should surface
-  here rather than be papered over by the deploy script.
+  beside `current_exe()`, and `stageWidevine()` finds `WidevineCdm/` the same way. The launcher
+  therefore hands the receiver nothing but a working directory, on purpose — if the sibling
+  resolution regresses, it should surface on the box rather than be papered over by whatever
+  starts the process.
 - **The SSH session is elevated and cmd.exe is the shell.** `netsh`/`New-NetFirewallRule` work
   without a UAC dance, which is what makes `windows-firewall` possible at all; and `;` is not a
   separator, `&` is.
 
-Output comes back over a small PowerShell tail (`tail.ps1`, staged beside the exe) rather than
-`Get-Content -Wait`, for two reasons: it opens with `FileShare.ReadWrite` so it cannot trip the
-writer, and it exits when `castaway.exe` is gone — a receiver that died three seconds in
-otherwise leaves you watching an idle stream that looks identical to one that is working.
+Output comes back over a small PowerShell tail (`tail.ps1`, staged at the install root) rather
+than `Get-Content -Wait`, because that opens with `FileShare.ReadWrite` and so cannot trip the
+writer. It follows the **launcher's** lifetime rather than the receiver's, which is what a tail
+means under the new layout: a receiver that dies three seconds in no longer ends the stream,
+because the launcher restarts it and says so in the same log (`version a1a1a1a exited with code
+3 after 0.4s`). The exit code the tail used to hand back went with `run.cmd`; the launcher's own
+lines carry it, which is a thing to read rather than a number to infer.
 
 `windows-firewall` generates its rules from `nix/network-surface.json`, the same source of truth
 as the Linux `open-firewall` and as the app's own `--network-surface`, so it cannot drift from
