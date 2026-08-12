@@ -14,6 +14,7 @@ mod config;
 mod instance;
 mod logging;
 mod screen;
+mod shutdown;
 // The network-surface registry (#22/#30): every socket, as data, generating the doc,
 // the firewall JSON, and the --network-surface query.
 mod surface;
@@ -58,10 +59,11 @@ use proto_miracast::MiracastAdapter;
 use proto_spotify::SpotifyService;
 use substrate_mdns::MdnsResponder;
 use substrate_ssdp::{Responder, ResponderConfig, SsdpDevice};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::shutdown::Shutdown;
 
 /// The mDNS host label every advertisement resolves to (`castaway.local.`). One name for
 /// the box, however many services it publishes.
@@ -178,7 +180,7 @@ fn main() -> anyhow::Result<()> {
         .context("building tokio runtime")?;
 
     let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(64);
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = shutdown::Shutdown::new();
     // A fullscreen kiosk has no window chrome, so ctrl-c must also stop the winit loop;
     // the flag is checked on every wake, and setting it comes with a wake (#59).
     let kiosk_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -679,7 +681,7 @@ fn main() -> anyhow::Result<()> {
             &config.update,
             casting,
             utc_offset_secs,
-            Arc::clone(&shutdown),
+            shutdown.clone(),
             Arc::clone(&kiosk_exit),
             wake.clone(),
         );
@@ -720,7 +722,7 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         #[cfg(not(feature = "electron"))]
         pipeline::kiosk::run(rx, wiring).map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
-        shutdown.notify_waiters();
+        shutdown.fire();
         // Dropping the runtime waits for every blocking task that has already started —
         // and the SponsorBlock Lounge stream is a blocking read that can sit inside its
         // 90-second timeout with nothing to interrupt it. The window is gone; nobody is
@@ -777,7 +779,7 @@ fn main() -> anyhow::Result<()> {
             &config.update,
             casting,
             utc_offset_secs,
-            Arc::clone(&shutdown),
+            shutdown.clone(),
             Arc::clone(&kiosk_exit),
             castaway_core::Waker::new(),
         );
@@ -860,7 +862,7 @@ fn record_the_mix(config: &Config, mixer: &Arc<pipeline::mixer::AudioMixer>) {
 /// tell the winit loop to exit.
 fn spawn_ctrl_c(
     runtime: &tokio::runtime::Runtime,
-    shutdown: &Arc<Notify>,
+    shutdown: &Shutdown,
     kiosk_exit: &Arc<std::sync::atomic::AtomicBool>,
     kiosk_wake: castaway_core::Waker,
     remote: castaway_core::RemoteHandle,
@@ -891,7 +893,7 @@ fn spawn_ctrl_c(
         // The kiosk sleeps between frames (#59) and checks the flag when awake; a
         // ctrl-c on an idle panel has to wake it to be noticed.
         kiosk_wake.wake();
-        shutdown.notify_waiters();
+        shutdown.fire();
     });
 }
 
@@ -1004,7 +1006,7 @@ struct Launchers<D> {
 async fn serve(
     config: Config,
     event_tx: mpsc::Sender<SourceMessage>,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
     osd: castaway_core::OsdSink,
     launchers: Launchers<impl Fn(proto_dial::DialEvent) + Send + 'static>,
     handles: PipelineHandles,
@@ -1460,10 +1462,7 @@ async fn serve(
         }
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = responder
-                .run(async move { shutdown.notified().await })
-                .await
-            {
+            if let Err(e) = responder.run(async move { shutdown.wait().await }).await {
                 warn!(error = %e, "SSDP responder exited");
             }
         })
@@ -1506,7 +1505,7 @@ async fn serve(
     let http_shutdown = shutdown.clone();
     let http_handle = tokio::spawn(async move {
         let served = axum::serve(listener, http)
-            .with_graceful_shutdown(async move { http_shutdown.notified().await })
+            .with_graceful_shutdown(async move { http_shutdown.wait().await })
             .await;
         if let Err(e) = served {
             warn!(error = %e, "HTTP host exited");
@@ -1514,7 +1513,7 @@ async fn serve(
     });
 
     info!("castaway services running");
-    shutdown.notified().await;
+    shutdown.wait().await;
     info!("services: shutting down (SSDP byebye, unregister mDNS)");
 
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1598,7 +1597,7 @@ async fn spawn_cast(
     media_ports: castaway_core::MediaPorts,
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
     app_hosting: Option<proto_cast::PlatformHost>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
@@ -1720,7 +1719,7 @@ async fn spawn_cast(
                 }
             }
             () = refresh => {}
-            () = shutdown.notified() => info!("Cast listener stopping"),
+            () = shutdown.wait() => info!("Cast listener stopping"),
         }
     }))
 }
@@ -1796,7 +1795,7 @@ struct GameStreamWiring {
 fn spawn_gamestream(
     config: &Config,
     event_tx: mpsc::Sender<SourceMessage>,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
 ) -> anyhow::Result<GameStreamWiring> {
     let gs = &config.gamestream;
     let store = proto_gamestream::PairingStore::new(gs.state_dir.clone());
@@ -1848,7 +1847,7 @@ fn spawn_gamestream(
                     warn!(error = %e, "GameStream adapter exited");
                 }
             }
-            () = shutdown.notified() => info!("GameStream client stopping"),
+            () = shutdown.wait() => info!("GameStream client stopping"),
         }
     });
     // The command sender goes back to the caller rather than being held here: the panel
@@ -1863,7 +1862,7 @@ fn spawn_gamestream(
 fn spawn_miracast(
     config: &Config,
     event_tx: mpsc::Sender<SourceMessage>,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // D35 split the protocol from the radio precisely because they fail for unrelated
     // reasons: `proto-miracast` is portable and fixture-tested, while bringing up the
@@ -1927,7 +1926,7 @@ fn spawn_miracast(
                         warn!(error = %e, "Miracast adapter exited");
                     }
                 }
-                () = shutdown.notified() => info!("Miracast stopping"),
+                () = shutdown.wait() => info!("Miracast stopping"),
             }
         }))
     }
@@ -1940,7 +1939,7 @@ fn spawn_airplay(
     media_ports: castaway_core::MediaPorts,
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
 ) -> tokio::task::JoinHandle<()> {
     let receiver = AirPlayReceiver::new(
@@ -1979,7 +1978,7 @@ fn spawn_airplay(
                     warn!(error = %e, "AirPlay adapter exited");
                 }
             }
-            () = shutdown.notified() => info!("AirPlay listeners stopping"),
+            () = shutdown.wait() => info!("AirPlay listeners stopping"),
         }
     })
 }
@@ -2004,7 +2003,7 @@ fn spawn_fcast(
     advertised: std::net::Ipv4Addr,
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
     mirror: Option<Arc<dyn castaway_core::MirrorBackend>>,
 ) -> FCastWiring {
@@ -2054,7 +2053,7 @@ fn spawn_fcast(
                     warn!(error = %e, "FCast adapter exited");
                 }
             }
-            () = shutdown.notified() => info!("FCast listener stopping"),
+            () = shutdown.wait() => info!("FCast listener stopping"),
         }
     });
     FCastWiring {
@@ -2086,7 +2085,7 @@ fn spawn_matter(
     config: &Config,
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
     osd: castaway_core::OsdSink,
     browser_launches: Option<mpsc::UnboundedSender<proto_matter::BrowserLaunch>>,
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
@@ -2175,7 +2174,7 @@ fn spawn_matter(
                     warn!(error = %e, "Matter adapter exited");
                 }
             }
-            () = shutdown.notified() => info!("Matter listeners stopping"),
+            () = shutdown.wait() => info!("Matter listeners stopping"),
         }
     }))
 }

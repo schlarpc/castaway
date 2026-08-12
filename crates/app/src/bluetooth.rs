@@ -15,7 +15,9 @@ use hci_transport::{usb::UsbTransport, FirmwareSet, UsbId};
 use proto_bluetooth_audio::host::HostConfig;
 use proto_bluetooth_audio::{BluetoothAdapter, BluetoothConfig};
 use substrate_hci::{BdAddr, HciTransport, LinkKey};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
+
+use crate::shutdown::Shutdown;
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -33,7 +35,7 @@ const LINK_KEYS_FILE: &str = "bluetooth-link-keys";
 pub async fn spawn(
     config: &Config,
     event_tx: mpsc::Sender<SourceMessage>,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // The first attempt is part of startup, so a box with no dongle says so once, at
     // boot, with a real error — rather than disappearing into a retry loop nobody reads.
@@ -74,7 +76,7 @@ async fn supervise(
     config: Config,
     first: (Arc<BluetoothAdapter>, String),
     sink: SessionSink,
-    shutdown: Arc<Notify>,
+    shutdown: Shutdown,
 ) {
     let mut next = Some(first);
     let mut backoff = RETRY_MIN;
@@ -84,7 +86,7 @@ async fn supervise(
             None => {
                 tokio::select! {
                     () = tokio::time::sleep(backoff) => {}
-                    () = shutdown.notified() => return,
+                    () = shutdown.wait() => return,
                 }
                 match build(&config).await {
                     Ok(ready) => ready,
@@ -109,7 +111,7 @@ async fn supervise(
                     Err(e) => warn!(error = %e, controller = %id, "bluetooth adapter exited"),
                 }
             }
-            () = shutdown.notified() => {
+            () = shutdown.wait() => {
                 info!("Bluetooth sink stopping");
                 return;
             }

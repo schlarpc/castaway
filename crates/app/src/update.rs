@@ -102,7 +102,7 @@ pub fn spawn(
     config: &UpdateConfig,
     casting: CastingHandle,
     utc_offset_secs: i32,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: crate::shutdown::Shutdown,
     kiosk_exit: Arc<std::sync::atomic::AtomicBool>,
     kiosk_wake: castaway_core::Waker,
 ) -> Arc<AtomicI32> {
@@ -172,7 +172,7 @@ pub fn spawn(
         );
         kiosk_exit.store(true, std::sync::atomic::Ordering::Relaxed);
         kiosk_wake.wake();
-        shutdown.notify_waiters();
+        shutdown.fire();
     });
 
     exit_code
