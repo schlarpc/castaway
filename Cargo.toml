@@ -166,6 +166,16 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # `ring` everywhere, explicitly: it is the backend that already cross-compiles for the
 # Windows target in nix/windows.nix, and rcgen/rustls each default to aws-lc-rs, which
 # would drag a second C crypto build into the tree.
+#
+# This pin says what *this* tree's crates use. It no longer says what is in the dependency
+# graph: `castaway-update`'s `sigstore` brings `aws-lc-rs` in unconditionally (D59), and
+# reqwest 0.13's `rustls` feature turns it on for the rustls crate below as well. Two
+# provider features on one rustls is not an error — it is an *ambiguity*, and rustls
+# resolves it by panicking the first time anyone builds a config without naming a
+# provider. So: every `ClientConfig`/`ServerConfig` in this workspace is built with
+# `builder_with_provider(ring)`, never the bare `builder()`. Cargo cannot enforce that
+# invariant, and a review that assumes "the pin means ring is the only one" will restore
+# the panic. `grep builder_with_provider crates/` is the check.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
