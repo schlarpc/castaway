@@ -112,6 +112,9 @@ pub struct Agent {
     /// Where tonight has got to. Derived state the loop keeps between turns — the policy
     /// is a function and does not remember anything.
     phase: Phase,
+    /// Whether the `hold` file was there last time round, so its appearance and its
+    /// removal are each one log line rather than one per look.
+    held: bool,
 }
 
 /// A release that has been downloaded, verified and extracted under its final name.
@@ -167,6 +170,7 @@ impl Agent {
             utc_offset_secs,
             staged: None,
             phase: Phase::Fresh,
+            held: false,
         })
     }
 
@@ -195,6 +199,20 @@ impl Agent {
         }
 
         loop {
+            // Re-read every turn rather than once at startup, because "delete it to
+            // re-arm" is only half a contract: somebody who drops a `hold` file at 03:00
+            // means it for 03:30, and a check made hours earlier would not have seen it.
+            if self.holding() {
+                tokio::time::sleep(
+                    self.policy
+                        .window
+                        .until_open(self.local_minute())
+                        .max(self.policy.recheck),
+                )
+                .await;
+                continue;
+            }
+
             let obs = Observation {
                 at: self.local_minute(),
                 phase: if self.staged.is_some() {
@@ -255,6 +273,21 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Is a human driving? One log line when it appears and one when it goes, because
+    /// this is looked at every quarter of an hour and neither state is news twice.
+    fn holding(&mut self) -> bool {
+        let held = self.tree.hold().exists();
+        if held != self.held {
+            if held {
+                info!("auto-update: a hold file appeared; standing down until it is removed");
+            } else {
+                info!("auto-update: the hold file is gone; armed again");
+            }
+            self.held = held;
+        }
+        held
     }
 
     /// The local time, to the minute, from one clock read.
