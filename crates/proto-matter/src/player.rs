@@ -7,7 +7,7 @@
 //! in [`crate::node`] are a thin shell over this, and the tests drive it directly.
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use castaway_core::PlaybackProgress;
 
@@ -145,6 +145,16 @@ impl PlayerSnapshot {
     ///   last projection stands rather than snapping back to zero.
     /// - A report → both fields are taken as given, including a `duration` of [`None`]:
     ///   a live stream genuinely has no end, and that is a statement, not a gap.
+    ///
+    /// A report also *ends the buffering* (#310). `Buffering` is what a launch with
+    /// autoplay sets, and nothing used to take it off again — the projection moved only
+    /// on commands the client itself sent, so a phone that launched something and then
+    /// watched it play was told the panel was still fetching, for the whole item. The
+    /// pipeline reports a position only once it has produced a frame or an audio block,
+    /// so a report *is* the evidence that the fetch is behind us. It is one-directional:
+    /// nothing here demotes `Playing` back to `Buffering`, because the absence of a
+    /// report is not evidence of a stall — a session another protocol is pacing has none
+    /// either.
     #[must_use]
     pub fn with_progress(mut self, progress: Option<PlaybackProgress>) -> Self {
         if matches!(self.state, PlaybackState::NotPlaying) {
@@ -153,9 +163,43 @@ impl PlayerSnapshot {
         let Some(progress) = progress else {
             return self;
         };
+        if matches!(self.state, PlaybackState::Buffering) {
+            self.state = PlaybackState::Playing;
+        }
         self.position = progress.position;
         self.duration = progress.duration;
         self
+    }
+
+    /// What `MediaPlayback`'s `SampledPosition` says, sampled against the wall clock the
+    /// caller read (#310).
+    ///
+    /// The attribute is a *pair* — a position and the instant it was true — because a
+    /// client is expected to extrapolate: it reads this once and advances the scrubber
+    /// itself, correcting on the next read. That makes `UpdatedAt` load-bearing in a way
+    /// a timestamp usually is not. Two consequences, and both are why this returns an
+    /// [`Option`] rather than always producing a struct:
+    ///
+    /// - **A clock before the Matter epoch is no clock.** The panel is a box that can
+    ///   boot with an unset RTC, and `UpdatedAt` is epoch-µs from 2000-01-01. A
+    ///   fabricated zero would tell a client the reading is twenty-six years stale, and
+    ///   an extrapolating client would draw a position hours past the end. `Null` is the
+    ///   spec's word for "not available" and it is the honest one here.
+    /// - **Nothing loaded is nothing to sample.** With no media there is no position for
+    ///   a timestamp to be about.
+    ///
+    /// Pure over `now`, so the tests pin both edges without a clock (#208): the caller —
+    /// the cluster handler, which is the boundary — reads [`SystemTime::now`] once per
+    /// attribute read and passes it in.
+    #[must_use]
+    pub fn sampled_position(&self, now: SystemTime) -> Option<SampledPosition> {
+        if matches!(self.state, PlaybackState::NotPlaying) {
+            return None;
+        }
+        Some(SampledPosition {
+            updated_at: matter_epoch_micros(now)?,
+            position_ms: u64::try_from(self.position.as_millis()).ok()?,
+        })
     }
 
     /// Validate an absolute seek against what is known about the media's end.
@@ -188,6 +232,41 @@ impl PlayerSnapshot {
     pub fn skip_backward_target(&self, by: Duration) -> Duration {
         self.position.saturating_sub(by)
     }
+}
+
+/// `MediaPlayback`'s `PlaybackPositionStruct`: where playback was, and when that was
+/// true (#310).
+///
+/// Both halves in one type because neither means anything alone — a position with no
+/// timestamp is unextrapolatable, and a timestamp with no position says nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampledPosition {
+    /// When the position was read, in microseconds since the Matter epoch.
+    pub updated_at: u64,
+    /// Where playback had reached, in milliseconds. The cluster's own unit.
+    pub position_ms: u64,
+}
+
+/// The Matter epoch — 2000-01-01T00:00:00 UTC — as seconds since the Unix epoch.
+///
+/// Matter dates every `epoch-us` and `epoch-s` from here rather than from 1970, which
+/// buys the format thirty years of range at the top end.
+const MATTER_EPOCH_UNIX_SECS: u64 = 946_684_800;
+
+/// A wall-clock reading as Matter epoch-microseconds, or [`None`] if it is not a time
+/// this epoch can express.
+///
+/// [`None`] covers the case that actually happens: a box whose clock has not been set,
+/// which reads somewhere in 1970 and is *before* the epoch. Every other failure here —
+/// a clock before 1970, a clock so far in the future that microseconds overflow `u64`
+/// (year 586524) — lands in the same answer, which is right: all of them mean this
+/// reading cannot be believed.
+#[must_use]
+pub fn matter_epoch_micros(now: SystemTime) -> Option<u64> {
+    let unix = now.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    let secs = unix.as_secs().checked_sub(MATTER_EPOCH_UNIX_SECS)?;
+    secs.checked_mul(1_000_000)?
+        .checked_add(u64::from(unix.subsec_micros()))
 }
 
 /// Why an absolute seek cannot be honoured.
@@ -741,6 +820,108 @@ mod tests {
         // No report keeps the last projection rather than snapping back to zero.
         let held = live.clone().with_progress(None);
         assert_eq!(held, live);
+    }
+
+    /// The pipeline producing is what ends the buffering (#310).
+    #[test]
+    fn a_progress_report_takes_the_projection_out_of_buffering() {
+        // What an autoplay launch sets, and what nothing used to take off again: the
+        // phone that launched the item watched it play while being told it was fetching.
+        let launched = PlayerSnapshot {
+            state: PlaybackState::Buffering,
+            ..PlayerSnapshot::default()
+        };
+        let started = launched
+            .clone()
+            .with_progress(Some(castaway_core::PlaybackProgress::at(
+                Duration::from_secs(2),
+            )));
+        assert_eq!(started.state, PlaybackState::Playing);
+
+        // No report is not evidence of a stall — a session another protocol is pacing has
+        // none either — so the launch that has genuinely not started stays `Buffering`.
+        assert_eq!(
+            launched.clone().with_progress(None).state,
+            PlaybackState::Buffering
+        );
+
+        // And it only goes that one way. A paused item still reports a position; being
+        // told where it is paused must not restart it.
+        let paused = PlayerSnapshot {
+            state: PlaybackState::Paused,
+            ..PlayerSnapshot::default()
+        };
+        assert_eq!(
+            paused
+                .with_progress(Some(castaway_core::PlaybackProgress::at(
+                    Duration::from_secs(2)
+                )))
+                .state,
+            PlaybackState::Paused
+        );
+    }
+
+    /// `SampledPosition` is a position *and* the instant it was true, because the client
+    /// extrapolates between reads (#310).
+    #[test]
+    fn a_sample_carries_the_position_and_the_moment_it_was_read() {
+        let playing = PlayerSnapshot {
+            state: PlaybackState::Playing,
+            position: Duration::from_millis(90_500),
+            ..PlayerSnapshot::default()
+        };
+        // 2026-08-13T00:00:00Z, which is 1_786_060_800 Unix seconds.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_060_800);
+        let sample = playing
+            .sampled_position(now)
+            .expect("a running item samples");
+        assert_eq!(sample.position_ms, 90_500);
+        assert_eq!(
+            sample.updated_at,
+            (1_786_060_800 - 946_684_800) * 1_000_000,
+            "UpdatedAt is microseconds from the *Matter* epoch, not the Unix one"
+        );
+    }
+
+    /// A box whose clock has not been set has no `UpdatedAt` to give, and `Null` beats a
+    /// fabricated one: a client extrapolating from a 2000-01-01 reading draws a position
+    /// twenty-six years past the end.
+    #[test]
+    fn an_unset_clock_produces_no_sample_rather_than_a_fictional_one() {
+        let playing = PlayerSnapshot {
+            state: PlaybackState::Playing,
+            position: Duration::from_secs(5),
+            ..PlayerSnapshot::default()
+        };
+        assert_eq!(playing.sampled_position(SystemTime::UNIX_EPOCH), None);
+        // The epoch itself is expressible; the second before it is not.
+        let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800);
+        assert_eq!(
+            playing.sampled_position(epoch).map(|s| s.updated_at),
+            Some(0)
+        );
+        assert_eq!(
+            playing.sampled_position(epoch - Duration::from_secs(1)),
+            None
+        );
+    }
+
+    /// Nothing loaded is nothing to sample: there is no position for a timestamp to be
+    /// about, and the attribute is nullable for exactly this.
+    #[test]
+    fn nothing_playing_has_no_sampled_position() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_060_800);
+        assert_eq!(PlayerSnapshot::default().sampled_position(now), None);
+        // Paused is *not* that case — the position is real and a client redraws from it.
+        let paused = PlayerSnapshot {
+            state: PlaybackState::Paused,
+            position: Duration::from_secs(12),
+            ..PlayerSnapshot::default()
+        };
+        assert_eq!(
+            paused.sampled_position(now).map(|s| s.position_ms),
+            Some(12_000)
+        );
     }
 
     /// A report while nothing is loaded is someone else's session and must not be adopted.

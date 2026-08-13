@@ -343,18 +343,20 @@ impl MediaPlaybackHandler {
 
 impl media_playback::ClusterHandler for MediaPlaybackHandler {
     // Beyond the feature map, the attribute and command lists are trimmed to what the
-    // panel actually serves: the mandatory `CurrentState`, plus `Duration` and the seek
-    // range — the shape of the media's end, which is what #283 put in the projection.
-    // `SampledPosition` and `PlaybackSpeed` are *not* advertised: nothing here implements
-    // them yet, and a list is a promise a client plans reads against. Likewise the track
-    // commands stay off the accepted-command list — the track features are not advertised
-    // and a command the metadata does not carry is refused by the interaction model
-    // itself, which is a truer answer than a handler's `CommandNotFound`.
+    // panel actually serves: the mandatory `CurrentState`, plus `Duration`, the seek
+    // range — the shape of the media's end, which is what #283 put in the projection —
+    // and `SampledPosition`, which AdvancedSeek makes mandatory and #310 implemented
+    // against a real clock. `PlaybackSpeed` is still *not* advertised: nothing here
+    // implements it, and a list is a promise a client plans reads against. Likewise the
+    // track commands stay off the accepted-command list — the track features are not
+    // advertised and a command the metadata does not carry is refused by the interaction
+    // model itself, which is a truer answer than a handler's `CommandNotFound`.
     const CLUSTER: Cluster<'static> = media_playback::FULL_CLUSTER
         .with_features(MEDIA_PLAYBACK_FEATURES)
         .with_attrs(rs_matter::with!(
             required;
             media_playback::AttributeId::Duration
+                | media_playback::AttributeId::SampledPosition
                 | media_playback::AttributeId::SeekRangeStart
                 | media_playback::AttributeId::SeekRangeEnd
         ))
@@ -431,6 +433,35 @@ impl media_playback::ClusterHandler for MediaPlaybackHandler {
             .map_or_else(rs_matter::tlv::Nullable::none, |d| {
                 rs_matter::tlv::Nullable::some(millis(d))
             }))
+    }
+
+    fn sampled_position<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: rs_matter::tlv::NullableBuilder<
+            P,
+            media_playback::PlaybackPositionStructBuilder<P>,
+        >,
+    ) -> Result<P, Error> {
+        // The clock is read *here*, at the boundary, and passed into the projection
+        // (#208/#310) — the pair has to be a position and the instant that position was
+        // true, because the client extrapolates from it between reads.
+        //
+        // `Null` where the projection cannot honestly produce one: nothing loaded, or a
+        // box whose clock has not been set. See `PlayerSnapshot::sampled_position` for
+        // why a fabricated `UpdatedAt` is worse than absence.
+        match self
+            .ctx
+            .refreshed()
+            .sampled_position(std::time::SystemTime::now())
+        {
+            Some(sample) => builder
+                .non_null()?
+                .updated_at(sample.updated_at)?
+                .position(rs_matter::tlv::Nullable::some(sample.position_ms))?
+                .end(),
+            None => builder.null(),
+        }
     }
 
     fn handle_play<P: TLVBuilderParent>(

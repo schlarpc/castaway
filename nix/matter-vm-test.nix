@@ -404,6 +404,23 @@ pkgs.testers.runNixOSTest {
             in peer_log
         ), peer_log
 
+        # `SampledPosition`, which AdvancedSeek makes mandatory and which #310
+        # implemented: the item is loaded, so this is *not* Null, and the timestamp is a
+        # real clock reading rather than the fabricated zero the issue warns about — a
+        # client extrapolates the scrubber from it, so a zero would draw a position
+        # twenty-six years past the end.
+        sample = one(
+            r"playback sampled_position position_ms=Some\((\d+)\) updated_at_us=(\d+)",
+            peer_log,
+        )
+        print(sample.group(0))
+        # Nothing has played (the null pipeline reports no progress), so the position is
+        # where the launch put it.
+        assert sample.group(1) == "0", sample.group(1)
+        # Matter epoch-µs, so 2025-01-01 is 25 years in: anything below that is either a
+        # box with no clock or a fabricated stamp, and both must read Null instead.
+        assert int(sample.group(2)) > 788_000_000_000_000, sample.group(2)
+
         # The two skips are the relative verbs #283 made real: each resolves against the
         # projection into an absolute seek, and the two compose — 15 s forward then 5 s
         # back lands at 10 s. The resolved targets are read out of the *panel's* journal,
@@ -444,6 +461,18 @@ pkgs.testers.runNixOSTest {
         # panel accepted and then denied having accepted is what a paused phone showing
         # "playing" looks like.
         assert states == ["Playing", "Paused", "NotPlaying", "NotPlaying"], states
+
+        # And `SampledPosition` follows the state through the same sequence (#310):
+        # something loaded samples, and a stop leaves nothing for a timestamp to be about,
+        # so it goes Null rather than reporting a stale position for media that is gone.
+        samples = re.findall(
+            r"media_playback sampled_position (None|position_ms=\S+ updated_at_us=\d+)",
+            peer_log,
+        )
+        print(samples)
+        assert len(samples) == 4, samples
+        assert samples[0] != "None" and samples[1] != "None", samples
+        assert samples[2] == "None" and samples[3] == "None", samples
 
     with subtest("a remote's keys drive the transport, and the rest are refused (#274)"):
         # Both new clusters are in the descriptor a client walks — on the player, and

@@ -801,6 +801,13 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
             range_end.into_option(),
         );
 
+        // The other half of the seek surface, and what AdvancedSeek makes mandatory
+        // (#310): where playback is, and when that was true.
+        println!(
+            "matter-peer: playback sampled_position {}",
+            read_sampled_position(matter, crypto, fab_idx, player).await?
+        );
+
         // Two skips whose targets compose (15 s forward, then 5 s back → 10 s): what the
         // panel forwards to its pipeline is the resolved absolute seek, and the VM reads
         // both numbers out of the panel's own journal.
@@ -923,6 +930,15 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
             .current_state_read(PLAYER_ENDPOINT)
             .await?;
         println!("matter-peer: media_playback current_state={state:?}");
+
+        // And what the position pair says at the same moment. The `stop` in this sequence
+        // is what makes the `Null` case reachable from a client: nothing loaded is nothing
+        // to sample, and an attribute that kept reporting a stale position through a stop
+        // would have a phone drawing a scrubber for media that is gone (#310).
+        println!(
+            "matter-peer: media_playback sampled_position {}",
+            read_sampled_position(matter, crypto, fab_idx, player).await?
+        );
     }
 
     // Keys after the transport sequence — its `stop` is what makes a transport key with
@@ -1146,6 +1162,40 @@ async fn send_keys<C: rs_matter::crypto::Crypto>(
         handle.complete().await?;
     }
     Ok(())
+}
+
+/// Read `MediaPlayback::SampledPosition` and print the pair a client would extrapolate
+/// from (#310).
+///
+/// Read through the interaction model like everything else here, because the question the
+/// attribute answers is a client's: `Null` when the panel has nothing to report, and
+/// otherwise a position *and* a `UpdatedAt` in Matter epoch-µs that has to be a real
+/// clock reading — a fabricated zero would have a client draw a position twenty-six years
+/// extrapolated.
+async fn read_sampled_position<C: rs_matter::crypto::Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    fab_idx: core::num::NonZeroU8,
+    player: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use rs_matter::dm::clusters::decl::media_playback::MediaPlaybackClient as _;
+
+    let line = Exchange::initiate(matter, crypto, fab_idx, player)
+        .await?
+        .media_playback()
+        .sampled_position_read_with(PLAYER_ENDPOINT, |sample| {
+            let sample = sample?;
+            Ok::<_, rs_matter::error::Error>(match sample.into_option() {
+                None => "None".to_owned(),
+                Some(position) => format!(
+                    "position_ms={:?} updated_at_us={}",
+                    position.position()?.into_option(),
+                    position.updated_at()?
+                ),
+            })
+        })
+        .await??;
+    Ok(line)
 }
 
 /// Invoke `ApplicationLauncher::LaunchApp` for an app in catalog 0 and print the status.
