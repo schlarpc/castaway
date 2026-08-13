@@ -44,7 +44,14 @@ let
     pname = "castaway";
     # No `--features`: the default set *is* this list now (D55). Naming it here as well
     # would be two lists that have to agree, which is the drift this change exists to end.
-    cargoExtraArgs = "--package castaway";
+    #
+    # `castaway-browser-fd` is named as a second *package* rather than picked up as a
+    # dependency, and that is the whole of #308: cargo emits a package's `cdylib` only
+    # when the package is a build target, so `--package castaway` alone built the rlib
+    # half (which the spawner uses for the soname constant) and no `.so` at all. Crane
+    # then installed exactly what was built, and every nix-built deploy ran the
+    # `pidfd_getfd` fallback — logging so, and nobody reading it.
+    cargoExtraArgs = "--package castaway --package castaway-browser-fd";
 
     nativeBuildInputs = [
       pkgs.pkg-config
@@ -126,10 +133,23 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
   # The receiver locates Electron, the host app, and the CDM through these env vars, so
   # the wrapper has to be what runs — an unwrapped start would come up browser-less.
   postInstall = ''
+    # The fd addon the host app dlopens to hand frame descriptors back over the control
+    # socket (#271). Crane installs cdylibs into $out/lib, so this is a check that the
+    # build really produced one rather than a step that makes it appear: without it the
+    # receiver degrades to `pidfd_getfd` *silently enough* — one debug line — that this
+    # went unnoticed through a whole release (#308). A rename or a dropped `--package`
+    # fails the build here instead.
+    addon=$out/lib/libcastaway_browser_fd.so
+    test -f "$addon" || {
+      echo "the fd addon is not in this build: $addon missing (see #308)" >&2
+      exit 1
+    }
+
     wrapProgram $out/bin/castaway \
       --set-default CASTAWAY_ELECTRON ${electron}/bin/electron \
       --set-default CASTAWAY_BROWSER_APP $out/share/castaway/browser-host \
       --set-default CASTAWAY_WIDEVINE_CDM ${widevineCdm} \
+      --set-default CASTAWAY_BROWSER_FD_ADDON "$addon" \
       --prefix LD_LIBRARY_PATH : "${runtimeLibs}"
 
     # The browser host app travels with the binary. It is ours and dependency-free, so

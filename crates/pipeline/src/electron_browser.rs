@@ -180,10 +180,12 @@ use tracing::{debug, error, info, trace, warn};
 /// Where the fd addon (`castaway-browser-fd`'s cdylib, #271) is, if anywhere.
 ///
 /// The env override first — the Nix wrapper and the tests both know exactly where they
-/// put it — then beside the binary and up to two directories above it, which covers the
-/// production layout (the addon installed next to `castaway`) and a cargo build
-/// (`target/debug/deps/<test>` with the cdylib at `target/debug/`). `None` is not an
-/// error: the spawner logs it and the reach-in path carries the session.
+/// put it — then beside the binary and up to two directories above it, and each of those
+/// directories' `lib/`. That covers a cargo build (`target/debug/deps/<test>` with the
+/// cdylib at `target/debug/`), an addon installed next to `castaway`, and the Unix
+/// install layout crane produces, where the binary is `<prefix>/bin/castaway` and its
+/// cdylib `<prefix>/lib/` (#308). `None` is not an error: the spawner logs it and the
+/// reach-in path carries the session.
 #[cfg(unix)]
 fn locate_fd_addon() -> Option<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("CASTAWAY_BROWSER_FD_ADDON") {
@@ -193,7 +195,12 @@ fn locate_fd_addon() -> Option<std::path::PathBuf> {
     exe.ancestors()
         .skip(1)
         .take(3)
-        .map(|dir| dir.join(castaway_browser_fd::ADDON_SONAME))
+        .flat_map(|dir| {
+            [
+                dir.join(castaway_browser_fd::ADDON_SONAME),
+                dir.join("lib").join(castaway_browser_fd::ADDON_SONAME),
+            ]
+        })
         .find(|path| path.exists())
 }
 
