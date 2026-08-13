@@ -1088,6 +1088,49 @@ fn assert_the_marker_blocks_line_up(state: &Published, sound: &Sound, at_least: 
 /// How long the panel is quiet before the tone, in the two placement tests.
 const QUIET: Duration = Duration::from_millis(250);
 
+/// How far from where it was played the tone may land and still be that sound.
+///
+/// Wide enough for the segment cut and the codec's frame grid — the onset is a first
+/// crossing inside a 1024-sample AAC frame — and an order of magnitude below the shifts
+/// the defect this test caught produced (74/109/207 ms, from a "session" driven inside
+/// the render loop).
+const PLACEMENT_SLACK: f64 = 0.06;
+
+/// Whether the silence the mixer invented can account for the tone landing where it did
+/// — the discriminator between "this box could not measure placement" and "the stream
+/// mislaid sound" (#314).
+///
+/// `miss` is seconds late (negative: early), `invented_s` the fill the mixer counted. The
+/// fill goes into the track ahead of the tone, so it can only push the onset *late*, and
+/// only by as much as it lasted. Anything earlier than it was played, or later than the
+/// fill accounts for, is the stream's.
+fn invented_silence_explains(miss: f64, invented_s: f64) -> bool {
+    miss > 0.0 && miss - invented_s < PLACEMENT_SLACK
+}
+
+#[test]
+fn the_placement_premise_excuses_only_what_the_fill_accounts_for() {
+    // No GPU and no encoder needed: the arithmetic the two placement tests choose their
+    // failure message with, checked where it runs in every build (#314).
+    let sandbox = 4096.0 / f64::from(RATE); // the 85 ms of fill the sighting recorded
+    assert!(
+        invented_silence_explains(0.085, sandbox),
+        "an 85 ms late onset with 85 ms of invented silence is the box"
+    );
+    assert!(
+        !invented_silence_explains(0.400, sandbox),
+        "400 ms late is not 85 ms of fill, however loaded the box was"
+    );
+    assert!(
+        !invented_silence_explains(-0.100, sandbox),
+        "invented silence cannot pull a tone earlier than it was played"
+    );
+    assert!(
+        !invented_silence_explains(0.200, 0.0),
+        "with no fill counted there is nothing to excuse"
+    );
+}
+
 /// Where the tone came back in the decoded track, or `None` where there is no GPU.
 fn tone_onset(scenario: Scenario) -> Option<f64> {
     let segments = 4;
@@ -1122,12 +1165,38 @@ fn tone_onset(scenario: Scenario) -> Option<f64> {
     // Four 200 ms segments minus the settle and the uncut tail leave the tone at least
     // 200 ms of track after its quarter second of silence.
     assert_the_marker_blocks_line_up(&state, &sound, 20);
-    assert!(
-        (at - QUIET.as_secs_f64()).abs() < 0.06,
-        "the tone starts {at:.3}s in; it was played at {:.3}s. {}",
-        QUIET.as_secs_f64(),
-        state.sound_diagnostics()
-    );
+    // The claim — and its premise, checked first when it is about to fail (#236, #314).
+    // Silence the mixer invented goes into the track *ahead* of the tone and pushes the
+    // onset late by its own length, so a box that descheduled the mixer thread produces
+    // this failure with the stream doing nothing wrong: one run under triple-suite
+    // contention showed `invented=4096`, `starved=0` — 85 ms of fill, an onset at 0.335 s
+    // — which `assert_the_source_kept_up` cannot see, because it bounds the *harness
+    // source's* schedule and this is the mixer thread's.
+    //
+    // Only the explained part is excused, and only in the one direction the mechanism
+    // works: the fill can push the tone late, never early, and never by more than it
+    // lasted. A mixer that mislays sound still fails here — the miss is then larger than
+    // the silence it counted, or in the wrong direction, and the panic below is what
+    // fires.
+    let miss = at - QUIET.as_secs_f64();
+    if miss.abs() >= PLACEMENT_SLACK {
+        let invented = state.audio.mix().invented();
+        let invented_s = invented as f64 / f64::from(RATE);
+        assert!(
+            !invented_silence_explains(miss, invented_s),
+            "the tone starts {at:.3}s in rather than {:.3}s, and the mixer counted \
+             {invented} frames ({invented_s:.3}s) of invented silence — enough to account \
+             for the miss, so this box could not measure placement; not a defect in the \
+             stream. {}",
+            QUIET.as_secs_f64(),
+            state.sound_diagnostics()
+        );
+        panic!(
+            "the tone starts {at:.3}s in; it was played at {:.3}s. {}",
+            QUIET.as_secs_f64(),
+            state.sound_diagnostics()
+        );
+    }
     Some(at)
 }
 
