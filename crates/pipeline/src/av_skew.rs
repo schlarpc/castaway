@@ -20,6 +20,10 @@
 //! the pictures" — because both clocks run at real time when everything is healthy and
 //! the difference moves only when one of them stalls or slews.
 //!
+//! The offset is re-measured for the first [`SETTLE`] rather than latched at the very
+//! first pairing (#318): that pairing lands while the page's audio pipeline is still
+//! filling, and the transient would otherwise be the session's zero for ever.
+//!
 //! What the number can no longer claim is the *absolute* lip-sync offset; that would need
 //! a common origin neither side can give. The docs on `Electron::av_skew_ms` say so.
 //!
@@ -51,6 +55,25 @@ const STALE: Duration = Duration::from_millis(250);
 /// by a few hundred milliseconds at the very most.
 const JUMP_MS: i64 = 1_000;
 
+/// How long a fresh baseline keeps being re-taken before it is believed (#318).
+///
+/// The first pairing of a session lands while the page's audio pipeline is still filling
+/// — the element has started, the worklet is a few blocks in, `currentTime` is not yet
+/// tracking the paints — and whatever offset exists at *that* instant used to become the
+/// baseline for the whole session. The live measurement read a steady ~93 ms rather than
+/// ~0 for exactly that reason: not drift, just the moment the stopwatch was started.
+///
+/// So the baseline is re-taken on every pairing for the first second and only then held.
+/// The cost is honest and worth naming: drift that happens *inside* the window is
+/// absorbed rather than reported, because nothing here can tell it apart from the
+/// startup transient it exists to discard. Drift is a property of a session that has been
+/// running, and a second is far shorter than the intervals a pacing loop cares about.
+///
+/// A discontinuity ([`JUMP_MS`]) restarts the window as well: a seek or a resume refills
+/// the same pipeline from scratch, so the pairing right after one is the same
+/// not-yet-tracking reading as the pairing at session start.
+const SETTLE: Duration = Duration::from_secs(1);
+
 /// The newest audio clock reading, and when it was taken.
 #[derive(Debug, Clone, Copy)]
 struct Mark {
@@ -69,12 +92,31 @@ struct Mark {
 #[derive(Debug, Default)]
 pub struct SkewGauge {
     audio: Option<Mark>,
-    /// The offset at the first pairing (or the first after a discontinuity): the
-    /// difference of the two origins, which is the part of the subtraction that means
-    /// nothing and is therefore removed.
-    baseline_ms: Option<i64>,
+    /// What the reported drift is measured against — `None` until the first pairing.
+    baseline: Option<Baseline>,
     /// The offset at the previous pairing, for the discontinuity check.
     last_offset_ms: Option<i64>,
+}
+
+/// The offset the two origins differ by, which is the part of the subtraction that means
+/// nothing and is therefore removed — and the instant it stops being re-taken.
+#[derive(Debug, Clone, Copy)]
+struct Baseline {
+    /// The offset this baseline was last taken at.
+    offset_ms: i64,
+    /// When [`SETTLE`] expires. Pairings before it re-take `offset_ms`; the first pairing
+    /// at or after it is the first one reported as drift.
+    settled_at: Instant,
+}
+
+impl Baseline {
+    /// A baseline taken now, with its settling window open.
+    fn taken(offset_ms: i64, now: Instant) -> Self {
+        Self {
+            offset_ms,
+            settled_at: now + SETTLE,
+        }
+    }
 }
 
 impl SkewGauge {
@@ -129,18 +171,25 @@ impl SkewGauge {
                 // drift could between consecutive pairings. Re-baseline and say nothing
                 // for this sample — reporting the jump itself would be the wild
                 // excursion the gauge exists to stop.
-                self.baseline_ms = Some(offset);
+                self.baseline = Some(Baseline::taken(offset, now));
                 self.last_offset_ms = Some(offset);
                 return None;
             }
         }
         self.last_offset_ms = Some(offset);
-        match self.baseline_ms {
-            Some(baseline) => Some(offset - baseline),
+        match &mut self.baseline {
+            // Still settling: this pairing replaces the baseline rather than being
+            // measured against it (#318). Zero, and honestly so — the gauge has not
+            // finished deciding where zero is.
+            Some(baseline) if now < baseline.settled_at => {
+                baseline.offset_ms = offset;
+                Some(0)
+            }
+            Some(baseline) => Some(offset - baseline.offset_ms),
             None => {
-                self.baseline_ms = Some(offset);
-                // Zero by construction, and honestly so: "drift since the first pairing"
-                // is zero at the first pairing.
+                self.baseline = Some(Baseline::taken(offset, now));
+                // Zero by construction, and honestly so: "drift since the session started
+                // measuring" is zero at the first pairing.
                 Some(0)
             }
         }
@@ -310,16 +359,90 @@ mod tests {
         let start = t0();
         gauge.audio(0, start);
         assert_eq!(gauge.video(0, start), Some(0));
+        // Out of the settling window with both clocks locked, so the walk below is
+        // measured against a baseline that is no longer moving under it.
+        let settled = start + SETTLE;
+        gauge.audio(1_000, settled);
+        assert_eq!(gauge.video(1_000, settled), Some(0));
         let mut skew = 0;
         for i in 1..=30u64 {
-            let now = start + Duration::from_millis(i * 200);
+            let now = settled + Duration::from_millis(i * 200);
             let step = i64::try_from(i).unwrap();
             // The audio clock runs at half rate: 100 ms behind per 200 ms step.
-            gauge.audio(step * 100, now);
+            gauge.audio(1_000 + step * 100, now);
             skew = gauge
-                .video(step * 200, now)
+                .video(1_000 + step * 200, now)
                 .expect("gradual drift must keep reporting");
         }
         assert_eq!(skew, 3_000, "thirty steps of 100 ms each");
+    }
+
+    #[test]
+    fn the_baseline_settles_instead_of_latching_the_startup_transient() {
+        // #318. The first pairing catches the page's audio pipeline mid-fill: here the
+        // media clock is 93 ms behind where it will sit once the element is really
+        // running, which is what the live session measured as a rock-steady 93 ms of
+        // "drift". Latched, every later reading carries that offset for ever; settled,
+        // the pairings inside the window replace it and a healthy session reads zero.
+        let mut gauge = SkewGauge::new();
+        let start = t0();
+        gauge.audio(-93, start);
+        assert_eq!(gauge.video(0, start), Some(0));
+        // Half a second in, the element is tracking: the offset is the one this session
+        // will actually run at, and it is inside the window, so it becomes the baseline.
+        let filling = start + Duration::from_millis(500);
+        gauge.audio(500, filling);
+        assert_eq!(gauge.video(500, filling), Some(0));
+        // Long after the window, both clocks at real time: zero, not the 93 ms the first
+        // pairing happened to see.
+        let later = start + Duration::from_secs(30);
+        gauge.audio(30_000, later);
+        assert_eq!(gauge.video(30_000, later), Some(0));
+    }
+
+    #[test]
+    fn the_window_shuts_and_real_drift_after_it_is_reported() {
+        // The other half of the settling window: it is a window, not a mode. The shipped
+        // SETTLE is asserted in virtual time (#208) rather than waited out — a pairing at
+        // the instant it expires is already measuring.
+        let mut gauge = SkewGauge::new();
+        let start = t0();
+        gauge.audio(0, start);
+        assert_eq!(gauge.video(0, start), Some(0));
+        let settled = start + SETTLE;
+        // 40 ms of genuine drift, at the first pairing the window no longer covers.
+        gauge.audio(1_000 - 40, settled);
+        assert_eq!(
+            gauge.video(1_000, settled),
+            Some(40),
+            "the window is half-open: the pairing that closes it is measured, not absorbed"
+        );
+    }
+
+    #[test]
+    fn a_seek_settles_again_rather_than_latching_the_first_pairing_after_it() {
+        // A seek refills the same pipeline the session start did, so the pairing right
+        // after one is the same not-yet-tracking reading — the window restarts with the
+        // baseline.
+        let mut gauge = SkewGauge::new();
+        let start = t0();
+        gauge.audio(0, start);
+        assert_eq!(gauge.video(0, start), Some(0));
+        // Seek forward a minute, well past the first settling window.
+        let seek = start + Duration::from_secs(10);
+        gauge.audio(70_000, seek);
+        assert_eq!(gauge.video(10_000, seek), None, "the seam says nothing");
+        // The refill: 60 ms out at the first pairing after the seek, tracking by the
+        // second one. Both are inside the new window, so neither is drift.
+        let refilling = seek + Duration::from_millis(100);
+        gauge.audio(70_100 - 60, refilling);
+        assert_eq!(gauge.video(10_100, refilling), Some(0));
+        let tracking = seek + Duration::from_millis(600);
+        gauge.audio(70_600, tracking);
+        assert_eq!(gauge.video(10_600, tracking), Some(0));
+        // And afterwards the session reads zero rather than the transient.
+        let later = seek + Duration::from_secs(30);
+        gauge.audio(100_000, later);
+        assert_eq!(gauge.video(40_000, later), Some(0));
     }
 }

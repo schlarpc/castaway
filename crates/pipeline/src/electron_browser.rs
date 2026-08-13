@@ -300,7 +300,8 @@ struct Health {
     /// Positive means the picture's clock has gained on the sound's. Named like AirPlay's
     /// `av_skew_ms` deliberately — but note it is *drift*, not the absolute offset: the
     /// paint timestamp and the media element's `currentTime` share no origin, so the
-    /// session-start offset is measured and subtracted (see [`crate::av_skew`]). The old
+    /// session-start offset is measured (over the gauge's settling window, #318) and
+    /// subtracted (see [`crate::av_skew`]). The old
     /// direct subtraction reported the difference of the two origins — `17455` holding
     /// constant for 90 s — which is a number about Chromium's clock bookkeeping, not
     /// about sync.
@@ -682,8 +683,9 @@ impl Electron {
     ///
     /// *Drift*, not the absolute lip-sync offset — the paint timestamp and the media
     /// element's `currentTime` share no origin, so the offset at the first pairing is
-    /// measured and subtracted (see [`crate::av_skew`]). Zero at the first pairing by
-    /// construction; a session whose clocks both run at real time stays there.
+    /// measured and subtracted (see [`crate::av_skew`]). Zero through the gauge's
+    /// settling window by construction, and a session whose clocks both run at real time
+    /// stays there.
     ///
     /// `None` until a page frame and a page audio block have both carried a media clock,
     /// which for a page with no media element is never — a clock page is not out of sync,
