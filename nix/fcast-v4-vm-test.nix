@@ -8,7 +8,9 @@
 # explicitly so a regression in any one of them fails CI. What is NOT in it and
 # why (measured on the bench, 2026-08-09): render-pipeline cases (progress
 # cadence, EOS autoplay, fetch failures — the null pipeline reports no position,
-# never finishes media, never fetches), FCompanion transfers (#249), embedded
+# never finishes media, never fetches; the two `*_url_resource_not_found_v4`
+# cases now have the right *answer* behind them since #341, and are still
+# unreachable here for that second reason), FCompanion transfers (#249), embedded
 # track selection and subtitles and images (capability gaps the introduction
 # states honestly), and playback speed (#250, refused over faked).
 { pkgs, self }:

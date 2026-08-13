@@ -956,10 +956,14 @@ impl Pipeline for RenderPipeline {
                 }
                 // The URL was unreachable, the server refused it, or it held nothing this
                 // build can decode. Named at `warn` because it is the whole explanation
-                // for a panel that accepted a cast and showed nothing.
+                // for a panel that accepted a cast and showed nothing — and *classified*,
+                // because which of those three it was is the difference between a sender
+                // showing "not found" and a sender telling somebody to go and debug the
+                // panel (#341).
                 Err(e) => {
-                    warn!(%uri, error = %e, "decode ended: playback failed");
-                    PlaybackEnd::Failed(e.to_string())
+                    let cause = failure_cause(&e);
+                    warn!(%uri, error = %e, ?cause, "decode ended: playback failed");
+                    PlaybackEnd::Failed(castaway_core::PlaybackFailure::new(cause, e.to_string()))
                 }
             };
 
@@ -1100,8 +1104,9 @@ impl Pipeline for RenderPipeline {
             });
             let failed: Option<crate::audio_session::SessionFailed> =
                 ends.map(|(report, ticket)| {
-                    Box::new(move |why: String| report.report(ticket, PlaybackEnd::Failed(why)))
-                        as crate::audio_session::SessionFailed
+                    Box::new(move |why: castaway_core::PlaybackFailure| {
+                        report.report(ticket, PlaybackEnd::Failed(why));
+                    }) as crate::audio_session::SessionFailed
                 });
             match source {
                 FrameSource::Encoded(rx) => {
@@ -1334,6 +1339,25 @@ impl Pipeline for RenderPipeline {
         self.tx.send(RenderCommand::RestPanel);
         info!("render pipeline: STOP");
         Ok(())
+    }
+}
+
+/// Which of the three things a sender can be told a decode failure was (#341).
+///
+/// The pipeline's errors are richer than any sender protocol's vocabulary, so this is
+/// where the collapse happens — once, deliberately, rather than in each adapter guessing
+/// from a string. The wildcard is the honest arm and not a default: a GPU that would not
+/// initialise, an encoder that refused, a browser with no CDM are all *this box's*
+/// problem, and "internal error" is the truthful thing to say about them.
+const fn failure_cause(e: &PipelineError) -> castaway_core::FailureCause {
+    use castaway_core::FailureCause;
+
+    match e {
+        PipelineError::Fetch(_) => FailureCause::Unobtainable,
+        // Got the bytes, cannot play them: no demuxer, no decoder, frames whose geometry
+        // this build cannot use.
+        PipelineError::Decode(_) | PipelineError::InvalidFrame(_) => FailureCause::Unplayable,
+        _ => FailureCause::Receiver,
     }
 }
 

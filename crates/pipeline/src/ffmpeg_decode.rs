@@ -58,8 +58,60 @@ fn ensure_init() {
     });
 }
 
+/// An ffmpeg error as one of ours — and, in doing so, the decision of whether the media
+/// could not be *got* or could not be *played* (#341).
+///
+/// Classified from the error itself rather than from the call site, which is the only
+/// thing that works: `avformat_open_input` both opens the resource and probes the
+/// container, so "open failed" spans both halves, and a reconnect that 404s mid-stream
+/// fails during the *decode* loop while still being an unobtainable resource.
 fn map_err(e: ffmpeg::Error) -> PipelineError {
-    PipelineError::Decode(e.to_string())
+    if is_unobtainable(&e) {
+        PipelineError::Fetch(e.to_string())
+    } else {
+        PipelineError::Decode(e.to_string())
+    }
+}
+
+/// Whether this error means the bytes never arrived.
+///
+/// The HTTP statuses libavformat names, plus a protocol nothing here speaks — an
+/// `fcomp://` URL in a build with no HTTP surface is a resource we cannot reach, not a
+/// format we cannot play — plus the transport-level refusals, which arrive as a bare
+/// errno. `std::io::ErrorKind` is used to read those rather than `libc` constants: it is
+/// the same classification, it is portable to the Windows build, and it needs no
+/// dependency this crate would otherwise not have.
+fn is_unobtainable(e: &ffmpeg::Error) -> bool {
+    use ffmpeg::Error;
+    use std::io::ErrorKind;
+
+    match e {
+        Error::HttpBadRequest
+        | Error::HttpUnauthorized
+        | Error::HttpForbidden
+        | Error::HttpNotFound
+        | Error::HttpOther4xx
+        | Error::HttpServerError
+        | Error::ProtocolNotFound => true,
+        // libavformat wraps the platform's own errno for everything under the protocol:
+        // a refused connect, an unroutable host, a name that does not resolve, the
+        // `rw_timeout` above expiring, a path that is not there.
+        Error::Other { errno } => matches!(
+            std::io::Error::from_raw_os_error(*errno).kind(),
+            ErrorKind::NotFound
+                | ErrorKind::PermissionDenied
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::NetworkDown
+                | ErrorKind::TimedOut
+        ),
+        // Everything else — invalid data, no demuxer, no decoder, a stream that is not
+        // there — is media we got and cannot play.
+        _ => false,
+    }
 }
 
 /// Decode the video stream at `uri`, invoking `on_frame` for each RGBA frame. Returns
@@ -1418,6 +1470,86 @@ mod tests {
 
     fn header(name: &str, value: &str) -> castaway_core::RequestHeader {
         castaway_core::RequestHeader::new(name, value).unwrap()
+    }
+
+    /// Which side of #341 each ffmpeg error lands on, asserted on the error values
+    /// libavformat actually returns rather than on the strings they render to.
+    ///
+    /// The mapping is what a sender is told, so getting it backwards is a receiver
+    /// blaming itself for a dead link — or, worse, blaming the link for a codec it does
+    /// not have.
+    #[test]
+    fn an_http_status_is_a_fetch_failure_and_bad_data_is_a_decode_one() {
+        use ffmpeg::Error;
+
+        for error in [
+            Error::HttpNotFound,
+            Error::HttpForbidden,
+            Error::HttpUnauthorized,
+            Error::HttpBadRequest,
+            Error::HttpOther4xx,
+            Error::HttpServerError,
+            // No protocol for the scheme is a resource we cannot reach, not a format we
+            // cannot play — an `fcomp://` URL in a build with no HTTP surface.
+            Error::ProtocolNotFound,
+        ] {
+            assert!(
+                matches!(map_err(error), PipelineError::Fetch(_)),
+                "{error:?} means the bytes never arrived"
+            );
+        }
+
+        for error in [
+            Error::InvalidData,
+            Error::DecoderNotFound,
+            Error::DemuxerNotFound,
+            Error::StreamNotFound,
+        ] {
+            assert!(
+                matches!(map_err(error), PipelineError::Decode(_)),
+                "{error:?} means we got it and cannot play it"
+            );
+        }
+    }
+
+    /// The transport-level refusals, which arrive as a bare errno rather than as one of
+    /// libavformat's named errors — a refused connect is the commonest way a cast fails
+    /// and it has no `Error::` variant of its own.
+    #[test]
+    fn a_refused_connection_is_a_fetch_failure() {
+        use std::io::ErrorKind;
+
+        // The platform's own number for a kind, found by asking it rather than by
+        // naming a constant: `io::Error::from(kind)` builds an error with *no* errno, and
+        // hard-coding 111 for ECONNREFUSED would make this a Linux test.
+        let errno_for = |kind: ErrorKind| {
+            (1..256)
+                .find(|&n| std::io::Error::from_raw_os_error(n).kind() == kind)
+                .unwrap_or_else(|| panic!("{kind:?} has no errno on this platform"))
+        };
+
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+        ] {
+            let errno = errno_for(kind);
+            let error = ffmpeg::Error::Other { errno };
+            assert!(
+                matches!(map_err(error), PipelineError::Fetch(_)),
+                "errno {errno} ({kind:?}) means the bytes never arrived"
+            );
+        }
+
+        // And an errno that is none of those stays a decode failure rather than being
+        // swept into "unreachable" by a wildcard.
+        let broken_pipe = errno_for(ErrorKind::BrokenPipe);
+        assert!(matches!(
+            map_err(ffmpeg::Error::Other { errno: broken_pipe }),
+            PipelineError::Decode(_)
+        ));
     }
 
     /// A fetch nobody described is exactly the fetch it was before #251: our two DLNA

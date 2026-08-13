@@ -39,7 +39,7 @@ pub use lossy::{DropCounter, LossySend, LossySender};
 pub use nowplaying::{Artwork, ImageFormat, NowPlaying, PlaybackState, QueueItem, RepeatMode};
 pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
 pub use pipeline::{HostedPage, Pipeline};
-pub use playback::{PlaybackEnd, PlaybackProgress, PlaybackReport};
+pub use playback::{FailureCause, PlaybackEnd, PlaybackFailure, PlaybackProgress, PlaybackReport};
 pub use ports::{MediaPorts, PortRange, PortRangeError};
 pub use session::{CastingHandle, RemoteHandle, SessionConfig, SessionManager};
 pub use source::SourceDescription;

@@ -186,7 +186,9 @@ mod tests {
     async fn the_end_of_the_item_is_handed_to_the_connection() {
         let (remote, mut actor_rx, _rx) = remote();
         remote
-            .media_ended(PlaybackEnd::Failed("connection refused".into()))
+            .media_ended(PlaybackEnd::Failed(
+                castaway_core::PlaybackFailure::unobtainable("connection refused"),
+            ))
             .await
             .unwrap();
         match actor_rx.try_recv() {

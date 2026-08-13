@@ -71,11 +71,93 @@ pub enum PlaybackEnd {
     /// The item played through to its end.
     Finished,
     /// The fetch or the decode failed, with whatever the pipeline could say about it.
-    ///
-    /// Carried as a string rather than a typed error because it crosses a crate boundary
-    /// in the direction dependencies do not flow: `pipeline` knows about ffmpeg and
-    /// `core` must not. Consumers surface it to a human, they do not match on it.
-    Failed(String),
+    Failed(PlaybackFailure),
+}
+
+/// Why the item did not play, in the vocabulary every protocol has to answer in (#341).
+///
+/// Three, because three is what the receivers' error vocabularies actually distinguish
+/// and no more: FCast has `ResourceNotFound`, `UnsupportedFormat` and `Internal`;
+/// AVTransport's `ERROR_OCCURRED` collapses all of them; Cast's `LOAD_FAILED` /
+/// `LOAD_CANCELLED` is its own axis. Reporting a URL we got a 404 from as an *internal
+/// receiver error* — which is what a single `Failed` variant forced — tells the sender to
+/// doubt the panel when the answer is that the sender's link is dead.
+///
+/// Not `#[non_exhaustive]`, deliberately: every adapter that maps this onto its own
+/// protocol's errors should stop compiling when a fourth cause appears, rather than
+/// silently folding it into whichever arm the wildcard reaches (ground rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCause {
+    /// The bytes could not be got at all: the host refused the connection, the server
+    /// answered 404 or 403, the file is not there. Nothing is wrong with the receiver
+    /// and nothing is wrong with the media — the *link* is wrong, and the sender is the
+    /// one that can fix it.
+    Unobtainable,
+    /// The bytes arrived and are not something this build can play: a container it
+    /// cannot demux, a codec it has no decoder for, a stream that decodes to nothing.
+    Unplayable,
+    /// The receiver's own fault: no output device, a lost GPU, an encoder that would not
+    /// open. The one case where "internal error" is the honest thing to tell a sender,
+    /// and the reason it must not be the answer to the other two.
+    Receiver,
+}
+
+/// Why playback failed, and what to tell a human about it.
+///
+/// The detail stays a string because it crosses a crate boundary in the direction
+/// dependencies do not flow — `pipeline` knows about ffmpeg and `core` must not — but the
+/// *cause* is typed, because that is the part adapters branch on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackFailure {
+    cause: FailureCause,
+    detail: String,
+}
+
+impl PlaybackFailure {
+    /// A failure with a stated cause.
+    #[must_use]
+    pub fn new(cause: FailureCause, detail: impl Into<String>) -> Self {
+        Self {
+            cause,
+            detail: detail.into(),
+        }
+    }
+
+    /// The bytes could not be got. See [`FailureCause::Unobtainable`].
+    #[must_use]
+    pub fn unobtainable(detail: impl Into<String>) -> Self {
+        Self::new(FailureCause::Unobtainable, detail)
+    }
+
+    /// The bytes arrived and could not be played. See [`FailureCause::Unplayable`].
+    #[must_use]
+    pub fn unplayable(detail: impl Into<String>) -> Self {
+        Self::new(FailureCause::Unplayable, detail)
+    }
+
+    /// The receiver could not hold up its end. See [`FailureCause::Receiver`].
+    #[must_use]
+    pub fn receiver(detail: impl Into<String>) -> Self {
+        Self::new(FailureCause::Receiver, detail)
+    }
+
+    /// Which of the three this was.
+    #[must_use]
+    pub const fn cause(&self) -> FailureCause {
+        self.cause
+    }
+
+    /// What the pipeline said, for a person.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for PlaybackFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
 }
 
 impl PlaybackEnd {
@@ -156,9 +238,13 @@ mod tests {
     #[test]
     fn only_a_failure_reads_as_one() {
         assert!(!PlaybackEnd::Finished.is_failure());
-        assert!(PlaybackEnd::Failed("connection refused".into()).is_failure());
-        assert!(PlaybackEnd::Failed("connection refused".into())
-            .to_string()
-            .contains("connection refused"));
+        assert!(
+            PlaybackEnd::Failed(PlaybackFailure::unobtainable("connection refused")).is_failure()
+        );
+        assert!(
+            PlaybackEnd::Failed(PlaybackFailure::unobtainable("connection refused"))
+                .to_string()
+                .contains("connection refused")
+        );
     }
 }

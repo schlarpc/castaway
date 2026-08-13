@@ -164,6 +164,29 @@ impl ResolvedItem {
     }
 }
 
+/// What to tell a sender its media failed of (#341).
+///
+/// FCast's vocabulary lines up with [`FailureCause`] almost word for word, which is why
+/// the split exists in `core` at all. Before it, every failure was `Internal` — so a
+/// receiver that fetched a sender's URL and got a 404 answered "something is wrong with
+/// the receiver", which is both false and the least useful thing it could say. FUTO's own
+/// driver has two cases (`cast_fake_image_url_resource_not_found_v4`,
+/// `cast_fake_video_url_resource_not_found_v4`) that assert the honest answer.
+///
+/// Exhaustive on purpose: a fourth cause must not fall into `Internal` by default (ground
+/// rule 1).
+const fn error_kind(cause: castaway_core::FailureCause) -> fcast_flatbuf::flat::ErrorKind {
+    use castaway_core::FailureCause;
+    use fcast_flatbuf::flat::ErrorKind;
+
+    match cause {
+        FailureCause::Unobtainable => ErrorKind::ResourceNotFound,
+        FailureCause::Unplayable => ErrorKind::UnsupportedFormat,
+        // The one case the old answer was right for.
+        FailureCause::Receiver => ErrorKind::Internal,
+    }
+}
+
 /// Turn what a sender sent into headers we will actually put on a fetch.
 ///
 /// Sorted by name, which the wire is not: v1-v3 carries them in a JSON object and
@@ -828,11 +851,11 @@ impl Player {
                     updates,
                 }
             }
-            PlaybackEnd::Failed(message) => {
+            PlaybackEnd::Failed(failure) => {
                 self.state = PlayState::Idle;
                 updates.push(ReceiverUpdate::Error {
-                    message: format!("playback failed: {message}"),
-                    kind: fcast_flatbuf::flat::ErrorKind::Internal,
+                    message: format!("playback failed: {failure}"),
+                    kind: error_kind(failure.cause()),
                 });
                 updates.push(ReceiverUpdate::Playback(self.snapshot(None)));
                 Applied {
@@ -1155,11 +1178,53 @@ mod tests {
     fn a_failed_item_reports_and_goes_idle() {
         let mut player = Player::new();
         player.load(play_url("http://h/gone.mp4")).unwrap();
-        let applied = player.media_ended(&PlaybackEnd::Failed("404".into()));
+        let applied = player.media_ended(&PlaybackEnd::Failed(
+            castaway_core::PlaybackFailure::unobtainable("404"),
+        ));
         assert!(applied.updates.iter().any(
             |u| matches!(u, ReceiverUpdate::Error { message, .. } if message.contains("404"))
         ));
         assert_eq!(player.snapshot(None).state, PlayState::Idle);
+    }
+
+    /// …and it says *which* failure, in FCast's own words (#341).
+    ///
+    /// A 404 on a URL the sender chose is `ResourceNotFound`, not `Internal`: the old
+    /// answer told the sender to doubt the receiver about a link only the sender can fix,
+    /// and FUTO's driver has two cases (`cast_fake_image_url_resource_not_found_v4`,
+    /// `cast_fake_video_url_resource_not_found_v4`) that assert exactly this.
+    #[test]
+    fn the_error_kind_says_whose_problem_it_was() {
+        use castaway_core::PlaybackFailure;
+        use fcast_flatbuf::flat::ErrorKind;
+
+        let kind_of = |failure: PlaybackFailure| {
+            let mut player = Player::new();
+            player.load(play_url("http://h/item.mp4")).unwrap();
+            player
+                .media_ended(&PlaybackEnd::Failed(failure))
+                .updates
+                .into_iter()
+                .find_map(|u| match u {
+                    ReceiverUpdate::Error { kind, .. } => Some(kind),
+                    _ => None,
+                })
+                .expect("a failed item must reach the sender as an error")
+        };
+
+        assert_eq!(
+            kind_of(PlaybackFailure::unobtainable("HTTP error 404 Not Found")),
+            ErrorKind::ResourceNotFound
+        );
+        assert_eq!(
+            kind_of(PlaybackFailure::unplayable("Invalid data found")),
+            ErrorKind::UnsupportedFormat
+        );
+        // The one case `Internal` was ever right for.
+        assert_eq!(
+            kind_of(PlaybackFailure::receiver("no audio output device")),
+            ErrorKind::Internal
+        );
     }
 
     /// `Play.volume` (v3) applies before the media starts, and out-of-range values

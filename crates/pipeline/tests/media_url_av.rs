@@ -864,4 +864,86 @@ async fn a_url_that_cannot_be_fetched_is_reported_as_a_failure() {
         matches!(end, PlaybackEnd::Failed(_)),
         "a refused connection is a failure, not a finish: {end:?}"
     );
+    // …and it says *whose* failure (#341). A host that refuses the connection is a link
+    // the sender gave us that does not work, not a fault in this box.
+    let PlaybackEnd::Failed(failure) = &end else {
+        unreachable!()
+    };
+    assert_eq!(
+        failure.cause(),
+        castaway_core::FailureCause::Unobtainable,
+        "a refused connection is unobtainable media: {failure}"
+    );
+}
+
+/// The two halves of #341, through a real fetch: a 404 is media we could not *get*, and
+/// bytes that are not media are media we could not *play*.
+///
+/// This is the case FUTO's own driver asserts (`cast_fake_video_url_resource_not_found_v4`)
+/// and the one the receiver used to answer `Internal` to — telling a sender to go and
+/// debug the panel over a URL only the sender can fix. It lives here rather than in the
+/// FCast VM because this is where a fetch actually happens: `checks.fcast-v4-vm` boots
+/// the portable build on purpose, and its null pipeline never opens a URL at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_server_answered_decides_whose_failure_it_was() {
+    use castaway_core::{FailureCause, MediaUri, Pipeline as _, PlaybackEnd};
+
+    // One connection, one canned answer, then gone. libavformat may probe and refetch, so
+    // the loop keeps answering until the client stops asking.
+    fn serve(response: &'static [u8]) -> u16 {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(response);
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    let cases = [
+        (
+            "a 404",
+            serve(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
+            FailureCause::Unobtainable,
+        ),
+        (
+            "200 with bytes that are not media",
+            serve(
+                b"HTTP/1.0 200 OK\r\nContent-Length: 11\r\nContent-Type: video/mp4\r\n\r\n\
+                  not a movie",
+            ),
+            FailureCause::Unplayable,
+        ),
+    ];
+
+    for (what, port, expected) in cases {
+        let (pipe, _render_rx) = pipeline::RenderPipeline::new(3);
+        let (ends_tx, mut ends_rx) = castaway_core::playback::end_channel();
+        pipe.set_playback_ends(ends_tx);
+
+        let uri = MediaUri::parse(&format!("http://127.0.0.1:{port}/item.mp4")).unwrap();
+        pipe.play(uri.into(), None).await.unwrap();
+
+        let end = tokio::time::timeout(Duration::from_secs(30), ends_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{what} was never reported"))
+            .expect("the end channel closed instead");
+        let PlaybackEnd::Failed(failure) = &end else {
+            panic!("{what} is a failure, not {end:?}");
+        };
+        assert_eq!(
+            failure.cause(),
+            expected,
+            "{what} should be {expected:?}, and libavformat said: {failure}"
+        );
+    }
 }

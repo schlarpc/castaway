@@ -1119,7 +1119,9 @@ mod tests {
         r.av_transport(&action("Play", &[])).unwrap();
         assert_eq!(r.state, TransportState::Playing);
 
-        r.media_ended(&PlaybackEnd::Failed("connection refused".into()));
+        r.media_ended(&PlaybackEnd::Failed(
+            castaway_core::PlaybackFailure::unobtainable("connection refused"),
+        ));
 
         let out = r.av_transport(&action("GetTransportInfo", &[])).unwrap();
         assert!(out

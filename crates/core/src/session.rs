@@ -1040,9 +1040,11 @@ mod tests {
         })
         .await;
 
-        ends.send(PlaybackEnd::Failed("connection refused".into()))
-            .await
-            .unwrap();
+        ends.send(PlaybackEnd::Failed(
+            crate::playback::PlaybackFailure::unobtainable("connection refused"),
+        ))
+        .await
+        .unwrap();
         eventually("the end reaching the control surface", || {
             (!remote.ends.lock().expect("poisoned").is_empty()).then_some(())
         })
@@ -1050,7 +1052,9 @@ mod tests {
 
         assert_eq!(
             &*remote.ends.lock().unwrap(),
-            &[PlaybackEnd::Failed("connection refused".into())],
+            &[PlaybackEnd::Failed(
+                crate::playback::PlaybackFailure::unobtainable("connection refused")
+            )],
             "the control point has to be able to stop saying PLAYING",
         );
         // …and the session ended with it, rather than leaving a card up over nothing.

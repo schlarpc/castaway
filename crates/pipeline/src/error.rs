@@ -22,6 +22,16 @@ pub enum PipelineError {
     #[error("decode error: {0}")]
     Decode(String),
 
+    /// The media could not be *got*: the connection was refused, the server answered
+    /// 404 or 403, the file is not there (#341).
+    ///
+    /// Split out of [`Self::Decode`] because it is the difference between "your link is
+    /// dead" and "this box cannot play that", and every sender protocol has separate
+    /// words for the two — a receiver that answers "internal error" to a 404 sends
+    /// somebody to debug the panel.
+    #[error("fetch error: {0}")]
+    Fetch(String),
+
     /// uBlock Origin's scriptlet modules could not be evaluated into resources.
     ///
     /// Distinct from "no scriptlets": an empty set looks identical to a working one from

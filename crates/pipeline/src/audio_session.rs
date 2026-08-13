@@ -60,7 +60,12 @@ pub fn spawn(
 /// (`RenderPipeline::end_report`) is private to that module and threading it through
 /// here would export it for one caller. Called at most once, and only for failures — a
 /// session that ends normally is already handled by the frame channel closing.
-pub type SessionFailed = Box<dyn FnOnce(String) + Send>;
+///
+/// It carries a [`castaway_core::PlaybackFailure`] rather than a message because the two
+/// ways a session here fails are not the same answer to a sender (#341): a codec we
+/// cannot decode is media this build cannot play, and a mix that will not take the
+/// samples is this box's own output failing.
+pub type SessionFailed = Box<dyn FnOnce(castaway_core::PlaybackFailure) + Send>;
 
 /// Drive one audio session to completion. Blocking; call it on its own thread.
 pub fn run(
@@ -84,7 +89,7 @@ pub fn run(
     let mut pending = Some(first);
     // Why the session could not play, if it could not. Set inside the sink closure and
     // reported after it, because the closure cannot consume the `FnOnce`.
-    let mut refused: Option<String> = None;
+    let mut refused: Option<castaway_core::PlaybackFailure> = None;
 
     let result = decode_audio_stream(
         codec,
@@ -123,10 +128,14 @@ pub fn run(
                 Err(e) => {
                     warn!(error = %e, rate = block.sample_rate, channels = block.channels,
                         "audio session: these samples cannot reach the mix");
-                    refused = Some(format!(
+                    // `Receiver`, not `Unplayable`: nothing is wrong with the media —
+                    // our own output could not take it, either because the mixer has no
+                    // conversion for that geometry or because the device went away
+                    // underneath it (#55).
+                    refused = Some(castaway_core::PlaybackFailure::receiver(format!(
                         "no conversion for {} Hz x {}: {e}",
                         block.sample_rate, block.channels
-                    ));
+                    )));
                     false
                 }
             }
@@ -142,7 +151,10 @@ pub fn run(
         warn!(error = %e, ?codec, "audio session ended with an error");
         crate::audio_decode::warn_undecodable(codec);
         if refused.is_none() {
-            refused = Some(format!("{codec:?} decode failed: {e}"));
+            // Media we got and cannot play — the codec we advertised and cannot decode.
+            refused = Some(castaway_core::PlaybackFailure::unplayable(format!(
+                "{codec:?} decode failed: {e}"
+            )));
         }
     }
     // Dropping the input is what leaves the mix; the mixer plays out whatever is still

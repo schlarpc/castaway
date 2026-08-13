@@ -1639,7 +1639,9 @@ mod tests {
         for (end, want) in [
             (castaway_core::PlaybackEnd::Finished, "FINISHED"),
             (
-                castaway_core::PlaybackEnd::Failed("connection refused".into()),
+                castaway_core::PlaybackEnd::Failed(castaway_core::PlaybackFailure::unobtainable(
+                    "connection refused",
+                )),
                 "ERROR",
             ),
         ] {

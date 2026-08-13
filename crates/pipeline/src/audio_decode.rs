@@ -1391,7 +1391,7 @@ pub(crate) mod tests {
         drop(tx);
 
         let mixer = crate::mixer::AudioMixer::new(std::sync::Arc::new(|| Box::new(RefusingOutput)));
-        let reported: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        let reported: std::sync::Arc<std::sync::Mutex<Option<castaway_core::PlaybackFailure>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = std::sync::Arc::clone(&reported);
         let started = std::time::Instant::now();
