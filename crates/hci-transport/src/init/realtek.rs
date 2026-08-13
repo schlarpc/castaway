@@ -10,7 +10,7 @@ use tracing::{debug, info};
 
 use crate::error::TransportError;
 use crate::firmware::FirmwareSet;
-use crate::init::{ControllerInit, UsbId};
+use crate::init::{ControllerInit, RequiredImage, UsbId};
 
 /// Read the ROM version, which selects which patch in the image applies.
 const READ_ROM_VERSION: OpCode = OpCode::new(0xFC6D);
@@ -131,11 +131,18 @@ impl ControllerInit for RealtekInit {
             .any(|(vendor, product)| *vendor == id.vendor && *product == id.product)
     }
 
-    fn required_images(&self, _id: UsbId) -> Vec<&'static str> {
+    fn required_images(&self, _id: UsbId) -> Vec<RequiredImage> {
         // The USB id does not say which blob: the chip does, and that answer needs an HCI
         // round trip we cannot do here. The BU is what every dongle in this list has
         // turned out to be so far, so it is what the probe checks for.
-        vec!["rtl_bt/rtl8761bu_fw.bin", "rtl_bt/rtl8761bu_config.bin"]
+        //
+        // The patch is the firmware; without it `init` has nothing to upload. The config
+        // blob is the board's tuning, and `init` logs and continues on controller
+        // defaults without one — the same split as Intel's `.sfi`/`.ddc` (#307).
+        vec![
+            RequiredImage::essential("rtl_bt/rtl8761bu_fw.bin"),
+            RequiredImage::optional("rtl_bt/rtl8761bu_config.bin"),
+        ]
     }
 
     async fn init(

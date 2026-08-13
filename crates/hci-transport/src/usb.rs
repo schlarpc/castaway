@@ -293,18 +293,33 @@ pub fn list() -> Result<Vec<(UsbId, DeviceInfo)>, TransportError> {
 
 /// Which of the enumerated controllers to open when the config names none.
 ///
-/// The first one a non-catch-all firmware loader claims — a part we can *drive* — and
-/// only then the first enumerated (#91). Enumeration order is bus topology, and bus
+/// The best one *this build can actually bring up* ([`init::Driveability`]), and among
+/// equals the first enumerated (#91, #307). Enumeration order is bus topology, and bus
 /// topology once decided that an unknown dongle beat the AX200 next to it: the unknown
 /// part "initialised" through the catch-all, answered `HCI_Reset` from whatever it boots
 /// into, and the radio sat inert with the driveable controller unopened.
 ///
-/// Pure over the id list, so the two-radio bench (architecture §11.3a-ii) is a fixture
-/// here rather than hardware: `list()` supplies the ids at runtime, tests fake them.
-fn preferred_index(ids: &[UsbId]) -> Option<usize> {
+/// The firmware set is an input because "a loader claims it" is not the same question as
+/// "this build can drive it": on a binary with no embedded Intel `.sfi`, preferring the
+/// AX200 over a ROM-based CSR8510 next to it fails init where the CSR8510 would have
+/// worked (#307). Which is also why the ROM allow-list ranks above an unknown dongle —
+/// a part we know needs nothing is a better bet than one nobody has written down.
+///
+/// Pure over the id list and the set, so the two-radio bench (architecture §11.3a-ii) is
+/// a fixture here rather than hardware: `list()` supplies the ids at runtime, tests fake
+/// them.
+fn preferred_index(ids: &[UsbId], firmware: &FirmwareSet) -> Option<usize> {
     ids.iter()
-        .position(|id| init::has_dedicated_loader(*id))
-        .or(if ids.is_empty() { None } else { Some(0) })
+        .enumerate()
+        // `max_by_key` keeps the *last* maximum, so the index is reversed to make the
+        // first enumerated win a tie — which is the documented fallback.
+        .max_by_key(|(index, id)| {
+            (
+                init::driveability(**id, firmware),
+                std::cmp::Reverse(*index),
+            )
+        })
+        .map(|(index, _)| index)
 }
 
 /// Whether a device advertises the Bluetooth HCI class triple.
@@ -325,27 +340,30 @@ fn is_bluetooth(info: &DeviceInfo) -> bool {
 }
 
 impl UsbTransport {
-    /// Open the preferred Bluetooth controller: one a firmware loader claims if any is
-    /// attached, else the first found.
+    /// Open the preferred Bluetooth controller: the one this build can best bring up, and
+    /// among equals the first found.
     ///
     /// Enumeration order used to be the whole policy, which mattered on any box with two
     /// radios (#91): an unknown dongle listed before an AX200 won, "initialised" through
-    /// the catch-all, and sat inert. `bluetooth.controller = "vendor:product"` still
+    /// the catch-all, and sat inert. `firmware` is what makes the preference true rather
+    /// than merely hopeful — a loader that claims a part is no use if the image it needs
+    /// is not in this build (#307). `bluetooth.controller = "vendor:product"` still
     /// overrides all of this by naming a device.
     ///
     /// # Errors
     /// [`TransportError::NoDevice`] if none is attached, or [`TransportError::Claim`] if
     /// the OS will not hand it over.
-    pub fn open_first() -> Result<Self, TransportError> {
+    pub fn open_first(firmware: &FirmwareSet) -> Result<Self, TransportError> {
         let devices = list()?;
         let ids: Vec<UsbId> = devices.iter().map(|(id, _)| *id).collect();
-        let index = preferred_index(&ids).ok_or(TransportError::NoDevice(None))?;
+        let index = preferred_index(&ids, firmware).ok_or(TransportError::NoDevice(None))?;
         if index != 0 {
             if let (Some(preferred), Some(first)) = (ids.get(index), ids.first()) {
                 info!(
                     %preferred,
                     skipped = %first,
-                    "preferring the controller a firmware loader claims over the first \
+                    rank = ?init::driveability(*preferred, firmware),
+                    "preferring the controller this build can bring up over the first \
                      enumerated"
                 );
             }
@@ -419,7 +437,7 @@ impl UsbTransport {
     ) -> Result<Self, TransportError> {
         let transport = match id {
             Some(id) => Self::open(id)?,
-            None => Self::open_first()?,
+            None => Self::open_first(firmware)?,
         };
         let loader = init::select(init::registry_for(policy), transport.id)?;
         debug!(loader = loader.name(), id = %transport.id, "initialising controller");
@@ -666,6 +684,7 @@ mod tests {
     /// itself cannot be faked (nusb owns enumeration), so the seam is the id list.
     mod preference {
         use super::super::preferred_index;
+        use crate::firmware::{Firmware, FirmwareSet};
         use crate::init::UsbId;
 
         /// The AX200 in the dev box: the Intel loader claims it.
@@ -677,33 +696,82 @@ mod tests {
         /// An MT7921-era MediaTek dongle: no loader, and not on the ROM allow-list.
         const UNKNOWN: UsbId = UsbId::new(0x0e8d, 0x0616);
 
+        /// A build carrying what both loaders cannot boot without. The bytes are never
+        /// read here — only [`FirmwareSet::has`] is asked — so they are empty.
+        fn shipped() -> FirmwareSet {
+            FirmwareSet::new()
+                .with("intel/ibt-20-1-3.sfi", Firmware::Embedded(&[]))
+                .with("rtl_bt/rtl8761bu_fw.bin", Firmware::Embedded(&[]))
+        }
+
         #[test]
         fn a_driveable_controller_beats_enumeration_order() {
-            // The defect the issue names: the unknown dongle enumerated first, won, and
-            // sat inert while the AX200 next to it went unopened.
-            assert_eq!(preferred_index(&[UNKNOWN, AX200]), Some(1));
-            assert_eq!(preferred_index(&[UNKNOWN, CSR8510, RTL8761BU]), Some(2));
+            // The defect #91 names: the unknown dongle enumerated first, won, and sat
+            // inert while the AX200 next to it went unopened.
+            let set = shipped();
+            assert_eq!(preferred_index(&[UNKNOWN, AX200], &set), Some(1));
+            assert_eq!(
+                preferred_index(&[UNKNOWN, CSR8510, RTL8761BU], &set),
+                Some(2)
+            );
         }
 
         #[test]
         fn among_driveable_controllers_enumeration_order_still_decides() {
             // Preference is not a ranking of vendors; the first part we can drive wins,
             // and `bluetooth.controller` is the override for anything finer.
-            assert_eq!(preferred_index(&[RTL8761BU, AX200]), Some(0));
-            assert_eq!(preferred_index(&[AX200, RTL8761BU]), Some(0));
+            let set = shipped();
+            assert_eq!(preferred_index(&[RTL8761BU, AX200], &set), Some(0));
+            assert_eq!(preferred_index(&[AX200, RTL8761BU], &set), Some(0));
         }
 
         #[test]
-        fn with_nothing_driveable_the_first_enumerated_is_the_fallback() {
-            // Exactly the old behaviour: a ROM-based part or an unknown dongle is still
-            // opened rather than refused — refusal is the config's job, not this one's.
-            assert_eq!(preferred_index(&[CSR8510]), Some(0));
-            assert_eq!(preferred_index(&[UNKNOWN, CSR8510]), Some(0));
+        fn a_loader_whose_image_is_not_in_this_build_wins_nothing() {
+            // #307, and the whole reason the set is an argument. With no embedded `.sfi`
+            // the AX200 is a part that will fail init, so the CSR8510 next to it — which
+            // needs nothing — is the better answer whichever order the bus lists them.
+            let empty = FirmwareSet::new();
+            assert_eq!(preferred_index(&[CSR8510, AX200], &empty), Some(0));
+            assert_eq!(preferred_index(&[AX200, CSR8510], &empty), Some(1));
+            // And with the image present the preference comes straight back.
+            assert_eq!(preferred_index(&[CSR8510, AX200], &shipped()), Some(1));
+        }
+
+        #[test]
+        fn a_missing_tuning_table_is_not_a_missing_firmware() {
+            // `shipped()` has no `.ddc` and no Realtek `_config.bin`; both loaders log and
+            // carry on without them, so neither part is demoted.
+            let set = shipped();
+            assert_eq!(preferred_index(&[CSR8510, AX200], &set), Some(1));
+            assert_eq!(preferred_index(&[CSR8510, RTL8761BU], &set), Some(1));
+        }
+
+        #[test]
+        fn a_rom_based_part_outranks_an_unknown_dongle() {
+            // The secondary refinement in #307: with nothing driveable attached, a part
+            // the ROM allow-list names is a better bet than one nobody has written down,
+            // and enumeration order used to be all that separated them.
+            let set = shipped();
+            assert_eq!(preferred_index(&[UNKNOWN, CSR8510], &set), Some(1));
+            assert_eq!(preferred_index(&[CSR8510, UNKNOWN], &set), Some(0));
+        }
+
+        #[test]
+        fn with_nothing_recognised_the_first_enumerated_is_the_fallback() {
+            // Exactly the old behaviour: an unknown dongle is still opened rather than
+            // refused — refusal is the config's job (`UnknownControllerPolicy`), not
+            // this one's.
+            let set = shipped();
+            assert_eq!(preferred_index(&[CSR8510], &set), Some(0));
+            assert_eq!(
+                preferred_index(&[UNKNOWN, UsbId::new(0x0e8d, 0x0608)], &set),
+                Some(0)
+            );
         }
 
         #[test]
         fn no_devices_is_no_answer_not_index_zero() {
-            assert_eq!(preferred_index(&[]), None);
+            assert_eq!(preferred_index(&[], &shipped()), None);
         }
     }
 

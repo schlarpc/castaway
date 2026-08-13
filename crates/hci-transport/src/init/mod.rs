@@ -49,6 +49,54 @@ impl fmt::Display for UsbId {
     }
 }
 
+/// Whether a loader can bring a part up without a given image.
+///
+/// The distinction is not cosmetic: it is the difference between a controller this build
+/// can drive and one it will fail on, and [`driveability`] is where that decides which
+/// radio gets opened on a box with two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Necessity {
+    /// No image, no radio. Both vendors' upload paths return
+    /// [`TransportError::Firmware`] without it, leaving the part in bootloader mode.
+    Essential,
+    /// The part comes up without it, differently tuned. Intel's DDC is the per-board
+    /// antenna table and Realtek's `_config.bin` its equivalent; both loaders log and
+    /// continue on controller defaults, so a build without them is worse, not broken.
+    Optional,
+}
+
+/// A firmware image a controller's loader will ask for.
+///
+/// Named by the `linux-firmware` filename, which is the same key [`FirmwareSet`] uses, so
+/// a caller can ask whether this build has it without knowing anything about the vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequiredImage {
+    /// The image's name, e.g. `intel/ibt-20-1-3.sfi`.
+    pub name: &'static str,
+    /// Whether the upload can proceed without it.
+    pub necessity: Necessity,
+}
+
+impl RequiredImage {
+    /// An image the loader cannot proceed without.
+    #[must_use]
+    pub const fn essential(name: &'static str) -> Self {
+        Self {
+            name,
+            necessity: Necessity::Essential,
+        }
+    }
+
+    /// An image that tunes the part rather than booting it.
+    #[must_use]
+    pub const fn optional(name: &'static str) -> Self {
+        Self {
+            name,
+            necessity: Necessity::Optional,
+        }
+    }
+}
+
 /// Brings a cold controller to the point where `HCI_Reset` will work.
 #[async_trait::async_trait]
 pub trait ControllerInit: Send + Sync {
@@ -60,7 +108,11 @@ pub trait ControllerInit: Send + Sync {
 
     /// Which firmware images this controller will need, so a build missing one can say
     /// so before touching the radio rather than half-way through an upload.
-    fn required_images(&self, _id: UsbId) -> Vec<&'static str> {
+    ///
+    /// Each one carries whether the loader can proceed without it ([`Necessity`]), which
+    /// is what lets [`driveability`] tell "this build cannot bring this part up at all"
+    /// apart from "the antenna tuning table is missing and the radio will work anyway".
+    fn required_images(&self, _id: UsbId) -> Vec<RequiredImage> {
         Vec::new()
     }
 
@@ -123,10 +175,7 @@ impl ControllerInit for NoInit {
         _hci: &dyn HciTransport,
         _firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
-        if !ROM_BASED
-            .iter()
-            .any(|(vendor, product)| *vendor == id.vendor && *product == id.product)
-        {
+        if !is_rom_based(id) {
             // Loud, because the failure downstream is silent. If this part does need
             // firmware, everything from here looks fine — it enumerates, it answers
             // HCI_Reset — and no phone ever connects.
@@ -197,6 +246,64 @@ pub fn registry_for(policy: UnknownControllerPolicy) -> Vec<Box<dyn ControllerIn
 #[must_use]
 pub fn has_dedicated_loader(id: UsbId) -> bool {
     registry_strict().iter().any(|init| init.matches(id))
+}
+
+/// Whether a part is on the ROM allow-list: it needs no upload and that is a *known*
+/// fact about it, not an assumption made because nobody wrote a loader.
+#[must_use]
+pub fn is_rom_based(id: UsbId) -> bool {
+    ROM_BASED
+        .iter()
+        .any(|(vendor, product)| *vendor == id.vendor && *product == id.product)
+}
+
+/// How well *this build* can bring a controller up — the order [`crate::usb`] prefers
+/// when the config names no device (#91, #307).
+///
+/// Ordered worst to best, and the ordering is the point: `derive(PartialOrd, Ord)` on a
+/// fieldless enum ranks by declaration order, so adding a variant in the wrong place is a
+/// visible edit to this list rather than a silent change of policy somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Driveability {
+    /// No loader claims it and it is not on the ROM allow-list. It may work; nothing
+    /// here knows, and [`NoInit`] says so out loud when it takes one.
+    Unknown,
+    /// A loader claims it and this build does not have an image it cannot proceed
+    /// without — the case #307 is about. Preferring one of these over a ROM-based part
+    /// next to it fails init where the other would have worked, which is worse than
+    /// having no loader at all.
+    ClaimedWithoutFirmware,
+    /// Known to run from ROM ([`ROM_BASED`]): no upload, no images, nothing to be
+    /// missing. Not *driveable* — nothing here configures it — but it is the one
+    /// unclaimed case that is expected to work.
+    RomBased,
+    /// A loader claims it and every image it cannot proceed without is in this build.
+    Driveable,
+}
+
+/// How well this build can bring `id` up, given the images it carries.
+///
+/// Pure over the id and the set, so the two-radio bench (architecture §11.3a-ii) is a
+/// fixture rather than hardware.
+#[must_use]
+pub fn driveability(id: UsbId, firmware: &FirmwareSet) -> Driveability {
+    let Ok(loader) = select(registry_strict(), id) else {
+        return if is_rom_based(id) {
+            Driveability::RomBased
+        } else {
+            Driveability::Unknown
+        };
+    };
+    let missing = loader
+        .required_images(id)
+        .into_iter()
+        .filter(|image| image.necessity == Necessity::Essential)
+        .any(|image| !firmware.has(image.name));
+    if missing {
+        Driveability::ClaimedWithoutFirmware
+    } else {
+        Driveability::Driveable
+    }
 }
 
 /// Pick the initialiser for a controller.
@@ -300,14 +407,78 @@ mod tests {
             Err(e) => panic!("nothing claimed {id}: {e}"),
         };
         assert!(
-            images(AX200).iter().any(|n| n.ends_with(".sfi")),
-            "intel must declare its .sfi"
+            images(AX200)
+                .iter()
+                .any(|i| i.name.ends_with(".sfi") && i.necessity == Necessity::Essential),
+            "intel must declare its .sfi, and as the one it cannot boot without"
         );
         assert!(
-            images(RTL8761BU).iter().any(|n| n.contains("rtl")),
+            images(RTL8761BU)
+                .iter()
+                .any(|i| i.name.contains("rtl") && i.necessity == Necessity::Essential),
             "realtek must declare its firmware"
         );
         assert!(images(CSR8510).is_empty());
+    }
+
+    /// Every image both loaders cannot proceed without, and nothing else: a build that
+    /// carries the firmware but not the tuning tables.
+    fn firmware_without_tuning() -> FirmwareSet {
+        FirmwareSet::new()
+            .with(
+                "intel/ibt-20-1-3.sfi",
+                crate::firmware::Firmware::Embedded(&[]),
+            )
+            .with(
+                "rtl_bt/rtl8761bu_fw.bin",
+                crate::firmware::Firmware::Embedded(&[]),
+            )
+    }
+
+    #[test]
+    fn a_claimed_part_without_its_firmware_ranks_below_one_that_needs_none() {
+        // #307: `open_first` used to prefer any part a loader claimed. On a build with no
+        // embedded `.sfi` that means opening the AX200 and failing init, next to a
+        // CSR8510 that would have come up.
+        let empty = FirmwareSet::new();
+        assert_eq!(
+            driveability(AX200, &empty),
+            Driveability::ClaimedWithoutFirmware
+        );
+        assert!(driveability(CSR8510, &empty) > driveability(AX200, &empty));
+    }
+
+    #[test]
+    fn a_missing_tuning_table_does_not_demote_a_part_that_will_boot() {
+        // The other side of the same rule, and why `Necessity` exists: the DDC and the
+        // Realtek config are missing here, and both parts still come up.
+        let set = firmware_without_tuning();
+        assert_eq!(driveability(AX200, &set), Driveability::Driveable);
+        assert_eq!(driveability(RTL8761BU, &set), Driveability::Driveable);
+    }
+
+    #[test]
+    fn a_known_rom_part_outranks_a_dongle_nobody_has_written_down() {
+        // The secondary refinement in #307. Neither is driveable; one of them is at least
+        // *expected* to work, and enumeration order used to be all that separated them.
+        let set = firmware_without_tuning();
+        assert_eq!(driveability(CSR8510, &set), Driveability::RomBased);
+        assert_eq!(
+            driveability(UsbId::new(0x0e8d, 0x0616), &set),
+            Driveability::Unknown
+        );
+        assert!(driveability(CSR8510, &set) > driveability(UsbId::new(0x0e8d, 0x0616), &set));
+    }
+
+    #[test]
+    fn a_driveable_part_outranks_everything_else() {
+        // The ordering the enum's declaration order encodes, asserted rather than assumed:
+        // this is the policy `preferred_index` reads straight off `Ord`.
+        let set = firmware_without_tuning();
+        let empty = FirmwareSet::new();
+        assert!(driveability(AX200, &set) > driveability(CSR8510, &set));
+        assert!(driveability(AX200, &set) > driveability(AX200, &empty));
+        assert!(driveability(CSR8510, &set) > driveability(AX200, &empty));
     }
 
     #[test]

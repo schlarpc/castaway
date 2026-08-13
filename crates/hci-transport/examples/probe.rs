@@ -71,16 +71,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_or_else(|_| "none".to_owned(), |l| l.name().to_owned());
         // Say up front whether the images this controller needs are present, rather
         // than discovering it half-way through an upload.
-        let missing: Vec<&str> = init::select(init::registry(), *id)
+        let missing: Vec<String> = init::select(init::registry(), *id)
             .map(|l| {
                 l.required_images(*id)
                     .iter()
-                    .filter(|n| !firmware.has(n))
-                    .copied()
+                    .filter(|image| !firmware.has(image.name))
+                    // Which ones stop the part booting and which only leave it untuned:
+                    // the same distinction `driveability` ranks on (#307).
+                    .map(|image| match image.necessity {
+                        init::Necessity::Essential => image.name.to_owned(),
+                        init::Necessity::Optional => format!("{} (optional)", image.name),
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        print!("  {id}  loader={loader}");
+        print!(
+            "  {id}  loader={loader} {:?}",
+            init::driveability(*id, &firmware)
+        );
         if missing.is_empty() {
             println!();
         } else {

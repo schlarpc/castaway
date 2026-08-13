@@ -18,7 +18,7 @@ use tracing::{debug, info};
 
 use crate::error::TransportError;
 use crate::firmware::FirmwareSet;
-use crate::init::{ControllerInit, UsbId};
+use crate::init::{ControllerInit, RequiredImage, UsbId};
 
 /// Read version, in TLV form on AX2xx.
 const READ_VERSION: OpCode = OpCode::new(0xFC05);
@@ -205,14 +205,23 @@ impl ControllerInit for IntelInit {
         Self::image_stem(id).is_some()
     }
 
-    fn required_images(&self, id: UsbId) -> Vec<&'static str> {
+    fn required_images(&self, id: UsbId) -> Vec<RequiredImage> {
         // Leaking through as `&'static str` so the probe can name the missing file. The
         // stems are compile-time constants, so the only allocation is the pair.
+        //
+        // The `.sfi` is the firmware; without it `init` cannot boot the part at all. The
+        // `.ddc` is the per-board tuning table, and `init` explicitly logs and continues
+        // without one — so it must not count against this build's ability to drive the
+        // controller (#307).
         Self::image_stem(id).map_or_else(Vec::new, |stem| match stem {
-            "intel/ibt-0041-0041" => {
-                vec!["intel/ibt-0041-0041.sfi", "intel/ibt-0041-0041.ddc"]
-            }
-            _ => vec!["intel/ibt-20-1-3.sfi", "intel/ibt-20-1-3.ddc"],
+            "intel/ibt-0041-0041" => vec![
+                RequiredImage::essential("intel/ibt-0041-0041.sfi"),
+                RequiredImage::optional("intel/ibt-0041-0041.ddc"),
+            ],
+            _ => vec![
+                RequiredImage::essential("intel/ibt-20-1-3.sfi"),
+                RequiredImage::optional("intel/ibt-20-1-3.ddc"),
+            ],
         })
     }
 
@@ -1052,10 +1061,15 @@ mod tests {
         // check lies about a part that is going to fail.
         assert!(intel
             .required_images(UsbId::new(0x8087, 0x0032))
-            .contains(&"intel/ibt-0041-0041.sfi"));
+            .contains(&RequiredImage::essential("intel/ibt-0041-0041.sfi")));
         assert!(intel
             .required_images(AX200)
-            .contains(&"intel/ibt-20-1-3.sfi"));
+            .contains(&RequiredImage::essential("intel/ibt-20-1-3.sfi")));
+        // And the .ddc is *optional*, because `init` logs and continues without one: a
+        // build carrying only the .sfi can still drive this part (#307).
+        assert!(intel
+            .required_images(AX200)
+            .contains(&RequiredImage::optional("intel/ibt-20-1-3.ddc")));
     }
 
     #[test]
