@@ -45,6 +45,10 @@ sha2.workspace = true
 # `attestation::rekor_config` builds that client itself instead. No features of our own —
 # the TLS backend is `sigstore`'s choice, and this must not become a second opinion on it.
 reqwest = { version = "0.13", default-features = false }
+# One combinator: `FutureExt::catch_unwind`, which is what contains `sigstore`'s panicking
+# client construction in `attestation::fetch_trust_root` (#351). `std` has no async
+# `catch_unwind`.
+futures.workspace = true
 
 # --- the agent: the I/O half (#345) ---
 # The install tree the launcher and this both write into.

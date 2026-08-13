@@ -22,8 +22,11 @@
 //! fetching a release — so this is robustness rather than necessity (D59 has the longer
 //! version, including why the trust root's staleness is not the hazard it looks like).
 
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 
+use futures::FutureExt as _;
 use sha2::{Digest as _, Sha256};
 use sigstore::bundle::verify::{policy::Identity, Verifier};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
@@ -124,8 +127,8 @@ impl Provenance {
     /// Only [`AttestationError::TrustRoot`], and only if the *embedded* root is also
     /// unreadable — a failed refresh alone is not an error here.
     pub async fn refreshed(cache: Option<&Path>) -> Result<Self, AttestationError> {
-        match SigstoreTrustRoot::new(cache).await {
-            Ok(root) => match Self::from_root(root) {
+        match fetch_trust_root(cache).await {
+            Ok(Ok(root)) => match Self::from_root(root) {
                 Ok(verifier) => {
                     info!("auto-update: trust root refreshed from Sigstore's TUF repository");
                     return Ok(verifier);
@@ -134,9 +137,13 @@ impl Provenance {
                 // say out loud before falling back past it.
                 Err(e) => warn!(error = %e, "auto-update: the refreshed trust root is unusable"),
             },
-            Err(e) => info!(
+            Ok(Err(e)) => info!(
                 error = %e,
                 "auto-update: could not refresh the trust root; using the one compiled in"
+            ),
+            Err(panic) => warn!(
+                panic = %panic,
+                "auto-update: fetching the trust root panicked; using the one compiled in"
             ),
         }
         Self::embedded()
@@ -185,6 +192,55 @@ impl Provenance {
     pub fn identity(&self) -> &str {
         RELEASE_IDENTITY
     }
+}
+
+/// `SigstoreTrustRoot::new`, with the dependency's own panic contained (#351).
+///
+/// `sigstore` builds the client it fetches TUF metadata with using
+/// `reqwest::Client::new()`, which *panics* rather than returning an error when the TLS
+/// backend will not initialise — and with the `rustls-tls` feature that backend is
+/// `rustls-platform-verifier`, which fails with "No CA certificates were loaded from the
+/// system" on a host whose trust store cannot be read. Unlike [`rekor_config`]'s client,
+/// this one is `sigstore`'s to build and there is no seam to hand it ours through
+/// (`SigstoreTrustRoot::new` takes only a cache directory), so the panic is caught where
+/// it lands and reported as one more way the refresh can fail.
+///
+/// This is containment, not a fix: a library that panics where it should error is
+/// upstream's to correct, and the receiver's requirement is only that
+/// [`Provenance::refreshed`] degrade to the embedded root the way every other failure on
+/// that path does. Without it the nightly update task unwinds and dies, and an unattended
+/// panel silently stops updating — the failure D59 exists to avoid. `panic = "abort"` is
+/// deliberately off in this workspace (see the root manifest), so there is an unwind here
+/// to catch.
+///
+/// The outer `Err` is the panic's message, already rendered: the payload is a
+/// `Box<dyn Any>` that cannot cross a `tracing` field, and nothing here does anything with
+/// it but log it.
+async fn fetch_trust_root(
+    cache: Option<&Path>,
+) -> Result<Result<SigstoreTrustRoot, sigstore::errors::SigstoreError>, String> {
+    // `AssertUnwindSafe`: the only state this future touches that outlives the panic is
+    // the on-disk TUF cache, which is `sigstore`'s to keep consistent and is re-validated
+    // on the next fetch regardless. Nothing in this crate is left half-written by it.
+    AssertUnwindSafe(SigstoreTrustRoot::new(cache))
+        .catch_unwind()
+        .await
+        .map_err(|payload| panic_message(&*payload))
+}
+
+/// What a caught panic said, for the log line. `panic!` payloads are `&'static str` or
+/// `String` in practice and anything at all in principle; the last case is named rather
+/// than dropped so a log line never reads as an empty field.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload.downcast_ref::<&str>().map_or_else(
+        || {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "a panic payload of an unknown type".to_owned())
+        },
+        |s| (*s).to_owned(),
+    )
 }
 
 /// Rekor's endpoint configuration. Only consulted when verification is *not* offline,
