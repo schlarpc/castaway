@@ -368,6 +368,26 @@ impl SessionStarter for Librespot {
     }
 }
 
+/// Name the process-wide TLS provider, because librespot's HTTP client does not.
+///
+/// The workspace pins `ring` and every `ClientConfig`/`ServerConfig` *we* build names it
+/// through `builder_with_provider` (see the `--- tls ---` block in the root manifest).
+/// That invariant covers this tree's code and stops at its edge: `librespot-core`'s
+/// `http_client.rs` reaches `hyper-rustls`' `with_webpki_roots()`, which reaches the bare
+/// `ClientConfig::builder()`, which — with both `ring` and `aws-lc-rs` in the graph since
+/// D59 — cannot tell which provider was meant and panics rather than choosing. The panic
+/// landed on the runtime worker running the login, so the runner died on the *first*
+/// pairing and every later one was answered with "the runner is gone": pairing looked
+/// accepted on the phone and the device never appeared.
+///
+/// Installing a process default is the remedy rustls itself names, and it is the only one
+/// available for a dependency that does not take a provider. Ring, to agree with the pin.
+/// `install_default` fails only if something got there first, and a provider that is
+/// already installed answers the same question, so the result is deliberately dropped.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Start the runner. Returns the handle the HTTP endpoint pushes credentials into.
 ///
 /// The runner is a task rather than something the caller drives, because pairing arrives
@@ -380,6 +400,7 @@ pub fn spawn(
     osd: Option<OsdSink>,
     active: ActiveUser,
 ) -> ConnectHandle {
+    install_crypto_provider();
     // Depth 1: pairings are human-paced, and if two arrive at once only the later one
     // matters — but it must not be dropped, so this is a send, not a try_send.
     let (tx, rx) = mpsc::channel(1);
@@ -3116,6 +3137,44 @@ mod tests {
         drop(pairings);
         task.await.expect("the runner should stop cleanly");
         assert_eq!(starter.shutdowns(), 1);
+    }
+
+    #[tokio::test]
+    async fn starting_the_runner_names_the_tls_provider_librespot_will_not() {
+        // The shape of the defect this guards: `ClientConfig::builder()` — what
+        // librespot's HTTP client reaches through hyper-rustls — panics instead of
+        // choosing when the graph carries two providers and none is installed, and it
+        // panicked on the task running the login, so the *first* pairing killed the
+        // runner. Driving `spawn` rather than the helper is the point: the call site is
+        // what regressed, and deleting it has to fail this.
+        //
+        // It fails in a *workspace* build and only there — `cargo test -p proto-spotify`
+        // resolves features over this crate alone, where `ring` is the only provider and
+        // the bare builder is unambiguous. The ambiguity is a property of the binary the
+        // panel runs, so the test that proves it has to be run the way CI runs it.
+        let (tx, _rx) = mpsc::channel(4);
+        let _handle = spawn(
+            ConnectSettings {
+                device_name: "panel".to_owned(),
+                device_id: "0123456789abcdef".to_owned(),
+                initial_volume: 0.5,
+                bitrate: 320,
+                normalisation: false,
+                local_file_directories: Vec::new(),
+            },
+            SessionSink::new(SourceId::new(ProtocolKind::Spotify, "http"), tx),
+            None,
+            ActiveUser::default(),
+        );
+        // Panics on a regression rather than comparing unequal — which is how the
+        // receiver experienced it.
+        let _config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "starting the runner should leave the process with a default provider"
+        );
     }
 
     #[test]

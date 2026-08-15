@@ -176,6 +176,14 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # `builder_with_provider(ring)`, never the bare `builder()`. Cargo cannot enforce that
 # invariant, and a review that assumes "the pin means ring is the only one" will restore
 # the panic. `grep builder_with_provider crates/` is the check.
+#
+# That invariant stops at our code, and a dependency walked straight through the gap:
+# librespot's HTTP client builds its config through hyper-rustls' bare builder, so the
+# Spotify runner panicked on the first pairing (#366). For a dependency that takes no
+# provider the only lever is the process default, which `proto-spotify`'s
+# `install_crypto_provider` installs — as ring, to agree with this pin. A crate-scoped
+# `cargo test -p …` cannot see any of this: the ambiguity exists only where features
+# unify across the whole workspace, which is the binary the panel runs.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }

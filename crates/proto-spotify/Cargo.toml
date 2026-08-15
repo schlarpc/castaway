@@ -27,6 +27,9 @@ aes.workspace = true
 ctr.workspace = true
 base64 = "0.23"
 rand.workspace = true
+# Not for a config of ours — this crate builds none. It is here to install the process
+# default provider librespot's HTTP client needs and does not name (`install_crypto_provider`).
+rustls.workspace = true
 librespot-core.workspace = true
 librespot-connect.workspace = true
 librespot-playback.workspace = true
