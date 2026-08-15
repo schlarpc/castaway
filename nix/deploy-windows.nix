@@ -113,6 +113,45 @@ let
     exit 1
   '';
 
+  # What a version directory on the box actually contains, file by file.
+  #
+  # The whole point of the incremental deploy: 561 MB of tree, of which `castaway.exe` is
+  # 62 MB and everything else — Electron at 358 MB, the ffmpeg DLLs, the CDM — is
+  # byte-identical from one iteration to the next. Sending the archive every time costs
+  # 235 MB to deliver a change that is almost always in one file.
+  #
+  # Hashing the whole tree on the box takes a few seconds and answers that exactly, with
+  # no bookkeeping to go stale: the box says what it has, and the difference against the
+  # store tree is what travels. Paths come back relative and slash-separated so the two
+  # sides can be compared as plain text.
+  manifestPs1 = pkgs.writeText "castaway-manifest.ps1" ''
+    param([Parameter(Mandatory = $true)][string]$Dir)
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-Path -LiteralPath $Dir)) { exit 2 }
+    $root = (Resolve-Path -LiteralPath $Dir).Path.TrimEnd('\') + '\'
+    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force)
+    $done = 0
+    foreach ($f in $files) {
+      # A file that cannot be read — still flushing behind the copy that just made it, or
+      # held by something — must not end the listing early. A manifest cut short is
+      # indistinguishable from "the box has almost nothing", which reads as "send
+      # everything": a silently wrong answer where a refusal was wanted.
+      try {
+        $hash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
+      } catch {
+        continue
+      }
+      $rel = $f.FullName.Substring($root.Length).Replace('\', '/')
+      "$hash $rel"
+      $done++
+    }
+    # The trailer is the point. The reader checks it arrived *and* that the count matches
+    # what it parsed, so a listing truncated anywhere — a dropped connection, a file that
+    # could not be read — is caught rather than believed. Without it a partial manifest
+    # cost a 235 MB transfer and looked like a considered decision.
+    "MANIFEST-COMPLETE $done $($files.Count)"
+  '';
+
   # Both scripts talk to the same box the same way.
   preamble = ''
     host="''${CASTAWAY_WINDOWS_HOST:-}"
@@ -239,6 +278,153 @@ let
       [ "$left" -eq 0 ] || die "$left launcher/castaway/electron process(es) survived taskkill on $host"
     }
 
+    # How many differing files, and how many bytes of them, before the incremental path
+    # stops being the cheap one. A Rust change is one file; a browser or ffmpeg bump is
+    # thousands, and scp pays a round trip per file. Past either bound the archive wins,
+    # so the fast path hands back to the slow one rather than grinding.
+    INCREMENTAL_MAX_FILES=200
+    INCREMENTAL_MAX_BYTES=$((120 * 1024 * 1024))
+
+    # Which version directory on the box to seed a new one from.
+    #
+    # `current.txt` first, because it is the tree most likely to differ from the new one by
+    # only the receiver. Any other version is still a far better starting point than an
+    # empty directory, so a box mid-rollback is not pushed onto the slow path.
+    seed_version() {
+      local seed
+      seed=$(on_box "type \"$root\\current.txt\" 2>nul" | unix | tr -d '[:space:]' || true)
+      if [ -n "$seed" ] && on_box "if not exist \"$root\\versions\\$seed\\castaway.exe\" exit 1"; then
+        printf '%s' "$seed"
+        return 0
+      fi
+      seed=$(on_box "dir /b \"$root\\versions\" 2>nul" | unix | tr -d '\r' | head -1 || true)
+      if [ -n "$seed" ] && on_box "if not exist \"$root\\versions\\$seed\\castaway.exe\" exit 1"; then
+        printf '%s' "$seed"
+        return 0
+      fi
+      return 1
+    }
+
+    # Stage by copying a version the box already has and sending only what differs.
+    #
+    # Returns non-zero when it decides the archive would be cheaper — the caller then runs
+    # `stage_version` as normal, so this is an optimisation with a fallback rather than a
+    # second way for a deploy to fail. Every verify-don't-assume rule the archive path has
+    # is kept: each transferred file is hashed *on the box* after it lands, and the stamp
+    # is written last, so a half-finished incremental deploy leaves no stamp and the next
+    # run cannot take any fast path off the back of it.
+    stage_version_incremental() {
+      local zip_sha="$1" exe_sha="$2" id="$3" tree="$4" scratch="$5"
+      local dest="$root\\versions\\$id"
+
+      local seed
+      seed=$(seed_version) || { say "no version on the box to seed from; sending the archive"; return 1; }
+      [ "$seed" != "$id" ] || { say "the box already has $id"; return 1; }
+
+      say "seeding versions\\$id from versions\\$seed (on the box, no network)"
+      on_box "if exist \"$dest\" rmdir /s /q \"$dest\"" || true
+      on_box "if exist \"$dest\" exit 1" \
+        || die "$dest still exists after rmdir — something holds a handle on it"
+      # robocopy's exit codes are a bitmask where anything under 8 means it copied what it
+      # was asked to; only >=8 is a failure. `exit /b 0` is what stops cmd reporting a
+      # successful copy as an error.
+      on_box "robocopy \"$root\\versions\\$seed\" \"$dest\" /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 & if errorlevel 8 (exit /b 1) else (exit /b 0)" \
+        || die "could not seed $dest from $seed"
+
+      say "comparing the box's copy against the build"
+      scp "''${ssh_opts[@]}" -q ${manifestPs1} "$host:castaway-manifest.ps1"
+      local remote="$scratch/remote.manifest" local_manifest="$scratch/local.manifest"
+      local raw="$scratch/remote.raw"
+      on_box "powershell -NoProfile -ExecutionPolicy Bypass -File castaway-manifest.ps1 -Dir \"$dest\"" \
+        | unix | sed 's/[[:space:]]*$//' | grep -v '^$' > "$raw" || true
+      # Trust the listing only if it says it finished and the arithmetic agrees. Anything
+      # else falls back to the archive: a short manifest means "send everything" to the
+      # comparison below, which is the expensive wrong answer arrived at confidently.
+      local trailer hashed total lines
+      trailer=$(grep -m1 '^MANIFEST-COMPLETE ' "$raw" || true)
+      if [ -z "$trailer" ]; then
+        say "the box's manifest did not complete; sending the archive instead"
+        on_box "if exist \"$dest\" rmdir /s /q \"$dest\"" || true
+        return 1
+      fi
+      hashed=$(printf '%s' "$trailer" | awk '{print $2}')
+      total=$(printf '%s' "$trailer" | awk '{print $3}')
+      grep -v '^MANIFEST-COMPLETE ' "$raw" | LC_ALL=C sort > "$remote"
+      lines=$(grep -c . "$remote" || true)
+      if [ "$hashed" != "$total" ] || [ "$lines" != "$hashed" ]; then
+        say "the box listed $lines of $total file(s); sending the archive instead"
+        on_box "if exist \"$dest\" rmdir /s /q \"$dest\"" || true
+        return 1
+      fi
+      ( cd "$tree" && find . -type f -printf '%P\n' | LC_ALL=C sort | while IFS= read -r f; do
+          printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
+        done ) | sort -k2 > "$local_manifest"
+
+      # A line is "<sha256> <relative path>", so a whole-line difference is exactly
+      # "this file is absent or has different content" — one comparison covering both,
+      # with no per-file lookups to get wrong.
+      local send="$scratch/send.list"
+      LC_ALL=C comm -23 "$local_manifest" "$remote" | cut -d' ' -f2- > "$send"
+
+      local count bytes
+      count=$(grep -c . "$send" || true)
+      bytes=0
+      if [ "$count" -gt 0 ]; then
+        bytes=$(cd "$tree" && while IFS= read -r f; do
+          [ -n "$f" ] && stat -c%s "$f" 2>/dev/null || true
+        done < "$send" | awk '{ total += $1 } END { print total + 0 }')
+      fi
+      say "$count file(s) differ, $((bytes / 1024 / 1024)) MiB"
+      if [ "$count" -gt "$INCREMENTAL_MAX_FILES" ] || [ "$bytes" -gt "$INCREMENTAL_MAX_BYTES" ]; then
+        say "that is more than the archive costs; sending the archive instead"
+        on_box "if exist \"$dest\" rmdir /s /q \"$dest\"" || true
+        return 1
+      fi
+
+      # Anything the box has and the build does not. A version directory is the build's
+      # tree exactly, never a superset — a stale DLL left behind is the kind of thing that
+      # loads in preference to the right one and is invisible until it is not.
+      local stale
+      stale=$(LC_ALL=C comm -13 \
+        <(cut -d' ' -f2- "$local_manifest") <(cut -d' ' -f2- "$remote") || true)
+      if [ -n "$stale" ]; then
+        say "removing $(printf '%s\n' "$stale" | grep -c . ) file(s) the build does not have"
+        printf '%s\n' "$stale" | while IFS= read -r f; do
+          [ -n "$f" ] || continue
+          on_box "del /q /f \"$dest\\''${f//\//\\}\" >nul 2>&1" || true
+        done
+      fi
+
+      local dest_fwd="''${dest//\\//}"
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        say "  sending $f"
+        local dir="''${f%/*}"
+        [ "$dir" = "$f" ] || on_box "if not exist \"$dest\\''${dir//\//\\}\" mkdir \"$dest\\''${dir//\//\\}\"" || true
+        scp "''${ssh_opts[@]}" -q "$tree/$f" "$host:$dest_fwd/$f" \
+          || die "could not send $f"
+        local got
+        got=$(remote_sha256 "$dest\\''${f//\//\\}")
+        local want
+        want=$(cd "$tree" && sha256sum "$f" | cut -d' ' -f1)
+        [ "$got" = "$want" ] || die "$f hashes $got on the box, $want here"
+      done < "$send"
+
+      on_box "if not exist \"$dest\\castaway.exe\" exit 1" \
+        || die "$dest\\castaway.exe missing after the incremental stage"
+      local got
+      got=$(remote_sha256 "$dest\\castaway.exe")
+      [ "$got" = "$exe_sha" ] \
+        || die "deployed castaway.exe hashes $got, built one hashes $exe_sha"
+
+      # Same stamp the archive path writes, and written just as last: the two paths are
+      # interchangeable from here on, and the next run's fast path cannot tell — or need
+      # to tell — which one put the tree there.
+      on_box "(echo $zip_sha)> \"$dest\\.deployed-sha256\"" \
+        || die "could not write the deploy stamp"
+      say "staged incrementally: $dest"
+    }
+
     # Copy the archive over, check it arrived intact, and extract it into `versions\<id>\`
     # with the wrapper directory stripped — which is what makes `versions\<id>\castaway.exe`
     # true, and is exactly what the in-app updater does with the same archive (#345).
@@ -307,16 +493,20 @@ let
   # is no flag for it here on purpose — re-arming should be a thing somebody does knowingly.
   deploy = pkgs.writeShellApplication {
     name = "castaway-deploy-windows";
-    runtimeInputs = [ pkgs.openssh pkgs.coreutils pkgs.unzip ];
+    runtimeInputs = [ pkgs.openssh pkgs.coreutils pkgs.unzip pkgs.findutils pkgs.gnugrep pkgs.gawk ];
     text = preamble + layout + ''
       artifact="castaway-windows-electron"
       force=""
       no_launch=""
+      full=""
       for arg in "$@"; do
         case "$arg" in
           --force) force=1 ;;
           --no-launch) no_launch=1 ;;
-          --*) echo "usage: castaway-deploy-windows [--force] [--no-launch] [ARTIFACT]" >&2
+          # Skip the incremental path and send the archive. For when the box's tree is
+          # suspect and re-extracting from a verified zip is the point.
+          --full) full=1 ;;
+          --*) echo "usage: castaway-deploy-windows [--force] [--full] [--no-launch] [ARTIFACT]" >&2
                exit 1 ;;
           *) artifact="$arg" ;;
         esac
@@ -371,8 +561,28 @@ let
 
       if [ -z "$fresh" ]; then
         on_box "mkdir \"$root\\versions\" 2>nul" || true
-        stage_version "$zip" "$zip_sha" "$exe_sha" "$version"
-        say "deployed and verified: $dest"
+        staged=""
+        if [ -z "$full" ]; then
+          # Unzipped locally rather than built as `.#$artifact`, and for the reason the
+          # comment above gives: a second derivation relinks the binary and its output is
+          # not bit-identical, so the tree to compare against has to be *these* bytes.
+          # Unpacking 235 MB onto local disk costs seconds and keeps the exe hash honest.
+          scratch=$(mktemp -d) || die "mktemp -d"
+          # shellcheck disable=SC2064
+          trap "rm -rf '$scratch'" EXIT
+          unzip -q "$zip" -d "$scratch/tree" || die "could not unpack $zip"
+          if stage_version_incremental "$zip_sha" "$exe_sha" "$version" \
+               "$scratch/tree/$artifact" "$scratch"; then
+            staged=1
+            say "deployed and verified (incremental): $dest"
+          fi
+          rm -rf "$scratch"
+          trap - EXIT
+        fi
+        if [ -z "$staged" ]; then
+          stage_version "$zip" "$zip_sha" "$exe_sha" "$version"
+          say "deployed and verified: $dest"
+        fi
       fi
 
       # The launcher at the root is what the scheduled task points at, and it is *not*
