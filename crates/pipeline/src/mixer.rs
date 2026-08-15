@@ -460,7 +460,9 @@ pub enum Backpressure {
     /// Take the newest audio and let the oldest go.
     ///
     /// The only honest answer for a sender that is its own clock — a phone on A2DP or
-    /// AirPlay, Spotify, a browser page. Nothing here can slow it down, so audio in excess
+    /// AirPlay, a browser page. (Spotify was listed here and is not one: librespot
+    /// decodes locally into a bounded channel and waits when nobody reads it — #367.)
+    /// Nothing here can slow such a sender down, so audio in excess
     /// of its budget is going to be lost whatever this returns; all this decides is
     /// *where*. Shedding it here costs a click. Refusing it pushes the loss up into the
     /// protocol's own queue, where the unit is an encoded packet — a decoder desync rather
@@ -468,6 +470,25 @@ pub enum Backpressure {
     /// only drain at real time. That queue is seconds deep, so it also becomes a permanent
     /// latency floor. See #111 and the regression it caused.
     Live,
+}
+
+impl Backpressure {
+    /// What a PCM source's declared clock ([`castaway_core::PcmClock`]) means for its
+    /// writes.
+    ///
+    /// The single place the declaration becomes behaviour, and it is a function because
+    /// the alternative was an inference: the seam in `render_pipeline` handed *every*
+    /// `FrameSource::Pcm` a [`Backpressure::Live`] input on the grounds that a source
+    /// delivering samples must be its own clock. librespot is not — it waits — so nothing
+    /// paced it, it decoded at about a hundred times real time, and the panel raced
+    /// through a playlist shedding all but a click of each track (#367).
+    #[must_use]
+    pub const fn for_clock(clock: castaway_core::PcmClock) -> Self {
+        match clock {
+            castaway_core::PcmClock::Ours => Self::Pull,
+            castaway_core::PcmClock::Theirs => Self::Live,
+        }
+    }
 }
 
 /// One source's way into the mix.
@@ -3140,6 +3161,49 @@ mod tests {
             MixerCounters::default().invented(),
             None,
             "and the invented fraction still refuses a zero denominator"
+        );
+    }
+
+    #[test]
+    fn a_source_that_declares_we_clock_it_is_paced_by_its_writes() {
+        // #367, at the boundary that decides it. Spotify pairs, plays, and rips through a
+        // playlist at about a hundred times real time when this is wrong — librespot
+        // decodes as fast as its sink accepts, so the sink accepting everything is the
+        // whole bug. The pacing property itself is pinned above; what this pins is that a
+        // source *declaring* our clock gets it.
+        let device = Recorder::new();
+        let mixer = mixer_with(&device);
+        let mut input = mixer.input(Backpressure::for_clock(castaway_core::PcmClock::Ours));
+        let start = Instant::now();
+        // A second of audio in 50 ms blocks.
+        for _ in 0..20 {
+            input.write(&tone(2400, 0.5)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "a second of audio from a source we clock went in in {elapsed:?}; \
+             nothing is pacing it, so its decoder will run flat out"
+        );
+    }
+
+    #[test]
+    fn a_source_that_declares_its_own_clock_is_still_never_made_to_wait() {
+        // The other half of #367, and the reason the fix is a declaration rather than a
+        // blanket switch to `Pull`: a phone cannot be slowed down, and parking its writer
+        // moves the loss into the protocol's queue instead of costing a click.
+        let device = Recorder::new();
+        let mixer = mixer_with(&device);
+        let mut input = mixer.input(Backpressure::for_clock(castaway_core::PcmClock::Theirs));
+        let start = Instant::now();
+        // Five seconds of audio, more than twice the budget.
+        for _ in 0..100 {
+            input.write(&tone(2400, 0.5)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a source that is its own clock was parked for {elapsed:?}"
         );
     }
 

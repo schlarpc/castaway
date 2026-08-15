@@ -90,7 +90,7 @@ impl NullPipeline {
                     info!(frames = n, "null pipeline: decoded {label} source ended");
                 });
             }
-            FrameSource::Pcm(rx) => {
+            FrameSource::Pcm(rx, _) => {
                 // A std channel drained on a blocking task, because both ends of the PCM
                 // path are threads — see `FrameSource::Pcm`.
                 tokio::task::spawn_blocking(move || {

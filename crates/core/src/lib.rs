@@ -47,7 +47,7 @@ pub use touch::{SurfaceTouch, TouchHandle, TouchPhase, TouchSurface};
 pub use types::{
     AudioCodec, AudioFormat, ColorInfo, ColorRange, ColorSpace, DeclaredLatency, DecodedFrame,
     EncodedFrame, FrameImage, FrameSource, FriendlyName, GpuSurface, MediaRequest, MediaUri,
-    PcmFrame, PixelFormat, ProtocolKind, RequestHeader, VideoCodec, MEDIA_USER_AGENT,
+    PcmClock, PcmFrame, PixelFormat, ProtocolKind, RequestHeader, VideoCodec, MEDIA_USER_AGENT,
 };
 pub use volume::Volume;
 pub use wake::Waker;

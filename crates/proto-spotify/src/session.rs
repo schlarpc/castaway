@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use castaway_core::{FrameSource, OsdSink};
 use castaway_core::{
-    NowPlaying, PcmFrame, PlaybackState, RepeatMode, SessionEvent, SessionSink, SourceDescription,
+    NowPlaying, PcmClock, PcmFrame, PlaybackState, RepeatMode, SessionEvent, SessionSink,
+    SourceDescription,
 };
 use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
@@ -787,7 +788,7 @@ async fn start(
     ));
 
     presentation
-        .open(sink, FrameSource::Pcm(pcm_rx), format)
+        .open(sink, FrameSource::Pcm(pcm_rx, PcmClock::Ours), format)
         .await?;
 
     // Serve the sink's requests for a fresh channel. This is what makes preemption
@@ -852,7 +853,7 @@ async fn serve_reattach(
         // writes does not produce a burst of session hand-offs.
         while requests.try_recv().is_ok() {}
         info!("spotify: reattaching audio to the pipeline");
-        let source = FrameSource::Pcm(link.attach());
+        let source = FrameSource::Pcm(link.attach(), PcmClock::Ours);
         if presentation.open(&sink, source, format).await.is_err() {
             debug!("spotify: session manager gone; stopping the reattach server");
             return;
@@ -1537,7 +1538,7 @@ mod tests {
 
     fn pcm() -> FrameSource {
         let (_tx, rx) = std::sync::mpsc::channel();
-        FrameSource::Pcm(rx)
+        FrameSource::Pcm(rx, PcmClock::Ours)
     }
 
     fn format() -> castaway_core::AudioFormat {

@@ -747,7 +747,33 @@ pub enum FrameSource {
     /// producer happens to sit inside *any* runtime context, which librespot's player
     /// thread does (it builds its own runtime and blocks on it). Sending on a std channel
     /// blocks the producer, which is exactly the backpressure an audio sink wants.
-    Pcm(std::sync::mpsc::Receiver<PcmFrame>),
+    ///
+    /// Blocking the producer is only *worth* anything if the consumer declines to read,
+    /// so the variant carries who the clock is — see [`PcmClock`].
+    Pcm(std::sync::mpsc::Receiver<PcmFrame>, PcmClock),
+}
+
+/// Whose clock a [`FrameSource::Pcm`] stream runs on.
+///
+/// The one fact about a stream of samples that cannot be read off the samples, and the
+/// one that decides what a consumer does when they arrive faster than the speakers take
+/// them: wait, or throw the oldest away. Getting it wrong is silent in both directions —
+/// waiting on a source that cannot be slowed moves the loss into the protocol's queue,
+/// and shedding from a source that would have waited makes it run as fast as it can
+/// decode.
+///
+/// It is carried on the variant rather than inferred at the seam because the shape of the
+/// transport does not answer it: `Pcm` is "samples, already decoded", which is equally
+/// true of a phone streaming at its own rate and of a local player we drive (#367).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcmClock {
+    /// Ours. The producer blocks when we stop reading, so not reading *is* the flow
+    /// control — a local player decoding a track into a bounded channel, which is
+    /// Spotify Connect: librespot decodes, and the phone only says what to play.
+    Ours,
+    /// The sender's. It produces at its own rate and nothing here can slow it down, so
+    /// audio beyond the budget has to be shed rather than waited on — a phone on A2DP.
+    Theirs,
 }
 
 #[cfg(test)]

@@ -1093,7 +1093,7 @@ impl Pipeline for RenderPipeline {
             // A mirror session is pixels by definition. PCM reaching here means an
             // adapter routed an audio-only source down the video path, which would
             // otherwise show as a black screen rather than as the wiring mistake it is.
-            FrameSource::Pcm(_) => Err(CoreError::Pipeline(
+            FrameSource::Pcm(..) => Err(CoreError::Pipeline(
                 "a mirror session cannot be PCM audio; use play_audio".into(),
             )),
             FrameSource::Url(uri) => self.play(uri.into(), None).await,
@@ -1204,14 +1204,25 @@ impl Pipeline for RenderPipeline {
                 }
                 // Already decoded (Spotify): `format` is what the adapter negotiated, but
                 // each block restates it, so the session takes it from the samples.
-                FrameSource::Pcm(rx) => {
+                FrameSource::Pcm(rx, clock) => {
+                    // Which of the two the source declared decides whether writing waits
+                    // or sheds, and it is not a detail: this line used to hand *every*
+                    // PCM source a live input on the grounds that "the sender is the
+                    // clock", which is true of a phone and false of librespot. Nothing
+                    // pushed back on it, so it decoded flat out — the panel raced through
+                    // a playlist at a hundred times real time, shedding all but a click of
+                    // each track (#367).
+                    let input = match crate::mixer::Backpressure::for_clock(clock) {
+                        // Only a live input publishes a latency target: the declaration a
+                        // sender makes about how far behind it is delivering is
+                        // meaningless for a source that waits for us instead (#176).
+                        crate::mixer::Backpressure::Live => self.live_audio_input(),
+                        pull => self.audio_input(pull),
+                    };
                     crate::audio_session::spawn_pcm(
-                        rx,
-                        self.live_audio_input(),
-                        stop,
-                        // Bluetooth/Spotify PCM: the sender is the clock, there is no
-                        // video to synchronise, and a seek is the phone's business — so
-                        // there is no paced session to share.
+                        rx, input, stop,
+                        // No video to synchronise, and a seek is the source's own
+                        // business either way — so there is no paced session to share.
                         None,
                     );
                     Ok(())
@@ -4559,7 +4570,7 @@ mod card_tests {
             let (_tx, rx) = std::sync::mpsc::sync_channel(1);
             pipeline
                 .play_audio(
-                    castaway_core::FrameSource::Pcm(rx),
+                    castaway_core::FrameSource::Pcm(rx, castaway_core::PcmClock::Ours),
                     castaway_core::AudioFormat::from_hz(44_100, 2).unwrap(),
                     None,
                 )
