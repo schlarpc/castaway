@@ -230,3 +230,63 @@ fn a_current_txt_pointing_at_nothing_does_not_stop_the_launcher() {
         },
     );
 }
+
+#[test]
+fn a_restart_keeps_the_previous_launchers_transcript() {
+    // #361. The launcher's own lines — the restart ladder, the health verdict, the
+    // rollback decision — live only in `castaway.log`, because the receiver's dated logs
+    // cannot cover the process that starts it and outlives each of its crashes. That file
+    // used to be truncated at every launcher start, so the explanation for a rollback was
+    // destroyed by the restart that followed it: at 4 a.m. the decision was made, and by
+    // morning the panel could not say why it was running what it was running.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = InstallTree::at(dir.path());
+    install::ensure_tree(&tree).expect("tree");
+
+    install_receiver(
+        &tree,
+        GOOD,
+        "echo 'first boot marker'; touch \"$(dirname \"$0\")/.healthy\"; sleep 600",
+    );
+    point(&tree, Pointer::Current, GOOD);
+    point(&tree, Pointer::Previous, GOOD);
+
+    {
+        let _launcher = Launcher::start(dir.path());
+        eventually_blocking_within("the first launcher to write its log", PATIENCE, || {
+            std::fs::read_to_string(tree.log())
+                .ok()
+                .filter(|log| log.contains("first boot marker"))
+        });
+    } // dropped: this launcher and its receiver are gone, as a reboot would leave them.
+
+    // The second boot. Same tree, same pointers — only the process is new.
+    install_receiver(
+        &tree,
+        GOOD,
+        "echo 'second boot marker'; touch \"$(dirname \"$0\")/.healthy\"; sleep 600",
+    );
+    let _launcher = Launcher::start(dir.path());
+    eventually_blocking_within("the second launcher to write its log", PATIENCE, || {
+        std::fs::read_to_string(tree.log())
+            .ok()
+            .filter(|log| log.contains("second boot marker"))
+    });
+
+    // The live log is the current boot, readable from the top — the property the truncate
+    // was there to get, and which rolling keeps.
+    let live = std::fs::read_to_string(tree.log()).expect("the live log");
+    assert!(
+        !live.contains("first boot marker"),
+        "the live log should begin at this boot, not accumulate every boot: {live}"
+    );
+
+    // And the boot that explains this one is still on disk beside it, which is the whole
+    // point: a rollback decided in one launcher's life is read in the next one's.
+    let kept = std::fs::read_to_string(tree.rolled_log())
+        .expect("the previous boot's log should have been rolled, not destroyed");
+    assert!(
+        kept.contains("first boot marker"),
+        "the rolled log should hold the previous boot verbatim: {kept}"
+    );
+}

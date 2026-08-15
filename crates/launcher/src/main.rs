@@ -249,33 +249,39 @@ struct Log {
 impl Log {
     fn open(tree: &InstallTree) -> Result<Self, Fatal> {
         let path = tree.log();
-        // Truncated at launcher start rather than appended to, matching what `run.cmd`
-        // did: a log that begins at the last boot is one somebody can read top to bottom.
-        // Within a launcher's life it accumulates, so a crash loop's whole history is
-        // there.
-        let open = |truncate: bool| {
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(!truncate)
-                .truncate(truncate)
-                .open(&path)
-                .map_err(|source| Fatal::Log {
-                    path: path.clone(),
-                    source,
-                })
-        };
-        drop(open(true)?);
-        // Reopened in append mode, and that is not tidiness: the launcher's own handle
+        let rolled = tree.rolled_log();
+        // A log that begins at the last boot is one somebody can read top to bottom, and
+        // that is worth keeping — but it used to be bought by *truncating*, which threw
+        // the previous launcher's transcript away (#361). The launcher's own lines have
+        // no other home: the receiver's dated logs under `logs/` cover what the receiver
+        // wrote, and cannot cover the process that starts it and outlives each of its
+        // crashes. So the one file holding "why am I running this version" was erased by
+        // the very restart that followed the decision — a rollback at 4 a.m. was
+        // unexplainable by the time anyone looked at the panel in the morning.
+        //
+        // Rolled instead, to the same one generation `handle` already keeps for size.
+        // Same readable-from-the-top property, and the boot that explains this one is
+        // still on disk beside it.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+            // Best-effort: if the rename cannot happen the old content stays and this
+            // run appends to it, which is untidy and still strictly better than the
+            // truncate it replaces. Refusing to start over a log rotation would be
+            // trading a panel for a filing preference.
+            let _ = std::fs::rename(&path, &rolled);
+        }
+        // Append rather than write, and that is not tidiness: the launcher's own handle
         // and each child's share one file, and a handle with its own write offset would
         // overwrite whatever the receiver printed since the last launcher line. `O_APPEND`
         // (and Windows' `FILE_APPEND_DATA`) is what makes every writer land at the end.
-        let file = open(false)?;
-        Ok(Self {
-            path,
-            rolled: tree.rolled_log(),
-            file,
-        })
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| Fatal::Log {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self { path, rolled, file })
     }
 
     /// A line from the launcher itself, timestamped so it can be lined up against the
