@@ -216,19 +216,35 @@ async fn handle_completion<EpType: BulkOrInterrupt>(
     }
 }
 
-/// Clear any halt inherited from a previous owner, and arm the endpoint.
+/// Clear any halt inherited from a previous owner.
 ///
 /// A process that died on a stall leaves the pipe halted, and the next claim then times
 /// out during vendor initialisation — which reads as a dead dongle needing a replug rather
 /// than as a pipe needing one control transfer.
-fn arm<EpType: BulkOrInterrupt>(
-    endpoint: &mut Endpoint<EpType, In>,
-    want: usize,
+///
+/// **Both directions, because both inherit one.** This started life inside [`arm`] and so
+/// covered only the pipes that get a read submitted — which left the bulk OUT pipe, the
+/// one carrying Intel's `Secure_Send` fragments while the bootloader is running, as the
+/// single endpoint nothing ever unhalted. An AX211 whose OUT pipe was left halted by a
+/// previous owner then stalled the *first* firmware fragment, which reads as a controller
+/// rejecting the upload rather than as the pipe needing exactly the control transfer this
+/// function already existed to send (#287).
+fn clear_stale_halt<EpType: BulkOrInterrupt, Dir: nusb::transfer::EndpointDirection>(
+    endpoint: &mut Endpoint<EpType, Dir>,
     what: &'static str,
 ) {
     if let Err(e) = endpoint.clear_halt().wait() {
         debug!(endpoint = what, error = %e, "no stall to clear at open");
     }
+}
+
+/// Clear any inherited halt, then arm the endpoint with its first read.
+fn arm<EpType: BulkOrInterrupt>(
+    endpoint: &mut Endpoint<EpType, In>,
+    want: usize,
+    what: &'static str,
+) {
+    clear_stale_halt(endpoint, what);
     let len = whole_packets(want, endpoint.max_packet_size());
     endpoint.submit(endpoint.allocate(len));
 }
@@ -403,7 +419,8 @@ impl UsbTransport {
             })?;
         info!(%id, "opened bluetooth controller over USB");
         let reader = Reader::new(&interface, id)?;
-        let acl_out = open_endpoint::<Bulk, Out>(&interface, id, EP_ACL_OUT, "bulk out")?;
+        let mut acl_out = open_endpoint::<Bulk, Out>(&interface, id, EP_ACL_OUT, "bulk out")?;
+        clear_stale_halt(&mut acl_out, "bulk out");
         Ok(Self {
             interface,
             id,
@@ -487,13 +504,35 @@ impl HciTransport for UsbTransport {
                     && self.bootloader.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     let mut endpoint = self.acl_out.lock().await;
-                    endpoint.submit(Buffer::from(body));
-                    endpoint
-                        .next_complete()
-                        .await
-                        .into_result()
-                        .map_err(|e| HciError::Transport(format!("bulk out: {opcode}: {e}")))?;
-                    return Ok(());
+                    endpoint.submit(Buffer::from(body.clone()));
+                    match endpoint.next_complete().await.into_result() {
+                        Ok(_) => return Ok(()),
+                        // A halt on this pipe is recoverable in exactly the way the read
+                        // path's is: what stopped is the endpoint, not the controller.
+                        // Clearing and resending one fragment is cheap next to abandoning
+                        // an upload that is thousands of fragments long — and the upload
+                        // is not resumable, so the alternative is starting over.
+                        Err(TransferError::Stall) => {
+                            warn!(
+                                endpoint = "bulk out",
+                                %opcode,
+                                "endpoint stalled; clearing and resending the fragment"
+                            );
+                            endpoint.clear_halt().wait().map_err(|e| {
+                                HciError::Transport(format!(
+                                    "bulk out: {opcode}: clearing the halt: {e}"
+                                ))
+                            })?;
+                            endpoint.submit(Buffer::from(body));
+                            endpoint.next_complete().await.into_result().map_err(|e| {
+                                HciError::Transport(format!("bulk out: {opcode}: {e}"))
+                            })?;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            return Err(HciError::Transport(format!("bulk out: {opcode}: {e}")))
+                        }
+                    }
                 }
 
                 self.interface
