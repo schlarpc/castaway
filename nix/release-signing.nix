@@ -304,6 +304,15 @@ in
         # `vmp-sign.sh` travels *inside* the artifact rather than being called out of the
         # repository: it is the copy that shipped with these bytes, so a tree signed here
         # and a tree signed by hand on a deploy box go through the same script.
+        #
+        # Executable bit restored first, because the archive does not carry one:
+        # `mkArchive` copies the tree with `--no-preserve=mode` (nix/windows.nix), which
+        # is right — a Windows tree has no use for a unix mode, and dropping it is part of
+        # what makes the zip reproducible. The consequence only bites here, where CI is
+        # the one party that runs a file out of that tree, and it bit late: every release
+        # before the certificate existed skipped this whole block, so the first release
+        # that actually signed was the first to execute a 0644 file and die on it (#348).
+        chmod +x "$root/vmp-sign.sh"
         "$root/vmp-sign.sh" "$browser"
         # The credential-free half, which its own comments say was built for CI. Point 3
         # of #344: assert, do not assume. A release whose .sig files are missing plays
