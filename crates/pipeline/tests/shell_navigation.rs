@@ -144,6 +144,57 @@ fn a_refreshing_picker_stays_one_step_from_home() {
 }
 
 #[test]
+fn a_tagged_refresh_lands_only_while_its_own_screen_is_still_on_top() {
+    // The case a plain `ReplaceScreen` gets wrong: a producer that keeps talking for
+    // minutes — an update downloading itself (#360) — while `back` is answered here and
+    // never reaches the app. Without the tag, the person who walked back to the settings
+    // menu watches it be overwritten by somebody else's progress line.
+    let (tx, mut render) = loop_with_home();
+    render.shell_push(Screen::Picker(Box::new(
+        pipeline::picker::Picker::loading("Check for updates", "Checking…").with_tag("update"),
+    )));
+    assert_eq!(render.shell_tag(), Some("update"));
+
+    let refresh = |text: &str| RenderCommand::ReplaceScreenTagged {
+        screen: Box::new(Screen::Picker(Box::new(
+            pipeline::picker::Picker::loading("Check for updates", text).with_tag("update"),
+        ))),
+        tag: "update".to_string(),
+    };
+
+    tx.send(refresh("46% — 108 of 236 MB"));
+    render.pump();
+    assert_eq!(
+        render.shell_depth(),
+        2,
+        "a tagged refresh is still one step"
+    );
+    assert_eq!(render.shell_tag(), Some("update"));
+
+    // The person goes back to the settings menu. The download does not stop — nothing
+    // here can stop it — but what it says stops landing.
+    render.shell_back();
+    render.shell_push(Screen::Picker(Box::new(pipeline::picker::Picker::loading(
+        "Settings", "",
+    ))));
+    assert_eq!(render.shell_tag(), None);
+    tx.send(refresh("83% — 196 of 236 MB"));
+    render.pump();
+    assert_eq!(
+        render.shell_tag(),
+        None,
+        "a stale refresh painted over the screen the person had moved to"
+    );
+
+    // And all the way Home, where an unconditional replace would have *pushed* a picker
+    // over the idle screen rather than replacing anything.
+    render.shell_home();
+    tx.send(refresh("done"));
+    render.pump();
+    assert_eq!(render.shell_depth(), 1, "a stale refresh left Home");
+}
+
+#[test]
 fn the_shell_does_not_answer_where_a_cast_is_covering_it() {
     // The shell draws at the bottom of the stack. A press on a video belongs to the
     // video, and a tile invisible underneath it must not eat the touch — the same rule

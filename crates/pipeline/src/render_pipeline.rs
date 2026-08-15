@@ -168,6 +168,20 @@ pub enum RenderCommand {
     /// Replace the screen on top, or push if at Home. What a picker's own refreshes use,
     /// so `back` stays one step regardless of how many times the list updated.
     ReplaceScreen(Box<crate::shell::Screen>),
+    /// Replace the screen on top **only if it is still the one this update is about**.
+    ///
+    /// [`Self::ReplaceScreen`] is right for a refresh that follows its own press by a
+    /// round trip. It is wrong for a producer that keeps talking for minutes — an update
+    /// downloading itself (#360) — because `back` is answered here and never reaches
+    /// `app`, so the sender cannot know the person walked off, and an unconditional
+    /// replace would paint progress over the settings menu or over Home. The tag makes
+    /// the stack answer that question instead of the sender guessing at it.
+    ReplaceScreenTagged {
+        /// The screen to put up.
+        screen: Box<crate::shell::Screen>,
+        /// The tag the screen on top must carry for this to land.
+        tag: String,
+    },
     /// Go back one shell screen.
     ShellBack,
     /// Put the panel back to its resting arrangement: the shell at Home, and the glass
@@ -3538,6 +3552,14 @@ impl RenderLoop {
                 }
                 false
             }
+            RenderCommand::ReplaceScreenTagged { screen, tag } => {
+                if self.shell_tag().is_some_and(|on_top| on_top == tag) {
+                    self.panel.replace_top(*screen);
+                    self.repaint_shell();
+                    self.reflow_surfaces();
+                }
+                false
+            }
             RenderCommand::ShellBack => {
                 self.shell_back();
                 false
@@ -3842,6 +3864,13 @@ impl RenderLoop {
     #[must_use]
     pub fn shell_depth(&self) -> usize {
         self.panel.depth()
+    }
+
+    /// What the screen on top says it is, if anything — the same answer
+    /// [`RenderCommand::ReplaceScreenTagged`] gates on. For tests and logs.
+    #[must_use]
+    pub fn shell_tag(&self) -> Option<&str> {
+        self.panel.stack().and_then(|stack| stack.current().tag())
     }
 
     /// What a panel-normalized touch would hit on the current shell screen.

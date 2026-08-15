@@ -97,6 +97,14 @@ pub struct Picker {
     /// the same reason every other screen carries a model and lets the render thread
     /// decide what it measures.
     pub scroll: f32,
+    /// Who this screen belongs to, for updates that arrive long after the press.
+    ///
+    /// Nothing renders it. It exists because `back` is answered render-side and never
+    /// reaches `app`, so a slow producer — an update downloading for four minutes (#360)
+    /// — has no way to know the person walked off. Tagging the screen lets
+    /// [`crate::render_pipeline::RenderCommand::ReplaceScreenTagged`] ask *the stack*
+    /// whether this is still the screen on top, rather than having the sender guess.
+    pub tag: Option<String>,
 }
 
 impl Picker {
@@ -109,6 +117,7 @@ impl Picker {
             items: Vec::new(),
             status: PickerStatus::Busy(message.into()),
             scroll: 0.0,
+            tag: None,
         }
     }
 
@@ -116,6 +125,13 @@ impl Picker {
     #[must_use]
     pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
         self.subtitle = Some(subtitle.into());
+        self
+    }
+
+    /// Builder-style owner tag — see [`Self::tag`].
+    #[must_use]
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
         self
     }
 
@@ -154,6 +170,15 @@ impl Picker {
     #[must_use]
     pub fn failed(mut self, why: impl Into<String>) -> Self {
         self.status = PickerStatus::Failed(why.into());
+        self
+    }
+
+    /// Mark it busy again, with what to say while it is. The other half of
+    /// [`Self::failed`], for a screen whose *later* states are waits too — a download
+    /// reporting its way to 100% is not "loading", it is loading over and over.
+    #[must_use]
+    pub fn busy(mut self, message: impl Into<String>) -> Self {
+        self.status = PickerStatus::Busy(message.into());
         self
     }
 }

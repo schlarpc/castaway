@@ -42,6 +42,16 @@ impl Screen {
             Self::Picker(_) => "picker",
         }
     }
+
+    /// Who owns this screen, for an update that arrives long after the press that opened
+    /// it. Only a picker can carry one — see [`crate::picker::Picker::tag`].
+    #[must_use]
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            Self::Home(_) | Self::Service(_) => None,
+            Self::Picker(p) => p.tag.as_deref(),
+        }
+    }
 }
 
 /// What a press on a shell screen means.
