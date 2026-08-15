@@ -292,6 +292,23 @@ let
       args = crossArgs // { inherit cargoExtraArgs; };
       pkg = craneLib.buildPackage (args // {
         inherit pname;
+
+        # `fixupPhase` strips every PE under `$out/bin`, and `stageBrowser` runs in
+        # `postInstall` — *before* fixup — so the castLabs ECS distribution was being
+        # stripped along with our own binaries. That rewrites `electron.exe` and every
+        # DLL beside it, which silently falsifies the one property the browser tree has
+        # to have: `stageBrowser`'s "the whole ECS distribution, unmodified" and
+        # docs/cross-build.md's "byte-for-byte as castLabs shipped it" were both untrue
+        # in the artifact that shipped. The symptom was EVS refusing to VMP-sign it —
+        # `ValidityError: Binary signature denied`, because a stripped binary is not a
+        # build castLabs recognises — and before the certificate existed nothing ever ran
+        # the signing step, so nothing noticed (#348).
+        #
+        # Blanket rather than surgical because `stripDirs` has no exclude, and because
+        # stripping buys nothing here anyway: these are MSVC-linked PEs whose debug info
+        # lives in separate PDBs that the artifact does not carry.
+        dontStrip = true;
+
         cargoArtifacts =
           if features == [ ] then
             crossBaseArtifacts
