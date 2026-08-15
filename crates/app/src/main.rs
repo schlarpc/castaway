@@ -546,6 +546,10 @@ fn main() -> anyhow::Result<()> {
                     shim_wake.wake();
                 })
             }),
+            #[cfg(all(feature = "electron", feature = "audio"))]
+            panel_audio: Some(Arc::clone(&mixer) as Arc<dyn crate::sponsorblock::PanelAudio>),
+            #[cfg(all(feature = "electron", not(feature = "audio")))]
+            panel_audio: None,
             shell: Some(ShellChannels {
                 events: shell_event_rx,
                 render: render_tx.clone(),
@@ -976,6 +980,14 @@ struct PipelineHandles {
     /// Absent in a build with no browser, where there is nothing to arm.
     #[cfg(feature = "electron")]
     cast_platform_shim: Option<Arc<dyn Fn(Option<u16>) + Send + Sync>>,
+    /// What the panel's speakers have been given, for the idle watchdog to check the
+    /// Lounge's word against (#362).
+    ///
+    /// The mixer itself, handed over as the narrow question the watchdog actually asks.
+    /// It travels with the pipeline handles because it is the same kind of thing: taken
+    /// out here, before the pipeline is moved into the session manager.
+    #[cfg(feature = "electron")]
+    panel_audio: Option<Arc<dyn crate::sponsorblock::PanelAudio>>,
 }
 
 /// The shell's two ends, as seen from the service side.
@@ -1046,6 +1058,8 @@ async fn serve(
         shell,
         #[cfg(feature = "electron")]
         cast_platform_shim,
+        #[cfg(feature = "electron")]
+        panel_audio,
     } = handles;
     let (iface, iface_source) = config.resolved_interface_with_source();
     info!(
@@ -1181,21 +1195,38 @@ async fn serve(
                 // anything, and the panel takes itself back. Wired as a DIAL stop so
                 // the whole exit path is the one a phone's stop already takes — the
                 // page hides, the app state reads stopped, the screen slot clears.
+                //
+                // Armed only where the panel's own audio can be read, because the Lounge
+                // alone cannot carry this decision: a channel that binds and then says
+                // nothing is indistinguishable from an empty screen, and acting on that
+                // ended a session that was three minutes into a music mix (#362). With no
+                // witness to check the Lounge against, the watchdog is not run at all —
+                // a panel left on a splash is a worse outcome than a panel that hangs up
+                // on someone watching it.
                 let idle_dial = dial.clone();
                 let idle_tx = dial_tx.clone();
-                let on_idle: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    let dial = idle_dial.clone();
-                    let tx = idle_tx.clone();
-                    tokio::spawn(async move {
-                        dial.abandoned().await;
-                        let _ = tx.send(proto_dial::DialEvent::Stopped).await;
-                    });
+                let watch = panel_audio.clone().map(|audio| sponsorblock::IdleWatch {
+                    audio,
+                    on_idle: Arc::new(move || {
+                        let dial = idle_dial.clone();
+                        let tx = idle_tx.clone();
+                        tokio::spawn(async move {
+                            dial.abandoned().await;
+                            let _ = tx.send(proto_dial::DialEvent::Stopped).await;
+                        });
+                    }),
                 });
+                if watch.is_none() {
+                    warn!(
+                        "SponsorBlock: no audio path to check the Lounge against, so the \
+                         idle watchdog stays off; the panel will not take itself back (#362)"
+                    );
+                }
                 tokio::spawn(sponsorblock::run(
                     config.sponsorblock.clone(),
                     screen.clone(),
                     osd.clone(),
-                    Some(on_idle),
+                    watch,
                 ));
             }
             // A page that crashed past recovery is not running, whatever DIAL last said.

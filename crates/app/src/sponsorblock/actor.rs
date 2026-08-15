@@ -26,7 +26,9 @@ use sponsorblock::{Decision, Planner, Segment, VideoId};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::{ad_update, playback_update, PlaybackClock};
+use super::{
+    ad_update, playback_update, IdleClock, IdleVerdict, IdleWatch, PlaybackClock, IDLE_EXIT,
+};
 use crate::config::SponsorBlock as SponsorBlockConfig;
 
 const LOUNGE: &str = "https://www.youtube.com/api/lounge";
@@ -34,23 +36,13 @@ const LOUNGE: &str = "https://www.youtube.com/api/lounge";
 /// video someone actually wants to watch.
 const TOAST: Duration = Duration::from_secs(3);
 
-/// How long the screen may sit with no video before the panel takes itself back.
-///
-/// "Ready to cast" with an empty queue is nobody watching anything. The clock is on the
-/// *video-less* state, not on channel silence: browsing the leanback UI by remote
-/// generates plenty of traffic and none of it resets this, so three minutes is the budget
-/// for picking something to watch, not for idling. Only a `nowPlaying` that names a video
-/// clears it. A *paused* video never counts as idle — the screen still has a video, and
-/// someone means to come back.
-const IDLE_EXIT: Duration = Duration::from_secs(180);
-
 /// Run the actor until the process ends. Never returns an error to its caller: a receiver
 /// that cannot reach SponsorBlock is a receiver that plays sponsors, not a broken one.
 pub async fn run(
     config: SponsorBlockConfig,
     screen: ScreenSlot,
     osd: OsdSink,
-    on_idle: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    watch: Option<IdleWatch>,
 ) {
     info!(
         categories = ?config.categories,
@@ -76,7 +68,7 @@ pub async fn run(
     // When the screen last became video-less, carried *across* channel re-attaches: the
     // long-poll EOFs and rebinds every couple of minutes as a matter of course, and an
     // idle clock that restarted with the channel would never reach its deadline.
-    let mut idle_since: Option<tokio::time::Instant> = None;
+    let mut idle = IdleClock::default();
     loop {
         match session(
             &config,
@@ -84,8 +76,8 @@ pub async fn run(
             &osd,
             &identity,
             &mut planner,
-            on_idle.as_deref(),
-            &mut idle_since,
+            watch.as_ref(),
+            &mut idle,
         )
         .await
         {
@@ -97,6 +89,14 @@ pub async fn run(
     }
 }
 
+/// The panel's audio counter, or zero where there is no watchdog to read it.
+///
+/// Zero is safe precisely because the two travel together: with no [`IdleWatch`] the
+/// deadline arm is disabled, so the number is never compared against anything.
+fn frames_written(watch: Option<&IdleWatch>) -> u64 {
+    watch.map_or(0, |watch| watch.audio.frames_written())
+}
+
 /// One attach-and-watch cycle: wait for a screen, bind to it, and follow it until the
 /// channel closes.
 async fn session(
@@ -105,8 +105,8 @@ async fn session(
     osd: &OsdSink,
     identity: &SenderIdentity,
     planner: &mut Planner,
-    on_idle: Option<&(dyn Fn() + Send + Sync)>,
-    idle_since: &mut Option<tokio::time::Instant>,
+    watch: Option<&IdleWatch>,
+    idle: &mut IdleClock,
 ) -> anyhow::Result<()> {
     let screen_id = wait_for_screen(screen).await;
     let token = lounge_token(&screen_id).await?;
@@ -130,12 +130,12 @@ async fn session(
     // Option<Sleep> in the select below.
     let mut due = Duration::from_secs(3600);
     // A screen that just appeared with nothing on it starts its idle clock now — the
-    // launch splash counts. `get_or_insert` and not `=`: a re-attach mid-idle must not
-    // grant the splash another three minutes.
-    idle_since.get_or_insert_with(tokio::time::Instant::now);
+    // launch splash counts. `arm` and not a reset: a re-attach mid-idle must not grant
+    // the splash another three minutes.
+    idle.arm(tokio::time::Instant::now(), frames_written(watch));
 
     loop {
-        let idle_deadline = idle_since.map(|since| since + IDLE_EXIT);
+        let idle_deadline = idle.deadline();
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()) };
@@ -151,9 +151,9 @@ async fn session(
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|id| !id.is_empty());
                     if has_video {
-                        *idle_since = None;
+                        idle.clear();
                     } else {
-                        idle_since.get_or_insert_with(tokio::time::Instant::now);
+                        idle.arm(tokio::time::Instant::now(), frames_written(watch));
                     }
                 }
                 sender.observe(&command);
@@ -194,17 +194,32 @@ async fn session(
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
-            }, if on_idle.is_some() => {
-                info!(
-                    idle = ?IDLE_EXIT,
-                    "YouTube screen has no video and nobody is driving it; \
-                     returning the panel to the home screen"
-                );
-                *idle_since = None;
-                if let Some(idle) = on_idle {
-                    idle();
+            }, if watch.is_some() => {
+                // The Lounge has said nothing about a video for a whole window. Before
+                // acting on that, ask the panel — the Lounge going quiet under playing
+                // media looks identical from here, and used to end the session (#362).
+                match idle.expired(tokio::time::Instant::now(), frames_written(watch)) {
+                    IdleVerdict::StillPlaying { frames } => {
+                        warn!(
+                            idle = ?IDLE_EXIT,
+                            frames,
+                            "the Lounge named no video for a whole idle window, but the \
+                             panel played audio throughout it; staying up. The channel is \
+                             attached and silent — see #362"
+                        );
+                    }
+                    IdleVerdict::ReturnHome => {
+                        info!(
+                            idle = ?IDLE_EXIT,
+                            "YouTube screen has no video and nobody is driving it; \
+                             returning the panel to the home screen"
+                        );
+                        if let Some(watch) = watch {
+                            (watch.on_idle)();
+                        }
+                        return Ok(());
+                    }
                 }
-                return Ok(());
             }
         }
 
@@ -360,9 +375,31 @@ fn stream_channel(query: &str, out: &mpsc::Sender<LoungeCommand>) {
     // its name is enough to trigger it, via the device list in `loungeStatus`.
     let mut buffered: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 8192];
+    // Counted so the exit line below can say whether this channel ever carried anything.
+    // A bind that succeeds and then delivers nothing is the shape #362 took, and it was
+    // indistinguishable in the log from a channel doing its job quietly.
+    let mut delivered = 0_u64;
     loop {
         let read = match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+            // EOF is routine — BrowserChannel long-polls and hangs up as a matter of
+            // course, and `run` re-attaches. An error is not, and both used to return
+            // here in silence, which is why a dead channel could not be told from a quiet
+            // one. Every other exit from this function says why it left; these now do too.
+            Ok(0) => {
+                debug!(
+                    delivered,
+                    "SponsorBlock receive channel reached EOF; will re-attach"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    delivered,
+                    "SponsorBlock receive channel failed; will re-attach"
+                );
+                return;
+            }
             Ok(n) => n,
         };
         buffered.extend_from_slice(&chunk[..read]);
@@ -397,6 +434,7 @@ fn stream_channel(query: &str, out: &mpsc::Sender<LoungeCommand>) {
         // remains is exactly the incomplete tail.
         buffered.drain(..valid_to);
         for command in commands {
+            delivered += 1;
             if out.blocking_send(command).is_err() {
                 return;
             }

@@ -145,6 +145,122 @@ impl PlaybackClock {
     }
 }
 
+/// How long the screen may sit with no video before the panel takes itself back.
+///
+/// "Ready to cast" with an empty queue is nobody watching anything. The clock is on the
+/// *video-less* state, not on channel silence: browsing the leanback UI by remote
+/// generates plenty of traffic and none of it resets this, so three minutes is the budget
+/// for picking something to watch, not for idling. Only a `nowPlaying` that names a video
+/// clears it. A *paused* video never counts as idle — the screen still has a video, and
+/// someone means to come back.
+const IDLE_EXIT: Duration = Duration::from_secs(180);
+
+/// The panel's own answer to "is sound coming out of it right now".
+///
+/// The second witness [`IdleClock`] needs, and the reason it needs one: the Lounge is
+/// otherwise the *only* thing that can clear the idle clock, and a Lounge that goes quiet
+/// under playing media is indistinguishable from an empty screen. That is not
+/// hypothetical — a three-minute music mix at −4.7 dBFS was returned to the home screen
+/// mid-song, with the mixer reporting 100% of frames written and zero starvation
+/// throughout (#362).
+///
+/// Audio, specifically, because it is the one signal that tells the two states apart. The
+/// paint counters do not: the "Ready to cast" splash animates, so frames keep arriving for
+/// a screen nobody is watching. The splash is *silent*, and a video is not.
+pub trait PanelAudio: Send + Sync {
+    /// Frames handed to the mixer over the life of the process. Monotonic.
+    fn frames_written(&self) -> u64;
+}
+
+impl PanelAudio for pipeline::mixer::AudioMixer {
+    fn frames_written(&self) -> u64 {
+        self.counters().written
+    }
+}
+
+/// The idle watchdog, as the two halves that only mean anything together: what it would
+/// do, and what it checks before doing it.
+///
+/// One struct rather than two arguments because a half-armed watchdog is precisely the
+/// defect (#362) — an exit callback with no second witness acts on the Lounge's silence
+/// alone, which is what hung up on a playing session. A build with no audio path can
+/// therefore express "no watchdog", and cannot express "a watchdog that cannot check".
+pub struct IdleWatch {
+    /// What the panel's speakers have been given.
+    pub audio: std::sync::Arc<dyn PanelAudio>,
+    /// Hand the panel back to the home screen.
+    pub on_idle: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+/// What the idle deadline expiring turned out to mean.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleVerdict {
+    /// Video-less and silent for the whole window: hand the panel back.
+    ReturnHome,
+    /// The panel was making sound the entire time the Lounge implied it was empty. The
+    /// clock has been re-armed; `frames` is what the window measured.
+    StillPlaying { frames: u64 },
+}
+
+/// The watchdog behind the idle exit: when the screen last became video-less, and what the
+/// panel's audio had done by then.
+///
+/// Pure, and holding the audio sample rather than reading it, so the whole decision is
+/// `(now, frames) -> verdict` and the shipped [`IDLE_EXIT`] is assertable in virtual time
+/// instead of waited out (rule 6, #236).
+#[derive(Debug, Default)]
+struct IdleClock {
+    armed: Option<Armed>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Armed {
+    since: tokio::time::Instant,
+    /// [`PanelAudio::frames_written`] as of [`Armed::since`], so the verdict compares a
+    /// window rather than a level.
+    frames: u64,
+}
+
+impl IdleClock {
+    /// Start the clock, if it is not already running.
+    ///
+    /// Deliberately not a reset: a screen that reports itself video-less over and over —
+    /// and a channel that re-attaches mid-idle — must not each grant another three
+    /// minutes, or the deadline is never reached.
+    fn arm(&mut self, now: tokio::time::Instant, frames: u64) {
+        self.armed.get_or_insert(Armed { since: now, frames });
+    }
+
+    /// Stop the clock: there is a video on screen.
+    fn clear(&mut self) {
+        self.armed = None;
+    }
+
+    /// When the panel should be handed back, if the clock is running.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.armed.map(|armed| armed.since + IDLE_EXIT)
+    }
+
+    /// The deadline has arrived. Ask the panel whether it agrees that nothing is playing.
+    ///
+    /// A window in which the mixer was handed audio is a window somebody was listening to
+    /// something, whatever the Lounge did or did not say. That re-arms rather than clears:
+    /// re-arming is bounded and self-correcting — the watchdog asks again one window later
+    /// and fires the first time the panel really does fall silent — where clearing would
+    /// hand the decision back to the same witness that just failed to make it.
+    fn expired(&mut self, now: tokio::time::Instant, frames: u64) -> IdleVerdict {
+        let played = self
+            .armed
+            .map_or(0, |armed| frames.saturating_sub(armed.frames));
+        if played > 0 {
+            self.armed = Some(Armed { since: now, frames });
+            return IdleVerdict::StillPlaying { frames: played };
+        }
+        self.armed = None;
+        IdleVerdict::ReturnHome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -285,6 +401,92 @@ mod tests {
         assert_eq!(
             clock.position_at(t0 + Duration::from_millis(1_500)),
             Duration::from_millis(11_500)
+        );
+    }
+
+    /// Frames of stereo audio at 48 kHz, so the counts below read as durations.
+    fn seconds_of_audio(seconds: u64) -> u64 {
+        seconds * 48_000
+    }
+
+    #[test]
+    fn a_silent_window_returns_the_panel() {
+        let t0 = tokio::time::Instant::now();
+        let mut clock = IdleClock::default();
+        clock.arm(t0, 0);
+        assert_eq!(clock.deadline(), Some(t0 + IDLE_EXIT));
+        // The shipped constant, asserted rather than waited out (#236).
+        assert_eq!(clock.expired(t0 + IDLE_EXIT, 0), IdleVerdict::ReturnHome);
+        assert_eq!(clock.deadline(), None, "a fired clock stops");
+    }
+
+    #[test]
+    fn a_window_the_panel_played_through_does_not_return_it() {
+        // #362 exactly: the Lounge said nothing for the whole window — so nothing cleared
+        // the clock — while the mixer was handed three minutes of audio. The old watchdog
+        // had only the Lounge to ask and hung up on a playing session.
+        let t0 = tokio::time::Instant::now();
+        let mut clock = IdleClock::default();
+        clock.arm(t0, seconds_of_audio(10));
+        let played = seconds_of_audio(190);
+        assert_eq!(
+            clock.expired(t0 + IDLE_EXIT, played),
+            IdleVerdict::StillPlaying {
+                frames: seconds_of_audio(180)
+            }
+        );
+        assert_eq!(
+            clock.deadline(),
+            Some(t0 + IDLE_EXIT + IDLE_EXIT),
+            "a vetoed exit re-arms from the veto, so the watchdog asks again"
+        );
+    }
+
+    #[test]
+    fn the_window_after_the_music_stops_still_returns_the_panel() {
+        // The veto is bounded: it buys one more window, not immunity. Without this the
+        // fix for #362 would be a panel that never goes home once anything has played.
+        let t0 = tokio::time::Instant::now();
+        let mut clock = IdleClock::default();
+        clock.arm(t0, 0);
+        let played = seconds_of_audio(180);
+        assert!(matches!(
+            clock.expired(t0 + IDLE_EXIT, played),
+            IdleVerdict::StillPlaying { .. }
+        ));
+        // The music ends the moment the veto re-arms; the next window is silent.
+        assert_eq!(
+            clock.expired(t0 + IDLE_EXIT + IDLE_EXIT, played),
+            IdleVerdict::ReturnHome
+        );
+    }
+
+    #[test]
+    fn re_arming_mid_idle_does_not_grant_another_window() {
+        // The screen reports itself video-less repeatedly, and the channel re-attaches
+        // every couple of minutes as a matter of course. Either one resetting the clock
+        // means the deadline is never reached.
+        let t0 = tokio::time::Instant::now();
+        let mut clock = IdleClock::default();
+        clock.arm(t0, 0);
+        clock.arm(t0 + Duration::from_secs(60), 0);
+        clock.arm(t0 + Duration::from_secs(120), 0);
+        assert_eq!(clock.deadline(), Some(t0 + IDLE_EXIT));
+    }
+
+    #[test]
+    fn a_video_on_screen_stops_the_clock() {
+        let t0 = tokio::time::Instant::now();
+        let mut clock = IdleClock::default();
+        clock.arm(t0, 0);
+        clock.clear();
+        assert_eq!(clock.deadline(), None);
+        // And the next video-less report starts a fresh window rather than resuming the
+        // old one.
+        clock.arm(t0 + Duration::from_secs(60), 0);
+        assert_eq!(
+            clock.deadline(),
+            Some(t0 + Duration::from_secs(60) + IDLE_EXIT)
         );
     }
 }
