@@ -309,6 +309,14 @@ needs flattening into ours:
 - `bin/browser/` — the ECS win32 distribution, **byte-for-byte as castLabs shipped it**. EVS
   signs these exact files; a modified tree invalidates the VMP signature, and an unsigned
   Widevine host is refused licences by exactly the services it exists to host.
+
+  This was a claim rather than a fact until 2026-08-15. `stageBrowser` runs in
+  `postInstall`, which is *before* `fixupPhase`, and fixup strips every PE under
+  `$out/bin` — so every binary in this directory was being stripped on the way out, and
+  every release shipped a modified ECS tree. Nothing caught it because nothing ran the
+  signing step until the EVS account existed, and then EVS answered the first real attempt
+  with `ValidityError: Binary signature denied`. `dontStrip = true` on the receiver's
+  derivation is what makes the sentence above true; #348 has the measurement.
 - `bin/browser-host/` — our Electron host app, launched from the receiver.
 - `bin/WidevineCdm/` — staged for the receiver to copy into the browser profile on first run,
   not loaded from here: ECS resolves its CDM under `<userDataDir>/WidevineCdm/<version>/`, a
