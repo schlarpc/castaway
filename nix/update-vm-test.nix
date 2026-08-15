@@ -13,6 +13,16 @@
 # handshake exit, the launcher restarting into the new tree, the health marker, and the
 # version GC keeping the rollback target.
 #
+# **What this does not cover, second: the manual check (#360).** Its only trigger is a
+# press on the settings screen, and this VM has no glass — the agent's `Handle` is held by
+# a `Setting` that only exists in a rendering build, and nothing reaches it from a shell.
+# Adding a back door so the VM could pull it would be testing the back door. So the manual
+# path is covered where it is genuinely reachable instead: `castaway_update::policy` for
+# what a manual request skips, and `castaway_update::agent`'s tests for the command
+# channel — against a fake release API serving the *real* attested manifest, so the
+# offer, the up-to-date answer, the already-staged answer, the `hold` refusal and the
+# serialisation of a request arriving mid-look all run the whole trust path.
+#
 # Two builds, not one, and that is what makes the ordering real: the running receiver is
 # stamped build 100 and the staged one 101, so `Offer::Newer` is a fact about the binaries
 # rather than something the test asserted into existence.

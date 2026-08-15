@@ -62,7 +62,7 @@ ureq.workspace = true
 # `default-features = false` and deflate only: the full default set drags bzip2, lzma and
 # zstd — three C libraries — into a cross-build that has no need of any of them.
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
-tokio = { workspace = true, features = ["rt", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "time", "macros", "rt-multi-thread"] }

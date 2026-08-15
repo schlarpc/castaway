@@ -238,6 +238,21 @@ pub enum Phase {
     Staged,
 }
 
+/// Who is asking.
+///
+/// The whole schedule below exists to guess at one question — *is there a person using
+/// this panel?* — and a manual request is that question already answered, out loud, by
+/// somebody standing in front of it (#360). So a manual request skips the window and
+/// skips the idle gate, and skips nothing else: the trust path is not a schedule and has
+/// no business knowing this type exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// The nightly loop, on its own timer, with nobody watching.
+    Scheduled,
+    /// Somebody pressed "Check for updates" and is standing there.
+    Manual,
+}
+
 /// What the panel looks like right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Observation {
@@ -250,6 +265,8 @@ pub struct Observation {
     pub casting: bool,
     /// How long since anybody touched the panel.
     pub idle_for: Duration,
+    /// Whose turn this is.
+    pub request: Request,
 }
 
 /// What to do about it.
@@ -266,6 +283,20 @@ pub enum Action {
 /// Decide.
 #[must_use]
 pub fn decide(policy: &Policy, obs: &Observation) -> Action {
+    // A person is standing at the panel, so there is nothing left to wait for: the window
+    // and the idle gate are both proxies for "is anyone here?", and the press answered
+    // that. Everything else — a `hold` file, the attestation, the build ordering, the
+    // digest — is outside this function and stays exactly where it was.
+    if obs.request == Request::Manual {
+        return match obs.phase {
+            // Already downloaded, verified and named: the only thing left is the restart.
+            Phase::Staged => Action::Activate,
+            // Including `UpToDate`: "I looked at 03:30 and there was nothing" is not an
+            // answer to somebody asking at noon, which is usually the moment just after
+            // they pushed a release.
+            Phase::Fresh | Phase::UpToDate => Action::Check,
+        };
+    }
     if !policy.window.contains(obs.at) {
         return Action::Wait(policy.window.until_open(obs.at));
     }
@@ -304,7 +335,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        decide, Action, MinuteOfDay, Observation, Phase, Policy, PolicyError, Window,
+        decide, Action, MinuteOfDay, Observation, Phase, Policy, PolicyError, Request, Window,
         DEFAULT_IDLE_AFTER,
     };
 
@@ -318,6 +349,7 @@ mod tests {
             phase,
             casting: true,
             idle_for: Duration::ZERO,
+            request: Request::Scheduled,
         }
     }
 
@@ -327,6 +359,7 @@ mod tests {
             phase,
             casting: false,
             idle_for: DEFAULT_IDLE_AFTER,
+            request: Request::Scheduled,
         }
     }
 
@@ -447,6 +480,74 @@ mod tests {
         // window is the promise; keeping it when it is inconvenient is what makes it one.
         let action = decide(&policy, &quiet(at(5, 1), Phase::Staged));
         assert!(matches!(action, Action::Wait(d) if d > Duration::from_secs(20 * 60 * 60)));
+    }
+
+    /// The same observation, asked for by a person rather than by the clock.
+    fn by_hand(obs: Observation) -> Observation {
+        Observation {
+            request: Request::Manual,
+            ..obs
+        }
+    }
+
+    #[test]
+    fn a_manual_request_never_waits_for_the_window() {
+        let policy = Policy::default();
+        // Two in the afternoon, which is as far from 03:30–05:00 as the day gets. The
+        // scheduled answer is nine and a half hours of sleep; the manual one is "look
+        // now", because the person asking has just pushed a release.
+        let afternoon = quiet(at(14, 0), Phase::Fresh);
+        assert!(matches!(decide(&policy, &afternoon), Action::Wait(_)));
+        assert_eq!(decide(&policy, &by_hand(afternoon)), Action::Check);
+    }
+
+    #[test]
+    fn a_manual_request_looks_again_even_though_tonight_already_concluded() {
+        let policy = Policy::default();
+        // The nightly loop looked at 03:30, found nothing, and is asleep until the window
+        // shuts. A press at 03:45 is a *new* question and gets a new look.
+        let settled = quiet(at(3, 45), Phase::UpToDate);
+        assert!(matches!(decide(&policy, &settled), Action::Wait(_)));
+        assert_eq!(decide(&policy, &by_hand(settled)), Action::Check);
+    }
+
+    #[test]
+    fn a_manual_restart_skips_the_idle_gate_because_the_person_is_the_idle_gate() {
+        let policy = Policy::default();
+        // Inside the window, so the idle gate is the *only* thing refusing: casting, and
+        // the glass touched a second ago. The press overrides it — it is somebody saying
+        // "yes, interrupt this", which is the one thing the idle gate is guessing at.
+        let busy = Observation {
+            casting: true,
+            idle_for: Duration::ZERO,
+            ..quiet(at(4, 0), Phase::Staged)
+        };
+        assert_eq!(decide(&policy, &busy), Action::Wait(policy.recheck));
+        assert_eq!(decide(&policy, &by_hand(busy)), Action::Activate);
+    }
+
+    #[test]
+    fn a_manual_request_is_the_only_one_that_is_never_told_to_wait() {
+        let policy = Policy::default();
+        // Every combination that exists, so a phase added later cannot quietly acquire a
+        // manual answer of "wait" — which on the glass is a screen that says nothing.
+        for phase in [Phase::Fresh, Phase::UpToDate, Phase::Staged] {
+            for casting in [false, true] {
+                for hour in [0, 4, 14, 23] {
+                    let obs = Observation {
+                        at: at(hour, 0),
+                        phase,
+                        casting,
+                        idle_for: Duration::ZERO,
+                        request: Request::Manual,
+                    };
+                    assert!(
+                        !matches!(decide(&policy, &obs), Action::Wait(_)),
+                        "a manual request was told to wait: {obs:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

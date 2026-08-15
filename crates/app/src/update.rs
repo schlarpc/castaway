@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use castaway_core::CastingHandle;
-use castaway_update::agent::{Agent, PanelActivity, StandDown};
+use castaway_update::agent::{Agent, Inbox, PanelActivity, StandDown};
 use castaway_update::manifest::InstalledBuild;
 use tracing::{info, warn};
 
@@ -90,6 +90,18 @@ fn last_input_idle() -> Duration {
     Duration::MAX
 }
 
+/// The three things it takes to put this receiver down so the launcher can bring the next
+/// one up. One struct because they are one act — a handover that fired only two of them
+/// leaves a process that will not leave.
+pub struct Handover {
+    /// The same shutdown ctrl-c takes: senders are told and the service layer unwinds.
+    pub shutdown: crate::shutdown::Shutdown,
+    /// The flag the kiosk loop reads to know it should stop.
+    pub kiosk_exit: Arc<std::sync::atomic::AtomicBool>,
+    /// What wakes that loop so it notices.
+    pub kiosk_wake: castaway_core::Waker,
+}
+
 /// Arm the updater, or say why not.
 ///
 /// Returns the shared exit code the process ends on. Zero until an update activates, at
@@ -97,15 +109,23 @@ fn last_input_idle() -> Duration {
 /// it — which is how "restart me into the new version" is said, and the only way it can
 /// be said: spawning a successor directly would put it outside the interactive session
 /// (docs/cross-build.md, session 0).
+/// `inbox` is the agent's end of the settings screen's [`castaway_update::agent::Handle`]
+/// (#360). It is passed in rather than made here because the settings catalog needs the
+/// other end whether or not there turns out to be an agent behind it — a stand-down is
+/// something the screen has to be able to *say*, not a row that quietly does nothing.
 pub fn spawn(
     runtime: &tokio::runtime::Runtime,
     config: &UpdateConfig,
     casting: CastingHandle,
     utc_offset_secs: i32,
-    shutdown: crate::shutdown::Shutdown,
-    kiosk_exit: Arc<std::sync::atomic::AtomicBool>,
-    kiosk_wake: castaway_core::Waker,
+    handover: Handover,
+    inbox: Inbox,
 ) -> Arc<AtomicI32> {
+    let Handover {
+        shutdown,
+        kiosk_exit,
+        kiosk_wake,
+    } = handover;
     let exit_code = Arc::new(AtomicI32::new(0));
 
     let policy = match config.policy() {
@@ -115,11 +135,17 @@ pub fn spawn(
             // operator who wrote a window meant something by it, and updating at an hour
             // nobody chose is exactly the surprise this whole feature is trying to avoid.
             warn!(error = %e, "auto-update: the configured window is not a schedule; disarmed");
+            // Not even a manual check: every path through the agent goes on to consult
+            // this schedule, and there isn't one.
+            inbox.stand_down(&StandDown::Disabled);
             return exit_code;
         }
     };
 
     let installed = installed_build();
+    // `config.enable` arms the *nightly loop*; it is not a refusal to build an agent. A
+    // press on "Check for updates" is a person asking, which is not the receiver updating
+    // itself, and the flag was never a statement about that (#360).
     let agent = Agent::new(
         config.enable,
         policy,
@@ -138,6 +164,10 @@ pub fn spawn(
                 StandDown::TrustAnchors(_) => warn!("auto-update: {reason}"),
                 _ => info!("auto-update: {reason}"),
             }
+            // And the settings screen gets the same sentence, because a row that
+            // disappears on the builds where it cannot work is indistinguishable from one
+            // that is broken.
+            inbox.stand_down(&reason);
             return exit_code;
         }
     };
@@ -157,7 +187,7 @@ pub fn spawn(
 
     let code = Arc::clone(&exit_code);
     runtime.spawn(async move {
-        let activation = agent.run().await;
+        let activation = agent.run(inbox).await;
         info!(
             from = %activation.replacing.short(),
             to = %activation.version.short(),

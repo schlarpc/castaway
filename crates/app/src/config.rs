@@ -852,7 +852,12 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Update {
-    /// Whether to look at all.
+    /// Whether the receiver looks on its own.
+    ///
+    /// `false` stands the *nightly loop* down, not the updater: "Check for updates" in
+    /// Settings still works, and the screen says automatic updates are off (#360). The
+    /// two are different questions — this flag answers "may the panel replace itself
+    /// while nobody is watching", and a press answers "I am here and I am asking".
     pub enable: bool,
     /// The release API root.
     ///

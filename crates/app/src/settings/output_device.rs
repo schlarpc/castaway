@@ -11,7 +11,7 @@ use pipeline::audio_select::{
     active_backend, list_output_devices, OutputBackendKind, OutputSelection, OutputSelector,
 };
 
-use super::{Applied, Choice, ChoiceList, ConfigStore, Setting};
+use super::{Applied, Choice, ChoiceList, Choices, ConfigStore, Drilldown, Setting};
 use crate::config::AudioOutput;
 
 /// The choice id for "follow the system default".
@@ -70,6 +70,12 @@ impl Setting for OutputDeviceSetting {
         }
     }
 
+    fn drilldown(&self) -> Drilldown<'_> {
+        Drilldown::Choices(self)
+    }
+}
+
+impl Choices for OutputDeviceSetting {
     fn choices(&self) -> Result<ChoiceList, String> {
         if let Some(reason) = self.backend.unavailable_reason() {
             return Ok(ChoiceList {

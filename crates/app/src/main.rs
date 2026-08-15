@@ -412,13 +412,24 @@ fn main() -> anyhow::Result<()> {
         let serve_tx = event_tx.clone();
         let serve_shutdown = shutdown.clone();
         let serve_osd = osd.clone();
+        // The updater's control surface, built here rather than beside the agent because
+        // the settings catalog below needs the panel's end of it and the agent does not
+        // exist yet — and because a build that stands down still has to be able to *say*
+        // so on that screen (#360).
+        let (update_handle, update_inbox) = castaway_update::agent::control();
         // What the Settings tile opens. The store points at the same file the config
         // came from, so what the screen saves is what the next boot reads.
-        let settings_catalog =
-            settings::Catalog::new(vec![Arc::new(settings::OutputDeviceSetting::new(
+        let settings_catalog = settings::Catalog::new(vec![
+            Arc::new(settings::OutputDeviceSetting::new(
                 audio_selector.clone(),
                 settings::ConfigStore::at(&location),
-            ))]);
+            )),
+            Arc::new(settings::UpdateCheckSetting::new(
+                update_handle,
+                update::installed_build(),
+                config.update.enable,
+            )),
+        ]);
         // The remote-control transport (#18). Built here because this is where all three
         // of its halves exist at once: the encoder's live fan-out, the input queue the
         // kiosk drains, and the handle that starts the tap.
@@ -681,9 +692,12 @@ fn main() -> anyhow::Result<()> {
             &config.update,
             casting,
             utc_offset_secs,
-            shutdown.clone(),
-            Arc::clone(&kiosk_exit),
-            wake.clone(),
+            update::Handover {
+                shutdown: shutdown.clone(),
+                kiosk_exit: Arc::clone(&kiosk_exit),
+                kiosk_wake: wake.clone(),
+            },
+            update_inbox,
         );
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
@@ -779,9 +793,14 @@ fn main() -> anyhow::Result<()> {
             &config.update,
             casting,
             utc_offset_secs,
-            shutdown.clone(),
-            Arc::clone(&kiosk_exit),
-            castaway_core::Waker::new(),
+            update::Handover {
+                shutdown: shutdown.clone(),
+                kiosk_exit: Arc::clone(&kiosk_exit),
+                kiosk_wake: castaway_core::Waker::new(),
+            },
+            // Headless: no settings screen exists to hold the other end, so the agent
+            // gets a control surface nobody is on the far side of.
+            castaway_update::agent::control().1,
         );
         // Headless: no renderer at all, so certainly no browser to launch YouTube in.
         let on_dial: Option<NoLauncher> = None;

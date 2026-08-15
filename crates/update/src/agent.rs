@@ -15,6 +15,13 @@
 //! The blocking work — HTTP, hashing a quarter of a gigabyte, unzipping it — runs on
 //! `spawn_blocking` rather than on the runtime (ground rule 4). A panel that stutters
 //! while it downloads its own update would be a worse bug than not updating.
+//!
+//! **One thing fetches, verifies, stages and activates, and this is it** (#360). A person
+//! standing at the panel can ask for a check now, through [`Handle`], and what answers is
+//! this same agent on its own loop — a request arriving mid-stage is serialised behind it
+//! rather than racing it for the same `versions/` directory. What a manual request skips
+//! is the *schedule* and nothing else: [`crate::policy::Request::Manual`] passes the
+//! window and the idle gate, and every step of the order of operations above still runs.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -24,11 +31,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use castaway_paths::install::{self, InstallTree, LayoutError, Pointer, VersionId};
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::attestation::{AttestationError, Provenance};
-use crate::manifest::{InstalledBuild, Manifest, Offer, Sha256Digest};
-use crate::policy::{decide, Action, MinuteOfDay, Observation, Phase, Policy};
+use crate::manifest::{BuildNumber, InstalledBuild, Manifest, Offer, Sha256Digest};
+use crate::policy::{decide, Action, MinuteOfDay, Observation, Phase, Policy, Request};
 
 /// The name the release workflow gives the manifest.
 const MANIFEST_ASSET: &str = "manifest.json";
@@ -78,7 +86,10 @@ impl ReleaseSource {
 /// different action by a different person.
 #[derive(Debug, Error)]
 pub enum StandDown {
-    /// `[update] enabled = false`.
+    /// `[update] enable = false`. Not returned by [`Agent::new`] — the flag stands the
+    /// *nightly loop* down, not the agent, so a person can still ask for a check (#360).
+    /// It is here because the sentence still has to be said, and this is where the
+    /// updater's stand-down prose lives.
     #[error("switched off by `[update] enable = false` in castaway.toml")]
     Disabled,
     /// The trust anchors compiled into this build could not be read, so nothing can be
@@ -95,6 +106,8 @@ pub enum StandDown {
     )]
     UnknownBuild,
     /// A `hold` file at the install root. A hand deploy wrote it; deleting it re-arms.
+    /// Re-read every turn of the loop and on every press rather than once at startup, so
+    /// "delete it to re-arm" is true without a restart.
     #[error(
         "a `hold` file at the install root: somebody deployed this by hand, and the updater \
          stands down until they delete it"
@@ -107,6 +120,194 @@ pub enum StandDown {
          a box onto that layout; a development build is expected to land here."
     )]
     Unmanaged(#[source] LayoutError),
+}
+
+/// What somebody at the panel can ask the updater for (#360).
+///
+/// Two, and neither carries a reply: [`Progress`] on the watch channel is the single
+/// account of what is happening, and a second one would be a second thing to disagree
+/// with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// Look now, whatever the hour, and say what is there.
+    CheckNow,
+    /// Take what the last check found: download it if it is not already on disk, then
+    /// move the pointers and hand back to the launcher.
+    ActivateNow,
+}
+
+/// Where the updater has got to, in terms a screen can render.
+///
+/// An enum rather than a percentage and some flags, so a screen's `match` stops compiling
+/// when a phase is added (ground rule 1) — there is no "unknown state" arm for a new one
+/// to fall silently into. Deliberately **not** `#[non_exhaustive]`: the screen that
+/// renders this is in another crate, and marking it so would force the wildcard arm this
+/// type exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// Nothing has been asked of it yet.
+    Idle,
+    /// Asking the release API what Latest is.
+    Checking,
+    /// Latest is not newer than what is running. Names the running build, because "up to
+    /// date" with no number is not something the person reading it can check.
+    UpToDate {
+        /// What is running.
+        running: InstalledBuild,
+    },
+    /// Something newer exists and **nothing has been downloaded**. The offer, and the
+    /// three facts the signed manifest carries about it.
+    Offer {
+        /// Its build number.
+        build: BuildNumber,
+        /// Its short commit.
+        commit: String,
+        /// How large the download is, from the signed manifest rather than from a
+        /// `Content-Length` a server chose.
+        bytes: u64,
+    },
+    /// Fetching the artifact. `total` is the signed manifest's size.
+    Downloading {
+        /// Bytes written so far.
+        received: u64,
+        /// Bytes the manifest says there are.
+        total: u64,
+    },
+    /// Checking what arrived against the digest the manifest declared.
+    Verifying,
+    /// Unpacking it into the install tree.
+    Extracting,
+    /// Downloaded, verified, extracted and named: a restart away.
+    Staged {
+        /// Its build number.
+        build: BuildNumber,
+        /// Its short commit.
+        commit: String,
+    },
+    /// The pointers have moved and the process is leaving.
+    Restarting,
+    /// It could not be done, in the words [`UpdateError`] already carries.
+    Failed {
+        /// The error and its causes.
+        why: String,
+    },
+    /// There is no updating to be had on this build, or not right now. Carries the
+    /// [`StandDown`] prose, which is written to be read by a person.
+    StoodDown {
+        /// Why.
+        why: String,
+    },
+}
+
+/// The panel's end of the updater: ask it things, watch what it does.
+///
+/// Cloneable and cheap. It stays useful when there is no agent at all — a build that
+/// stood down publishes its reason through the same channel, so the settings screen has
+/// something to say rather than a row that does nothing.
+#[derive(Debug, Clone)]
+pub struct Handle {
+    commands: mpsc::Sender<Command>,
+    progress: watch::Receiver<Progress>,
+}
+
+impl Handle {
+    /// Ask for a check now. `false` means nothing is listening — the agent stood down, or
+    /// somebody is pressing faster than it can answer.
+    pub fn check_now(&self) -> bool {
+        self.commands.try_send(Command::CheckNow).is_ok()
+    }
+
+    /// Ask for the offered version to be taken. `false` as for [`Self::check_now`].
+    pub fn activate_now(&self) -> bool {
+        self.commands.try_send(Command::ActivateNow).is_ok()
+    }
+
+    /// A fresh view of what it is doing. The latest state, not every state: a screen
+    /// waking after a slow redraw wants the current number, not the queue of old ones.
+    #[must_use]
+    pub fn progress(&self) -> watch::Receiver<Progress> {
+        self.progress.clone()
+    }
+}
+
+/// The agent's end of the same, handed to [`Agent::run`].
+///
+/// Separate from [`Agent::new`] on purpose: `new` is where the stand-downs are decided,
+/// and a stand-down still has to be *said*. Keeping this out of the constructor means the
+/// caller still holds it on the failing path and can publish the reason.
+pub struct Inbox {
+    commands: mpsc::Receiver<Command>,
+    /// A sender the agent keeps to itself, so `recv` never resolves to `None` and the
+    /// loop's `select!` cannot spin against a closed channel once the panel is gone.
+    keepalive: mpsc::Sender<Command>,
+    progress: watch::Sender<Progress>,
+}
+
+impl Inbox {
+    /// Say why there is no updater, for the screen that is going to ask.
+    pub fn stand_down(self, why: &StandDown) {
+        let _ = self.progress.send(Progress::StoodDown {
+            why: Chain(why).to_string(),
+        });
+    }
+}
+
+/// How many presses may be outstanding. A person cannot mean four things at once; the
+/// slack is so a press during a minutes-long stage is not dropped for being early.
+const COMMAND_SLACK: usize = 4;
+
+/// Both ends of the updater's control surface.
+///
+/// Built before the agent, because the settings catalog needs the [`Handle`] whether or
+/// not there turns out to be an agent behind it.
+#[must_use]
+pub fn control() -> (Handle, Inbox) {
+    let (tx, rx) = mpsc::channel(COMMAND_SLACK);
+    let (progress_tx, progress_rx) = watch::channel(Progress::Idle);
+    (
+        Handle {
+            commands: tx.clone(),
+            progress: progress_rx,
+        },
+        Inbox {
+            commands: rx,
+            keepalive: tx,
+            progress: progress_tx,
+        },
+    )
+}
+
+/// Where progress goes. A newtype so every report is one call and a dropped receiver — an
+/// unattended panel, which is the normal case — is ignored in one place.
+#[derive(Clone)]
+struct Reporter(watch::Sender<Progress>);
+
+impl Reporter {
+    fn say(&self, progress: Progress) {
+        // `send` fails only when nothing is listening, and nothing listening is what an
+        // unattended panel looks like every night of its life.
+        let _ = self.0.send(progress);
+    }
+}
+
+/// A release the API offered that is not on disk yet.
+#[derive(Debug, Clone)]
+struct Available {
+    version: VersionId,
+    manifest: Manifest,
+    url: String,
+}
+
+/// What one look at the release API concluded.
+#[derive(Debug, Clone)]
+enum Looked {
+    /// Latest is not newer than what is running.
+    UpToDate,
+    /// Newer, and already complete on disk — staged on a night the panel never went
+    /// quiet, or by a check the person made a moment ago.
+    AlreadyStaged(Staged),
+    /// Newer, and nothing has been downloaded.
+    Available(Available),
 }
 
 /// The updater, once it has decided it is allowed to run.
@@ -122,8 +323,20 @@ pub struct Agent {
     /// that is the only moment it can be read soundly, which is why the app reads it in
     /// `main` and passes it down — the same value `seasonal_rollover` runs on.
     utc_offset_secs: i32,
+    /// Whether the nightly loop runs. `false` is `[update] enable = false`, which stands
+    /// the *schedule* down and leaves the agent alive: a press on "Check for updates" is
+    /// not the receiver updating itself, it is a person asking, and the flag was never a
+    /// statement about that (#360).
+    armed: bool,
     /// The tree waiting for the panel to go quiet, if there is one.
     staged: Option<Staged>,
+    /// What a manual check found and has not downloaded. Nothing is fetched until the
+    /// person presses the offer, so this is the whole of what that press needs.
+    offer: Option<Available>,
+    /// Whether to freshen the Sigstore trust root before looking. Off in tests, which
+    /// verify a checked-in bundle against the checked-in root and must not depend on
+    /// reaching a TUF repository.
+    refresh_trust: bool,
     /// Where tonight has got to. Derived state the loop keeps between turns — the policy
     /// is a function and does not remember anything.
     phase: Phase,
@@ -154,6 +367,16 @@ struct Staged {
     manifest: Manifest,
 }
 
+impl Staged {
+    /// How it reads on the glass: complete, and one restart away.
+    fn as_progress(&self) -> Progress {
+        Progress::Staged {
+            build: self.manifest.build,
+            commit: self.version.short().to_string(),
+        }
+    }
+}
+
 /// What the agent concludes when it is time to restart.
 #[derive(Debug, Clone)]
 pub struct Activation {
@@ -166,29 +389,29 @@ pub struct Activation {
 impl Agent {
     /// Build an agent, or say why there will not be one.
     ///
+    /// `armed` is `[update] enable`: it decides whether the nightly loop runs, not
+    /// whether the agent exists. Every other guard below is a fact about this *build*
+    /// rather than a preference, and each is a refusal.
+    ///
     /// # Errors
-    /// A [`StandDown`] variant for each of the guards, evaluated here rather than in the
-    /// loop so the receiver's startup log states the situation once instead of every
-    /// night.
+    /// A [`StandDown`] variant for each of those, evaluated here rather than in the loop
+    /// so the receiver's startup log states the situation once instead of every night.
+    /// [`StandDown::Hold`] is not among them: a `hold` file is somebody's live decision,
+    /// re-read every turn and on every press, so that "delete it to re-arm" is true
+    /// without a restart.
     pub fn new(
-        enabled: bool,
+        armed: bool,
         policy: Policy,
         source: ReleaseSource,
         installed: InstalledBuild,
         activity: Arc<dyn PanelActivity>,
         utc_offset_secs: i32,
     ) -> Result<Self, StandDown> {
-        if !enabled {
-            return Err(StandDown::Disabled);
-        }
         let provenance = Provenance::embedded().map_err(StandDown::TrustAnchors)?;
         if matches!(installed, InstalledBuild::Unknown) {
             return Err(StandDown::UnknownBuild);
         }
         let (tree, running) = InstallTree::of_running_receiver().map_err(StandDown::Unmanaged)?;
-        if tree.hold().exists() {
-            return Err(StandDown::Hold);
-        }
         Ok(Self {
             tree,
             running,
@@ -199,7 +422,10 @@ impl Agent {
             trust_cache: castaway_paths::host().cache().join("sigstore"),
             activity,
             utc_offset_secs,
+            armed,
             staged: None,
+            offer: None,
+            refresh_trust: true,
             phase: Phase::Fresh,
             held: false,
             consecutive_failures: 0,
@@ -212,13 +438,30 @@ impl Agent {
     /// [`castaway_launcher::supervise::ACTIVATE_EXIT_CODE`]'s value — which this crate
     /// does not name, because the launcher owns that constant and the app is what wires
     /// the two together.
-    pub async fn run(mut self) -> Activation {
-        info!(
-            version = %self.running.short(),
-            build = %self.installed,
-            window = %format_args!("{}–{}", self.policy.window.start(), self.policy.window.end()),
-            "auto-update is armed"
-        );
+    pub async fn run(mut self, inbox: Inbox) -> Activation {
+        let Inbox {
+            mut commands,
+            // Held for as long as the loop runs, so `recv` below has no `None` to spin on
+            // once the panel's own handle is dropped.
+            keepalive: _keepalive,
+            progress,
+        } = inbox;
+        let report = Reporter(progress);
+        if self.armed {
+            info!(
+                version = %self.running.short(),
+                build = %self.installed,
+                window = %format_args!("{}–{}", self.policy.window.start(), self.policy.window.end()),
+                "auto-update is armed"
+            );
+        } else {
+            info!(
+                version = %self.running.short(),
+                build = %self.installed,
+                "auto-update: automatic updates are off (`[update] enable = false`); a check \
+                 asked for from the settings screen still works"
+            );
+        }
         // Once per boot, and before anything is staged: a tree left over from a night the
         // panel never went quiet is still good, and re-downloading it would be a quarter
         // of a gigabyte spent on nothing.
@@ -231,30 +474,32 @@ impl Agent {
         }
 
         loop {
+            if !self.armed {
+                // No schedule to keep, so the only thing that can happen here is somebody
+                // asking. `keepalive` is why this cannot resolve to `None` and spin.
+                if let Some(command) = commands.recv().await {
+                    if let Some(activation) = self.on_command(command, &report).await {
+                        return activation;
+                    }
+                }
+                continue;
+            }
             // Re-read every turn rather than once at startup, because "delete it to
             // re-arm" is only half a contract: somebody who drops a `hold` file at 03:00
             // means it for 03:30, and a check made hours earlier would not have seen it.
             if self.holding() {
-                tokio::time::sleep(
-                    self.policy
-                        .window
-                        .until_open(self.local_minute())
-                        .max(self.policy.recheck),
-                )
-                .await;
+                let until = self
+                    .policy
+                    .window
+                    .until_open(self.local_minute())
+                    .max(self.policy.recheck);
+                if let Some(activation) = self.sleep_or_serve(until, &mut commands, &report).await {
+                    return activation;
+                }
                 continue;
             }
 
-            let obs = Observation {
-                at: self.local_minute(),
-                phase: if self.staged.is_some() {
-                    Phase::Staged
-                } else {
-                    self.phase
-                },
-                casting: self.activity.casting(),
-                idle_for: self.activity.idle_for(),
-            };
+            let obs = self.observe(Request::Scheduled);
             match decide(&self.policy, &obs) {
                 Action::Wait(d) => {
                     // Leaving the window resets tonight's memory: tomorrow is a fresh
@@ -263,20 +508,26 @@ impl Agent {
                         self.phase = Phase::Fresh;
                     }
                     debug!(minutes = d.as_secs() / 60, "auto-update: waiting");
-                    tokio::time::sleep(d).await;
+                    if let Some(activation) = self.sleep_or_serve(d, &mut commands, &report).await {
+                        return activation;
+                    }
                 }
-                Action::Check => match self.check().await {
+                Action::Check => match self.check(&report).await {
                     Ok(Some(staged)) => {
                         info!(
                             version = %staged.version.short(),
                             build = %staged.manifest.build,
                             "an update is staged and waiting for the panel to go quiet"
                         );
+                        report.say(staged.as_progress());
                         self.staged = Some(staged);
                     }
                     Ok(None) => {
                         self.consecutive_failures = 0;
                         self.phase = Phase::UpToDate;
+                        report.say(Progress::UpToDate {
+                            running: self.installed,
+                        });
                     }
                     Err(e) => {
                         // Every one of these — the API down, a bad signature, a corrupt
@@ -284,6 +535,9 @@ impl Agent {
                         // kiosk wants: nothing changes and it tries again tomorrow.
                         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                         self.report_failure(&e);
+                        report.say(Progress::Failed {
+                            why: Chain(&e).to_string(),
+                        });
                         self.phase = Phase::UpToDate;
                     }
                 },
@@ -294,19 +548,201 @@ impl Agent {
                     // that keeps failing on a full disk. Every path out of this arm waits.
                     if let Some(staged) = self.staged.take() {
                         match self.activate(&staged.version) {
-                            Ok(activation) => return activation,
+                            Ok(activation) => {
+                                report.say(Progress::Restarting);
+                                return activation;
+                            }
                             Err(e) => {
                                 warn!(error = %Chain(&e), "auto-update: could not activate");
                                 // Put it back: the tree is fine, the pointer write was
                                 // not, and the next look is a perfectly good time to retry.
                                 self.staged = Some(staged);
-                                tokio::time::sleep(self.policy.recheck).await;
+                                let recheck = self.policy.recheck;
+                                if let Some(activation) =
+                                    self.sleep_or_serve(recheck, &mut commands, &report).await
+                                {
+                                    return activation;
+                                }
                             }
                         }
                     } else {
-                        tokio::time::sleep(self.policy.recheck).await;
+                        let recheck = self.policy.recheck;
+                        if let Some(activation) =
+                            self.sleep_or_serve(recheck, &mut commands, &report).await
+                        {
+                            return activation;
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// Wait `d`, unless somebody presses something first — in which case answer that
+    /// instead, and let the loop work out where it stands afterwards.
+    ///
+    /// Every sleep in the loop goes through here, which is what makes "the agent is the
+    /// only owner of the install tree" true: a request that arrives while the agent is
+    /// mid-stage is not seen until the stage returns, so it queues behind it rather than
+    /// racing it for the same staging path.
+    async fn sleep_or_serve(
+        &mut self,
+        d: Duration,
+        commands: &mut mpsc::Receiver<Command>,
+        report: &Reporter,
+    ) -> Option<Activation> {
+        let command = tokio::select! {
+            () = tokio::time::sleep(d) => None,
+            command = commands.recv() => command,
+        };
+        match command {
+            Some(command) => self.on_command(command, report).await,
+            None => None,
+        }
+    }
+
+    /// What the panel looks like to the policy, from one clock read.
+    fn observe(&self, request: Request) -> Observation {
+        Observation {
+            at: self.local_minute(),
+            phase: if self.staged.is_some() {
+                Phase::Staged
+            } else {
+                self.phase
+            },
+            casting: self.activity.casting(),
+            idle_for: self.activity.idle_for(),
+            request,
+        }
+    }
+
+    /// Answer somebody standing at the panel.
+    async fn on_command(&mut self, command: Command, report: &Reporter) -> Option<Activation> {
+        // A `hold` file is a person's decision and outranks another person's press: the
+        // one who deployed by hand is not here to be asked, and the file names itself so
+        // whoever is here can act on it.
+        if self.holding() {
+            report.say(Progress::StoodDown {
+                why: format!("{}\n{}", StandDown::Hold, self.tree.hold().display()),
+            });
+            return None;
+        }
+        let obs = self.observe(Request::Manual);
+        match (command, decide(&self.policy, &obs)) {
+            (Command::CheckNow, Action::Check) => {
+                self.manual_check(report).await;
+                None
+            }
+            // A tree is already staged, so "is there anything newer?" is answered on disk:
+            // no download to do, only a restart to offer.
+            (Command::CheckNow, Action::Activate) => {
+                if let Some(staged) = &self.staged {
+                    report.say(staged.as_progress());
+                }
+                None
+            }
+            (Command::ActivateNow, _) => self.manual_activate(report).await,
+            // `decide` never tells a manual request to wait — the policy tests are
+            // exhaustive over its inputs on that point. Saying so beats panicking on a
+            // wall, and beats silence, which is indistinguishable from a broken row.
+            (Command::CheckNow, Action::Wait(_)) => {
+                warn!("auto-update: the schedule refused a manual check, which should not happen");
+                report.say(Progress::Failed {
+                    why: "the updater would not answer a check just now".to_string(),
+                });
+                None
+            }
+        }
+    }
+
+    /// One look, asked for by a person: report what is there and download nothing.
+    ///
+    /// Nothing is fetched here beyond the manifest and its attestation — a quarter of a
+    /// gigabyte is not something to start on somebody's behalf without asking, and the
+    /// offer this leaves behind is what the asking is.
+    async fn manual_check(&mut self, report: &Reporter) {
+        report.say(Progress::Checking);
+        match self.look().await {
+            Ok(Looked::UpToDate) => {
+                self.consecutive_failures = 0;
+                self.phase = Phase::UpToDate;
+                report.say(Progress::UpToDate {
+                    running: self.installed,
+                });
+            }
+            Ok(Looked::AlreadyStaged(staged)) => {
+                self.consecutive_failures = 0;
+                report.say(staged.as_progress());
+                self.staged = Some(staged);
+            }
+            Ok(Looked::Available(available)) => {
+                self.consecutive_failures = 0;
+                info!(
+                    version = %available.version.short(),
+                    build = %available.manifest.build,
+                    "auto-update: a newer release is on offer to the person at the panel"
+                );
+                report.say(Progress::Offer {
+                    build: available.manifest.build,
+                    commit: available.version.short().to_string(),
+                    bytes: available.manifest.size,
+                });
+                self.offer = Some(available);
+            }
+            Err(e) => {
+                warn!(error = %Chain(&e), "auto-update: a manual check found nothing it could trust");
+                report.say(Progress::Failed {
+                    why: Chain(&e).to_string(),
+                });
+            }
+        }
+    }
+
+    /// Take what the last check found, with somebody watching it happen.
+    async fn manual_activate(&mut self, report: &Reporter) -> Option<Activation> {
+        if self.staged.is_none() {
+            let Some(available) = self.offer.take() else {
+                // Pressed with nothing on offer — a screen from before a restart, or a
+                // stale one. Saying so beats doing nothing, which reads as a dead row.
+                report.say(Progress::Failed {
+                    why: "there is nothing to install; check again".to_string(),
+                });
+                return None;
+            };
+            match self
+                .stage(
+                    &available.version,
+                    &available.manifest,
+                    available.url,
+                    report,
+                )
+                .await
+            {
+                Ok(staged) => self.staged = Some(staged),
+                Err(e) => {
+                    warn!(error = %Chain(&e), "auto-update: the staging somebody asked for failed");
+                    report.say(Progress::Failed {
+                        why: Chain(&e).to_string(),
+                    });
+                    return None;
+                }
+            }
+        }
+        let staged = self.staged.take()?;
+        match self.activate(&staged.version) {
+            Ok(activation) => {
+                report.say(Progress::Restarting);
+                Some(activation)
+            }
+            Err(e) => {
+                warn!(error = %Chain(&e), "auto-update: could not activate");
+                // The tree is fine; the pointer write was not. Keep it — tonight's loop
+                // and the next boot both still find it.
+                report.say(Progress::Failed {
+                    why: Chain(&e).to_string(),
+                });
+                self.staged = Some(staged);
+                None
             }
         }
     }
@@ -397,14 +833,38 @@ impl Agent {
         None
     }
 
-    /// One look at the release API. `Ok(None)` means there was nothing newer.
-    async fn check(&mut self) -> Result<Option<Staged>, UpdateError> {
+    /// The nightly path: look, and stage whatever is newer. `Ok(None)` means there was
+    /// nothing newer.
+    ///
+    /// Nobody is watching at 03:30, so the offer and the download are one step here —
+    /// which is the only difference between this and the manual path, and it is a
+    /// difference about *asking*, not about the order of operations.
+    async fn check(&mut self, report: &Reporter) -> Result<Option<Staged>, UpdateError> {
+        match self.look().await? {
+            Looked::UpToDate => Ok(None),
+            Looked::AlreadyStaged(staged) => Ok(Some(staged)),
+            Looked::Available(available) => self
+                .stage(
+                    &available.version,
+                    &available.manifest,
+                    available.url,
+                    report,
+                )
+                .await
+                .map(Some),
+        }
+    }
+
+    /// One look at the release API, downloading nothing.
+    async fn look(&mut self) -> Result<Looked, UpdateError> {
         // Freshen the trust root before looking. Sigstore adds logs and intermediates over
         // time — the embedded copy already carries two of each, one retired — and a panel
         // that has been up for months would otherwise still be judging releases by the
         // root it booted with. A failed refresh keeps the embedded one and says so.
-        if let Ok(provenance) = Provenance::refreshed(Some(&self.trust_cache)).await {
-            self.provenance = provenance;
+        if self.refresh_trust {
+            if let Ok(provenance) = Provenance::refreshed(Some(&self.trust_cache)).await {
+                self.provenance = provenance;
+            }
         }
 
         let source = self.source.clone();
@@ -436,11 +896,11 @@ impl Agent {
                     installed = %self.installed,
                     "auto-update: Latest is not newer than what is running"
                 );
-                return Ok(None);
+                return Ok(Looked::UpToDate);
             }
             // `Agent::new` refuses to build in this state, so reaching it would mean the
             // stamp changed under a running process. Refusing is still the right answer.
-            Offer::Unorderable => return Ok(None),
+            Offer::Unorderable => return Ok(Looked::UpToDate),
         }
 
         let version = VersionId::parse(manifest.commit.as_str())
@@ -454,12 +914,15 @@ impl Agent {
             .join(MANIFEST_ASSET)
             .exists()
         {
-            return Ok(Some(Staged { version, manifest }));
+            return Ok(Looked::AlreadyStaged(Staged { version, manifest }));
         }
 
         let url = release.asset(manifest.artifact.as_str())?;
-        let staged = self.stage(&version, &manifest, url).await?;
-        Ok(Some(staged))
+        Ok(Looked::Available(Available {
+            version,
+            manifest,
+            url,
+        }))
     }
 
     /// Fetch the build provenance for exactly these bytes and check it.
@@ -515,6 +978,7 @@ impl Agent {
         version: &VersionId,
         manifest: &Manifest,
         url: String,
+        report: &Reporter,
     ) -> Result<Staged, UpdateError> {
         let staging = self.tree.staging(version);
         let final_path = self.tree.version(version).path().to_path_buf();
@@ -530,6 +994,11 @@ impl Agent {
         );
         let staging_for_task = staging.clone();
         let final_for_task = final_path.clone();
+        let progress = report.clone();
+        report.say(Progress::Downloading {
+            received: 0,
+            total: size,
+        });
         tokio::task::spawn_blocking(move || {
             // A leftover from a download that died halfway: it was never named, so
             // removing it is free.
@@ -540,7 +1009,13 @@ impl Agent {
                 source,
             })?;
             let zip = staging_for_task.join("artifact.zip");
-            let digest = download_to(&url, &zip, size)?;
+            let digest = download_to(&url, &zip, size, &|received| {
+                progress.say(Progress::Downloading {
+                    received,
+                    total: size,
+                });
+            })?;
+            progress.say(Progress::Verifying);
             if digest != expected {
                 return Err(UpdateError::DigestMismatch {
                     expected: expected.to_string(),
@@ -548,6 +1023,7 @@ impl Agent {
                 });
             }
             let tree = staging_for_task.join("tree");
+            progress.say(Progress::Extracting);
             unzip_stripping_top_level(&zip, &tree)?;
             let _ = std::fs::remove_file(&zip);
 
@@ -811,12 +1287,27 @@ fn fetch_bytes(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
     Ok(bytes)
 }
 
+/// At most this many progress reports over one download.
+///
+/// Two hundred is a step every 1.2 MB of a quarter-gigabyte artifact — about a second of
+/// a hackerspace uplink, and comfortably under the couple of hertz a screen wants. The
+/// coalescing is counted in *bytes* rather than measured with a clock, which keeps the
+/// read loop deterministic and this constant assertable rather than waited out (#208).
+const DOWNLOAD_REPORTS: u64 = 200;
+
 /// Stream `url` into `path`, hashing as it goes and refusing to write more than `size`.
 ///
 /// Hashed on the way past rather than by re-reading the file: a quarter of a gigabyte
 /// read twice on a panel's disk is a minute nobody gets back, and the bound is what stops
 /// a server that keeps talking from filling the disk before the digest can disagree.
-fn download_to(url: &str, path: &Path, size: u64) -> Result<Sha256Digest, UpdateError> {
+///
+/// `on_progress` is called with the byte count so far, at most [`DOWNLOAD_REPORTS`] times.
+fn download_to(
+    url: &str,
+    path: &Path,
+    size: u64,
+    on_progress: &dyn Fn(u64),
+) -> Result<Sha256Digest, UpdateError> {
     use sha2::Digest as _;
 
     let response = agent()
@@ -833,8 +1324,13 @@ fn download_to(url: &str, path: &Path, size: u64) -> Result<Sha256Digest, Update
     })?;
     let mut hasher = sha2::Sha256::new();
     let mut reader = response.into_reader().take(size);
-    let mut buffer = vec![0u8; 256 * 1024];
+    const CHUNK: usize = 256 * 1024;
+    let mut buffer = vec![0u8; CHUNK];
     let mut written = 0u64;
+    // One chunk is the floor: reporting more often than the loop reads would be reporting
+    // the same number twice.
+    let step = (size / DOWNLOAD_REPORTS).max(CHUNK as u64);
+    let mut next_report = step;
     loop {
         let n = reader.read(&mut buffer).map_err(|source| UpdateError::Io {
             what: "downloading",
@@ -851,6 +1347,15 @@ fn download_to(url: &str, path: &Path, size: u64) -> Result<Sha256Digest, Update
             source,
         })?;
         written += n as u64;
+        if written >= next_report {
+            on_progress(written);
+            next_report = written.saturating_add(step);
+        }
+    }
+    // The last chunk almost never lands on a step boundary, and a bar that stops at 96%
+    // and then jumps to "verifying" reads as a stall rather than as an end.
+    if written > 0 && written.saturating_add(step) != next_report {
+        on_progress(written);
     }
     if written != size {
         return Err(UpdateError::ShortDownload {
@@ -1063,5 +1568,578 @@ impl std::fmt::Display for Chain<'_> {
             source = cause.source();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    // An ephemeral loopback port for a fake release API, torn down with the test. Not a
+    // service surface, so it has no entry in `crates/app/src/surface.rs` to name.
+    #![allow(clippy::disallowed_methods)]
+
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    use crate::attestation::TRUSTED_ROOT;
+    use crate::manifest::BuildNumber;
+
+    use super::*;
+
+    /// The real bundle GitHub issued over a real release of this repository, and the
+    /// manifest it covers — the same pair `attestation`'s tests verify offline. Using it
+    /// here is what makes a fake release API honest: the server is impersonated, the
+    /// *provenance* is not, so the manual check under test runs the whole trust path
+    /// rather than a version of it with the interesting step removed.
+    const ATTESTED: &[u8] = include_bytes!("../fixtures/attested-manifest.json");
+    const BUNDLE: &str = include_str!("../fixtures/attested-manifest.json.sigstore");
+    /// The build and commit the fixture manifest names.
+    const FIXTURE_BUILD: u64 = 957;
+    const FIXTURE_COMMIT: &str = "efc4316";
+    const FIXTURE_ARTIFACT_BYTES: u64 = 249_089_697;
+    /// Written down rather than read from `RELEASE_IDENTITY`, for the reason
+    /// `attestation`'s tests give: a build compiled for a fork still tests these bytes.
+    const FIXTURE_IDENTITY: &str =
+        "https://github.com/schlarpc/castaway/.github/workflows/release.yml@refs/heads/main";
+    const FIXTURE_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+    /// A panel with nobody at it: the state every test here is in, and the state that
+    /// makes the *scheduled* path permissive — so anything a manual request is shown to
+    /// do differently is not idleness doing it.
+    struct Empty;
+    impl PanelActivity for Empty {
+        fn casting(&self) -> bool {
+            false
+        }
+        fn idle_for(&self) -> Duration {
+            Duration::MAX
+        }
+    }
+
+    /// A panel in use: casting, touched a second ago. What the schedule refuses.
+    struct InUse;
+    impl PanelActivity for InUse {
+        fn casting(&self) -> bool {
+            true
+        }
+        fn idle_for(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    /// Somewhere to put an install tree, removed when the test finishes with it.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "castaway-agent-{}-{name}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(path.join("versions")).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A forty-character version name that a failure message can be read at a glance.
+    fn version(c: char) -> VersionId {
+        VersionId::parse(&std::iter::repeat_n(c, 40).collect::<String>()).unwrap()
+    }
+
+    fn build(n: u64) -> InstalledBuild {
+        InstalledBuild::Known(BuildNumber::new(n).unwrap())
+    }
+
+    /// An agent over a scratch tree, wired to `source`, with the trust anchors the
+    /// fixtures were signed under.
+    fn agent_for(
+        scratch: &Scratch,
+        running: &VersionId,
+        installed: InstalledBuild,
+        source: ReleaseSource,
+        activity: Arc<dyn PanelActivity>,
+    ) -> Agent {
+        Agent {
+            tree: InstallTree::at(&scratch.0),
+            running: running.clone(),
+            installed,
+            policy: Policy::default(),
+            source,
+            provenance: Provenance::with_anchors(TRUSTED_ROOT, FIXTURE_IDENTITY, FIXTURE_ISSUER)
+                .unwrap(),
+            activity,
+            utc_offset_secs: 0,
+            armed: true,
+            staged: None,
+            offer: None,
+            // Off: these tests check a checked-in bundle against the checked-in root, and
+            // must not depend on reaching a TUF repository.
+            refresh_trust: false,
+            trust_cache: scratch.0.join("sigstore-cache"),
+            phase: Phase::Fresh,
+            held: false,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// A gate a test holds shut so it can observe what happens *during* a request.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn wait(&self) {
+            let mut open = self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*open {
+                open = self
+                    .changed
+                    .wait(open)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        fn open(&self) {
+            *self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// A release API that answers the three requests a check makes, on localhost.
+    ///
+    /// Impersonating the *server* is the whole of what it does: every byte it serves for
+    /// the manifest and its provenance is a checked-in fixture GitHub really signed.
+    struct FakeRelease {
+        base_url: String,
+        /// Held shut, the manifest response never arrives — which is how a test observes
+        /// what the agent does while a look is in flight.
+        gate: Arc<Gate>,
+        /// How many bytes `/artifact.bin` should serve, for the download-progress test.
+        artifact_bytes: usize,
+    }
+
+    impl FakeRelease {
+        fn start(artifact_bytes: usize, gated: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let base_url = format!("http://127.0.0.1:{port}");
+            let gate = Arc::new(Gate::default());
+            if !gated {
+                gate.open();
+            }
+            let served = Self {
+                base_url: base_url.clone(),
+                gate: Arc::clone(&gate),
+                artifact_bytes,
+            };
+            let bodies = served.bodies();
+            let gate_for_thread = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let bodies = bodies.clone();
+                    let gate = Arc::clone(&gate_for_thread);
+                    // One thread per connection: a test that holds the gate shut on one
+                    // request must not stop the listener answering another.
+                    std::thread::spawn(move || serve_one(&stream, &bodies, &gate));
+                }
+            });
+            served
+        }
+
+        /// Every path this server knows, and what it answers with.
+        fn bodies(&self) -> Arc<Vec<(String, Vec<u8>)>> {
+            let digest = format!("sha256:{}", crate::Sha256Digest::of(ATTESTED));
+            let listing = serde_json::json!({
+                "attestations": [{ "bundle": serde_json::from_str::<serde_json::Value>(BUNDLE).unwrap() }]
+            });
+            let release = serde_json::json!({
+                "tag_name": format!("build-{FIXTURE_COMMIT}"),
+                "assets": [
+                    { "name": MANIFEST_ASSET,
+                      "browser_download_url": format!("{}/manifest.json", self.base_url) },
+                    { "name": "castaway-windows-electron-efc4316.zip",
+                      "browser_download_url": format!("{}/artifact.bin", self.base_url) },
+                ]
+            });
+            Arc::new(vec![
+                (
+                    "/repos/schlarpc/castaway/releases/latest".to_string(),
+                    serde_json::to_vec(&release).unwrap(),
+                ),
+                ("/manifest.json".to_string(), ATTESTED.to_vec()),
+                (
+                    format!("/repos/schlarpc/castaway/attestations/{digest}"),
+                    serde_json::to_vec(&listing).unwrap(),
+                ),
+                (
+                    "/artifact.bin".to_string(),
+                    vec![0x5au8; self.artifact_bytes],
+                ),
+            ])
+        }
+
+        fn source(&self) -> ReleaseSource {
+            ReleaseSource {
+                base_url: self.base_url.clone(),
+                repository: "schlarpc/castaway".to_string(),
+            }
+        }
+
+        fn artifact_url(&self) -> String {
+            format!("{}/artifact.bin", self.base_url)
+        }
+    }
+
+    fn serve_one(mut stream: &TcpStream, bodies: &[(String, Vec<u8>)], gate: &Gate) {
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => request.push(byte[0]),
+            }
+        }
+        let head = String::from_utf8_lossy(&request);
+        let Some(path) = head.split_whitespace().nth(1) else {
+            return;
+        };
+        // The manifest is the gated one: it is the request a look spends its time in.
+        if path == "/manifest.json" {
+            gate.wait();
+        }
+        let response = match bodies.iter().find(|(p, _)| p == path) {
+            Some((_, body)) => {
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(body);
+                out
+            }
+            None => {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            }
+        };
+        let _ = stream.write_all(&response);
+        let _ = stream.flush();
+    }
+
+    /// Drive one command through the agent and hand back everything it said.
+    ///
+    /// Every state, not just the last: the point of a progress channel is the states in
+    /// between, and a test that only read `borrow()` at the end would pass over a
+    /// download that never reported a byte.
+    async fn serve(agent: &mut Agent, command: Command) -> (Option<Activation>, Vec<Progress>) {
+        let (tx, mut rx) = watch::channel(Progress::Idle);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collecting = Arc::clone(&seen);
+        let watcher = tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let state = rx.borrow_and_update().clone();
+                collecting
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(state);
+            }
+        });
+        let activation = agent.on_command(command, &Reporter(tx)).await;
+        // Dropping the sender ends the watcher, which is what makes the collected list
+        // complete rather than whatever had arrived by the time the assert ran.
+        watcher.await.ok();
+        let states = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (activation, states)
+    }
+
+    #[tokio::test]
+    async fn a_manual_check_that_finds_nothing_newer_names_the_build_that_is_running() {
+        let server = FakeRelease::start(0, false);
+        let scratch = Scratch::new("uptodate");
+        let running = version('a');
+        // Exactly the release on offer: not newer, so nothing to do — and "up to date"
+        // has to carry the number, because that is the part the person can check.
+        let mut agent = agent_for(
+            &scratch,
+            &running,
+            build(FIXTURE_BUILD),
+            server.source(),
+            Arc::new(Empty),
+        );
+        let (activation, states) = serve(&mut agent, Command::CheckNow).await;
+        assert!(activation.is_none());
+        assert_eq!(
+            states,
+            vec![
+                Progress::Checking,
+                Progress::UpToDate {
+                    running: build(FIXTURE_BUILD)
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_check_offers_what_is_newer_and_downloads_none_of_it() {
+        let server = FakeRelease::start(0, false);
+        let scratch = Scratch::new("offer");
+        let running = version('a');
+        let mut agent = agent_for(
+            &scratch,
+            &running,
+            build(FIXTURE_BUILD - 1),
+            server.source(),
+            Arc::new(Empty),
+        );
+        let (_, states) = serve(&mut agent, Command::CheckNow).await;
+        assert_eq!(
+            states,
+            vec![
+                Progress::Checking,
+                Progress::Offer {
+                    build: BuildNumber::new(FIXTURE_BUILD).unwrap(),
+                    commit: FIXTURE_COMMIT.to_string(),
+                    bytes: FIXTURE_ARTIFACT_BYTES,
+                }
+            ]
+        );
+        // The whole promise of the offer: a quarter of a gigabyte of somebody's uplink is
+        // not spent until they press the row. Nothing was written under `versions/`, and
+        // no staging directory was even created.
+        let mut entries = std::fs::read_dir(scratch.0.join("versions")).unwrap();
+        assert!(
+            entries.next().is_none(),
+            "a check that only offered still put something on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_check_over_a_tree_already_staged_offers_a_restart_and_asks_no_network() {
+        let scratch = Scratch::new("staged");
+        let running = version('a');
+        let staged_version = version('b');
+        // An unreachable release API: reaching it here would mean the agent had gone to
+        // the network for an answer that was already on disk.
+        let source = ReleaseSource {
+            base_url: "http://127.0.0.1:9".to_string(),
+            repository: "schlarpc/castaway".to_string(),
+        };
+        let mut agent = agent_for(
+            &scratch,
+            &running,
+            build(FIXTURE_BUILD - 1),
+            source,
+            Arc::new(Empty),
+        );
+        // Exactly what `Agent::stage` leaves behind: the tree under its final name, with
+        // the manifest that describes it written inside.
+        let tree = scratch.0.join("versions").join(staged_version.as_str());
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join(MANIFEST_ASSET), ATTESTED).unwrap();
+        agent.staged = agent.rediscover_staged();
+        assert!(
+            agent.staged.is_some(),
+            "the staged tree was not rediscovered"
+        );
+
+        let (activation, states) = serve(&mut agent, Command::CheckNow).await;
+        assert!(activation.is_none(), "a check must not restart anything");
+        assert_eq!(
+            states,
+            vec![Progress::Staged {
+                build: BuildNumber::new(FIXTURE_BUILD).unwrap(),
+                commit: staged_version.short().to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hold_file_refuses_a_manual_check_and_names_itself() {
+        let scratch = Scratch::new("hold");
+        let running = version('a');
+        let source = ReleaseSource {
+            base_url: "http://127.0.0.1:9".to_string(),
+            repository: "schlarpc/castaway".to_string(),
+        };
+        let mut agent = agent_for(&scratch, &running, build(1), source, Arc::new(Empty));
+        let hold = agent.tree.hold();
+        std::fs::write(&hold, b"").unwrap();
+
+        let (activation, states) = serve(&mut agent, Command::CheckNow).await;
+        assert!(activation.is_none());
+        let [Progress::StoodDown { why }] = states.as_slice() else {
+            panic!("a held panel said {states:?}");
+        };
+        // "Delete it to re-arm" is only actionable if the screen says which file.
+        assert!(
+            why.contains(&hold.display().to_string()),
+            "the hold message does not name the file: {why}"
+        );
+        // And it outranks the press rather than being overridden by it: a hold means
+        // somebody deployed by hand, and they are not here to be asked.
+        let (activation, states) = serve(&mut agent, Command::ActivateNow).await;
+        assert!(activation.is_none());
+        assert!(matches!(states.as_slice(), [Progress::StoodDown { .. }]));
+    }
+
+    #[tokio::test]
+    async fn a_manual_restart_takes_a_staged_tree_while_the_panel_is_in_use() {
+        let scratch = Scratch::new("activate");
+        let running = version('a');
+        let staged_version = version('b');
+        let source = ReleaseSource {
+            base_url: "http://127.0.0.1:9".to_string(),
+            repository: "schlarpc/castaway".to_string(),
+        };
+        // Casting, and touched a second ago: everything the nightly schedule refuses to
+        // interrupt. The press is somebody saying "yes, interrupt it".
+        let mut agent = agent_for(
+            &scratch,
+            &running,
+            build(FIXTURE_BUILD - 1),
+            source,
+            Arc::new(InUse),
+        );
+        std::fs::write(
+            scratch.0.join("current.txt"),
+            format!("{}\n", running.as_str()),
+        )
+        .unwrap();
+        let tree = scratch.0.join("versions").join(staged_version.as_str());
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join(MANIFEST_ASSET), ATTESTED).unwrap();
+        agent.staged = agent.rediscover_staged();
+
+        let (activation, states) = serve(&mut agent, Command::ActivateNow).await;
+        let activation = activation.expect("the press was the whole permission needed");
+        assert_eq!(activation.version, staged_version);
+        assert_eq!(activation.replacing, running);
+        assert_eq!(states, vec![Progress::Restarting]);
+        // The pointers moved together, and previous names what was running — the rollback
+        // target a manual update needs exactly as much as a nightly one.
+        assert_eq!(
+            install::read_pointer(&agent.tree, Pointer::Current).unwrap(),
+            staged_version
+        );
+        assert_eq!(
+            install::read_pointer(&agent.tree, Pointer::Previous).unwrap(),
+            running
+        );
+    }
+
+    #[tokio::test]
+    async fn pressing_the_offer_with_nothing_offered_says_so_rather_than_doing_nothing() {
+        let scratch = Scratch::new("nothing");
+        let running = version('a');
+        let source = ReleaseSource {
+            base_url: "http://127.0.0.1:9".to_string(),
+            repository: "schlarpc/castaway".to_string(),
+        };
+        let mut agent = agent_for(&scratch, &running, build(1), source, Arc::new(Empty));
+        let (activation, states) = serve(&mut agent, Command::ActivateNow).await;
+        assert!(activation.is_none());
+        assert!(
+            matches!(states.as_slice(), [Progress::Failed { .. }]),
+            "a dead row is indistinguishable from a broken one: {states:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_arriving_mid_look_is_serialised_behind_it_rather_than_racing_it() {
+        // The one-owner property, observed rather than asserted about the code: while a
+        // look is in flight, a second press changes nothing about what the agent is
+        // doing, because the agent is not reading its command channel — it is inside the
+        // look. Two of these racing would be two downloads into one staging path.
+        let server = FakeRelease::start(0, true);
+        let scratch = Scratch::new("serialised");
+        let running = version('a');
+        let mut agent = agent_for(
+            &scratch,
+            &running,
+            build(FIXTURE_BUILD),
+            server.source(),
+            Arc::new(Empty),
+        );
+        let (handle, inbox) = control();
+        let mut progress = handle.progress();
+        assert!(handle.check_now());
+
+        let looking = tokio::spawn(async move {
+            let mut commands = inbox.commands;
+            let report = Reporter(inbox.progress);
+            let recheck = agent.policy.recheck;
+            let activation = agent.sleep_or_serve(recheck, &mut commands, &report).await;
+            (agent, activation)
+        });
+
+        // The look has started and is parked inside the gated manifest request.
+        progress
+            .wait_for(|p| *p == Progress::Checking)
+            .await
+            .expect("the check started");
+        // A second press, delivered while it is parked. It is accepted by the channel and
+        // *not* acted on: the agent is not at a point where it reads one.
+        assert!(handle.check_now());
+        assert_eq!(*progress.borrow_and_update(), Progress::Checking);
+        server.gate.open();
+        progress
+            .wait_for(|p| matches!(p, Progress::UpToDate { .. }))
+            .await
+            .expect("the check finished");
+        let (_agent, activation) = looking.await.unwrap();
+        assert!(activation.is_none());
+    }
+
+    #[test]
+    fn a_download_reports_often_enough_to_watch_and_not_so_often_it_is_a_flood() {
+        // The denominator is the signed manifest's size, and the reports are counted in
+        // bytes rather than timed off a clock — so this asserts the shipped coalescing
+        // rather than waiting one out (#208).
+        let bytes = 4 * 1024 * 1024;
+        let server = FakeRelease::start(bytes, false);
+        let scratch = Scratch::new("download");
+        let path = scratch.0.join("artifact.bin");
+        let seen = Mutex::new(Vec::new());
+        let digest = download_to(&server.artifact_url(), &path, bytes as u64, &|received| {
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(received);
+        })
+        .unwrap();
+        assert_eq!(digest, crate::Sha256Digest::of(&vec![0x5au8; bytes]));
+        let seen = seen
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!seen.is_empty(), "a download that reported nothing at all");
+        assert!(
+            seen.len() as u64 <= DOWNLOAD_REPORTS,
+            "{} reports for one download",
+            seen.len()
+        );
+        // Monotonic, and the last one is the whole file: a progress line that went
+        // backwards, or stopped short of 100%, reads as a stall.
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+        assert_eq!(seen.last().copied(), Some(bytes as u64));
     }
 }

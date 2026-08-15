@@ -13,7 +13,13 @@
 //! Pairing is the one flow here that outlives its press. Pressing an unpaired host puts
 //! a PIN on the glass and *waits on a human at another machine* — so it runs as a spawned
 //! task reporting back through a channel, while the event loop keeps answering presses.
-//! Everything else stays sequential, because everything else finishes in a round trip.
+//! An action setting (#360) is the same pattern with more than one message: it reports a
+//! stream of frames for as long as it has something to say.
+//!
+//! Anything that keeps talking after its press uses a **tagged** replace. `back` is
+//! answered render-side and never reaches this file, so a producer running for minutes
+//! cannot know the person walked off; the tag lets the stack refuse the update instead of
+//! this loop guessing at it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +31,7 @@ use proto_gamestream::{GameStreamAdapter, GameStreamCommand, GameStreamError, Pa
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::settings::{self, Applied};
+use crate::settings::{self, Applied, Drilldown, Stage};
 
 /// The id of the Moonlight tile on the Home screen. Matches what `build_attract` emits.
 const MOONLIGHT_TILE: &str = "gamestream";
@@ -65,6 +71,18 @@ struct ActivePairing {
     /// mid-typing it into Sunshine, and regenerating would invalidate their typing with
     /// no sign anything changed.
     pin: PairingPin,
+}
+
+/// One frame from a running action setting, on its way to the glass.
+struct ActionReport {
+    /// Which drill-in this belongs to. A frame from the one before is dropped rather
+    /// than painted over its successor — the stream outlives the screen by design, so
+    /// somebody who backs out and drills into something else must not be interrupted by
+    /// what they left.
+    epoch: u64,
+    /// Which setting, so the row ids and the screen tag come out right.
+    setting: String,
+    report: settings::Report,
 }
 
 /// What the spawned pairing task reports back to the event loop.
@@ -126,6 +144,10 @@ pub async fn run(
     // Sized for the one pairing that can be in flight; the extra slots are slack, not
     // a queue anyone fills.
     let (pairing_outcomes, outcomes_rx) = mpsc::channel(4);
+    // A download reports a couple of hundred times over some minutes, so this is slack
+    // rather than a backlog — and a full channel back-pressures the forwarding task,
+    // never the agent.
+    let (action_reports, reports_rx) = mpsc::channel(16);
     let nav = Nav {
         render,
         gamestream,
@@ -135,9 +157,11 @@ pub async fn run(
         chosen_host: None,
         pairing: None,
         pairing_outcomes,
+        action_reports,
+        action_epoch: 0,
         close_page,
     };
-    nav.run(events, outcomes_rx).await;
+    nav.run(events, outcomes_rx, reports_rx).await;
 }
 
 /// The navigation state one `run` owns. A struct because pairing gave the loop *state
@@ -156,6 +180,10 @@ struct Nav {
     /// The sender half the spawned pairing task reports through. Held here so the
     /// channel outlives any individual task.
     pairing_outcomes: mpsc::Sender<PairingOutcome>,
+    /// The same, for a running action setting's frames.
+    action_reports: mpsc::Sender<ActionReport>,
+    /// Bumped by every drill-in. See [`ActionReport::epoch`].
+    action_epoch: u64,
     /// Where the close badge's press goes: the task holding the DIAL-launched page.
     close_page: mpsc::UnboundedSender<()>,
 }
@@ -165,6 +193,7 @@ impl Nav {
         mut self,
         mut events: mpsc::Receiver<ShellEvent>,
         mut outcomes: mpsc::Receiver<PairingOutcome>,
+        mut reports: mpsc::Receiver<ActionReport>,
     ) {
         loop {
             tokio::select! {
@@ -174,6 +203,7 @@ impl Nav {
                     None => break,
                 },
                 Some(outcome) = outcomes.recv() => self.on_pairing_outcome(outcome).await,
+                Some(report) = reports.recv() => self.on_action_report(&report),
             }
         }
     }
@@ -226,7 +256,7 @@ impl Nav {
                     };
                     launch(&self.render, &self.gamestream_commands, &host, app).await;
                 } else if let Some(setting_id) = id.strip_prefix(SETTING_PREFIX) {
-                    show_setting(&self.render, &self.settings, setting_id).await;
+                    self.show_setting(setting_id).await;
                 } else if let Some(rest) = id.strip_prefix(CHOICE_PREFIX) {
                     let Some((setting_id, choice_id)) = rest.split_once(':') else {
                         warn!(%id, "shell: a choice row with no setting in its id");
@@ -399,8 +429,12 @@ fn show_settings_menu(render: &pipeline::RenderTx, catalog: &settings::Catalog) 
 
 /// One setting's choice list, freshly enumerated. Blocking work (device enumeration
 /// asks a sound server), so it runs off the async loop.
-fn choice_picker(setting: &dyn settings::Setting) -> Picker {
-    match setting.choices() {
+///
+/// Takes both halves rather than re-deriving the second: the drill-down borrow cannot be
+/// held across the `spawn_blocking` hop, so the caller inside that hop is where it is
+/// taken, and this is what it hands over.
+fn choice_picker(setting: &dyn settings::Setting, choices: &dyn settings::Choices) -> Picker {
+    match choices.choices() {
         Ok(list) => {
             let items: Vec<PickerItem> = list
                 .choices
@@ -427,23 +461,126 @@ fn choice_picker(setting: &dyn settings::Setting) -> Picker {
     }
 }
 
-/// Drill into one setting: answer the press, then fill the list in.
-async fn show_setting(render: &pipeline::RenderTx, catalog: &settings::Catalog, setting_id: &str) {
-    let Some(setting) = catalog.get(setting_id) else {
-        warn!(%setting_id, "shell: a settings row for a setting this build lacks");
-        return;
-    };
-    push(render, Picker::loading(setting.title(), "Looking…"));
-    let worker = Arc::clone(&setting);
-    match tokio::task::spawn_blocking(move || choice_picker(worker.as_ref())).await {
-        Ok(picker) => replace(render, picker),
-        Err(e) => {
-            warn!(%setting_id, error = %e, "shell: enumerating a setting's choices died");
-            replace(
-                render,
-                Picker::loading(setting.title(), "").failed("Something went wrong listing these"),
+/// A frame from a running action setting, as a screen.
+///
+/// Pure, and the only thing that turns the catalog's words into a picker — which is what
+/// makes every screen this feature can put on the glass assertable without an agent, a
+/// network or a clock.
+fn action_screen(title: String, setting_id: &str, report: &settings::Report) -> Picker {
+    let items: Vec<PickerItem> = report
+        .rows
+        .iter()
+        .map(|row| {
+            let item = PickerItem::new(
+                format!("{CHOICE_PREFIX}{setting_id}:{}", row.id),
+                row.label.clone(),
             );
+            match &row.detail {
+                Some(detail) => item.with_detail(detail.clone()),
+                None => item,
+            }
+        })
+        .collect();
+    let picker = Picker::loading(title, "").with_tag(setting_id);
+    match report.stage {
+        // A wait, and it must read as one: the sentence is the busy line, and there is
+        // nothing to press while it is going on.
+        Stage::Working => picker.busy(report.say.clone()),
+        // With rows, the sentence is what the person is deciding on, so it goes above
+        // them; with none, it *is* the screen.
+        Stage::Settled if items.is_empty() => picker.with_items(items, report.say.clone()),
+        Stage::Settled => picker
+            .with_subtitle(report.say.clone())
+            .with_items(items, String::new()),
+        // Rows survive a failure, the way a failed pairing keeps its retry.
+        Stage::Failed => picker
+            .with_items(items, String::new())
+            .failed(report.say.clone()),
+    }
+}
+
+impl Nav {
+    /// Drill into one setting: answer the press, then fill it in — either with a list, or
+    /// with the first frame of something that has started happening.
+    async fn show_setting(&mut self, setting_id: &str) {
+        let Some(setting) = self.settings.get(setting_id) else {
+            warn!(%setting_id, "shell: a settings row for a setting this build lacks");
+            return;
+        };
+        // Any drill-in retires whatever was being followed. The work it was following is
+        // not stopped — this loop never owned it — only its frames stop landing.
+        self.action_epoch = self.action_epoch.wrapping_add(1);
+        match setting.drilldown() {
+            settings::Drilldown::Choices(_) => {
+                push(&self.render, Picker::loading(setting.title(), "Looking…"));
+                let worker = Arc::clone(&setting);
+                let listed = tokio::task::spawn_blocking(move || match worker.drilldown() {
+                    Drilldown::Choices(choices) => Some(choice_picker(worker.as_ref(), choices)),
+                    // Only reachable if a setting changed shape between two calls, which
+                    // no implementation does; the alternative is an `unwrap` on a wall.
+                    Drilldown::Action(_) => None,
+                })
+                .await;
+                match listed {
+                    Ok(Some(picker)) => replace(&self.render, picker),
+                    Ok(None) | Err(_) => {
+                        warn!(%setting_id, "shell: enumerating a setting's choices did not answer");
+                        replace(
+                            &self.render,
+                            Picker::loading(setting.title(), "")
+                                .failed("Something went wrong listing these"),
+                        );
+                    }
+                }
+            }
+            settings::Drilldown::Action(action) => {
+                // Answered now, tagged, and filled in by the stream. Tagged from the very
+                // first screen, because the frame that replaces it may arrive after the
+                // person has already left.
+                push(
+                    &self.render,
+                    Picker::loading(setting.title(), "…").with_tag(setting.id()),
+                );
+                let mut frames = action.start();
+                let epoch = self.action_epoch;
+                let out = self.action_reports.clone();
+                let id = setting.id().to_string();
+                info!(%setting_id, "shell: a settings action started");
+                tokio::spawn(async move {
+                    while let Some(report) = frames.recv().await {
+                        let hop = ActionReport {
+                            epoch,
+                            setting: id.clone(),
+                            report,
+                        };
+                        // A closed channel is shutdown. The action carries on regardless
+                        // — it is not ours to stop, and a download half-done is still a
+                        // download the next boot can use.
+                        if out.send(hop).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
         }
+    }
+
+    /// One frame, on the glass — if the person is still looking at the screen it is for.
+    fn on_action_report(&self, report: &ActionReport) {
+        if report.epoch != self.action_epoch {
+            debug!(setting = %report.setting, "shell: a frame from an action nobody is on");
+            return;
+        }
+        let Some(setting) = self.settings.get(&report.setting) else {
+            return;
+        };
+        // Tagged rather than plain: `back` never reaches this file, so the stack is what
+        // decides whether this screen is still the one on top.
+        replace_tagged(
+            &self.render,
+            &report.setting,
+            action_screen(setting.title(), &report.setting, &report.report),
+        );
     }
 }
 
@@ -465,13 +602,28 @@ async fn apply_choice(
         warn!(%setting_id, "shell: a choice for a setting this build lacks");
         return;
     };
+    if let Drilldown::Action(action) = setting.drilldown() {
+        // An action's rows are not choices: pressing one starts work whose answer arrives
+        // on the stream that is already running, so there is nothing to render here and
+        // nothing to wait for. Rendering anything would race that stream.
+        info!(%setting_id, %choice_id, "settings: an action row was pressed");
+        action.press(choice_id);
+        return;
+    }
     let worker = Arc::clone(&setting);
     let chosen = choice_id.to_owned();
-    let outcome = tokio::task::spawn_blocking(move || {
-        let applied = worker.apply(&chosen);
-        // Re-enumerate under the same blocking hop: the list shown after a pick must
-        // be the list as it is now, not as it was before the device moved.
-        (applied, choice_picker(worker.as_ref()))
+    let outcome = tokio::task::spawn_blocking(move || match worker.drilldown() {
+        Drilldown::Choices(choices) => {
+            let applied = choices.apply(&chosen);
+            // Re-enumerate under the same blocking hop: the list shown after a pick must
+            // be the list as it is now, not as it was before the device moved.
+            (applied, choice_picker(worker.as_ref(), choices))
+        }
+        // Unreachable: the shape was checked a line ago and no setting changes it.
+        Drilldown::Action(_) => (
+            Err("this setting is not a list".to_string()),
+            Picker::loading(worker.title(), ""),
+        ),
     })
     .await;
     match outcome {
@@ -647,6 +799,18 @@ fn replace(render: &pipeline::RenderTx, picker: Picker) {
     ))));
 }
 
+/// The same, but only while `tag`'s screen is still the one on top.
+///
+/// What a producer that outlives its press uses. `back` is answered render-side and never
+/// arrives here, so an unconditional replace from a four-minute download would paint
+/// progress over the settings menu — or, from Home, push a picker over the idle screen.
+fn replace_tagged(render: &pipeline::RenderTx, tag: &str, picker: Picker) {
+    render.send(RenderCommand::ReplaceScreenTagged {
+        screen: Box::new(Screen::Picker(Box::new(picker))),
+        tag: tag.to_string(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -714,6 +878,122 @@ mod tests {
             why.contains("somepc"),
             "the message must say which pairing is in the way: {why}"
         );
+    }
+
+    /// The three shapes an action's frame can take, as the settings catalog hands them
+    /// over.
+    fn frame(stage: Stage, say: &str, rows: Vec<settings::Row>) -> settings::Report {
+        settings::Report {
+            say: say.to_string(),
+            stage,
+            rows,
+        }
+    }
+
+    #[test]
+    fn an_action_in_flight_reads_as_a_wait_with_its_own_words_and_nothing_to_press() {
+        // Four minutes of a spinner reads as a hang; four minutes of a number that
+        // climbs reads as a download. The words are the setting's, not this file's.
+        let screen = action_screen(
+            "Check for updates".into(),
+            "update-check",
+            &frame(Stage::Working, "46% — 108 of 236 MB", vec![]),
+        );
+        assert_eq!(
+            screen.status,
+            PickerStatus::Busy("46% — 108 of 236 MB".into())
+        );
+        assert!(screen.items.is_empty(), "nothing to choose mid-download");
+    }
+
+    #[test]
+    fn an_answer_with_something_to_press_shows_both_the_sentence_and_the_row() {
+        // The offer: the sentence is what the person is deciding on, so it has to be
+        // visible *alongside* the row rather than in the empty-list message, which a
+        // screen with a row never shows.
+        let screen = action_screen(
+            "Check for updates".into(),
+            "update-check",
+            &frame(
+                Stage::Settled,
+                "Build 957 (efc4316) is available — 237 MB.",
+                vec![settings::Row {
+                    id: "take-it".into(),
+                    label: "Download and restart now".into(),
+                    detail: Some("The panel goes blank".into()),
+                }],
+            ),
+        );
+        assert_eq!(
+            screen.subtitle.as_deref(),
+            Some("Build 957 (efc4316) is available — 237 MB.")
+        );
+        assert_eq!(screen.status, PickerStatus::Ready);
+        let [row] = screen.items.as_slice() else {
+            panic!("{:?}", screen.items);
+        };
+        // The id must survive the same `strip_prefix` and `split_once` the handler does,
+        // or the offer's one exit goes to the "list nothing owns" branch.
+        let rest = row.id.strip_prefix(CHOICE_PREFIX).expect("namespaced");
+        assert_eq!(rest.split_once(':'), Some(("update-check", "take-it")));
+        assert_eq!(row.detail.as_deref(), Some("The panel goes blank"));
+    }
+
+    #[test]
+    fn an_answer_with_nothing_to_press_is_the_sentence_itself() {
+        let screen = action_screen(
+            "Check for updates".into(),
+            "update-check",
+            &frame(Stage::Settled, "This panel is running build 957.", vec![]),
+        );
+        assert_eq!(
+            screen.status,
+            PickerStatus::Empty("This panel is running build 957.".into())
+        );
+        // Not repeated above the (absent) list as well — one sentence, once.
+        assert_eq!(screen.subtitle, None);
+    }
+
+    #[test]
+    fn a_failed_action_keeps_its_reason_and_whatever_it_can_still_offer() {
+        let screen = action_screen(
+            "Check for updates".into(),
+            "update-check",
+            &frame(
+                Stage::Failed,
+                "fetching the release listing: dns error",
+                vec![settings::Row {
+                    id: "again".into(),
+                    label: "Try again".into(),
+                    detail: None,
+                }],
+            ),
+        );
+        assert!(
+            matches!(&screen.status, PickerStatus::Failed(why) if why.contains("dns error")),
+            "{:?}",
+            screen.status
+        );
+        assert_eq!(screen.items.len(), 1, "a retry survives the failure");
+    }
+
+    #[test]
+    fn every_frame_of_an_action_carries_the_tag_that_stops_it_landing_on_the_wrong_screen() {
+        // The one property the whole tagged-replace mechanism rests on. An untagged
+        // frame would be refused by the stack outright — worse, it would be *silently*
+        // refused, so a screen that never updates is the symptom.
+        for stage in [Stage::Working, Stage::Settled, Stage::Failed] {
+            let screen = action_screen(
+                "Check for updates".into(),
+                "update-check",
+                &frame(stage, "x", vec![]),
+            );
+            assert_eq!(
+                screen.tag.as_deref(),
+                Some("update-check"),
+                "an untagged frame at {stage:?}"
+            );
+        }
     }
 
     #[test]
