@@ -8,6 +8,7 @@
 #![cfg(feature = "render")]
 
 use castaway_core::{DecodedFrame, PixelFormat};
+use pipeline::render_pipeline::FrameEpoch;
 use pipeline::{render_channel, RenderCommand};
 
 fn frame() -> DecodedFrame {
@@ -25,7 +26,7 @@ fn a_transition_cannot_be_crowded_out_by_frames() {
     let (tx, rx) = render_channel(1);
     // Flood the frame lane far past its depth. The excess drops, by design.
     for _ in 0..8 {
-        tx.send(RenderCommand::Video(frame()));
+        tx.send(RenderCommand::Video(frame(), FrameEpoch::ALWAYS_FRESH));
     }
     // The transition still arrives — and first, because a transition ordered
     // before a frame must apply before it.
@@ -35,7 +36,7 @@ fn a_transition_cannot_be_crowded_out_by_frames() {
         "a state transition must never be refused because frames are queued"
     );
     // The one frame the lane holds is still there behind it.
-    assert!(matches!(rx.try_recv(), Some(RenderCommand::Video(_))));
+    assert!(matches!(rx.try_recv(), Some(RenderCommand::Video(..))));
     assert!(rx.try_recv().is_none(), "the flood was dropped, not queued");
 }
 

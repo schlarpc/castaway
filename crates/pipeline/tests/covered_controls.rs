@@ -13,7 +13,7 @@
 
 use castaway_core::{ControlCapabilities, DecodedFrame, FrameImage, NowPlaying, PlaybackState};
 use pipeline::nowplaying_card::NowPlayingCard;
-use pipeline::render_pipeline::{RenderCommand, RenderLoop};
+use pipeline::render_pipeline::{FrameEpoch, RenderCommand, RenderLoop};
 
 /// A point inside the strip: bottom-centre.
 const ON_STRIP: (f32, f32) = (0.5, 0.93);
@@ -54,7 +54,10 @@ fn a_strip_hidden_under_video_neither_owns_nor_acts() {
          proves nothing about coverage"
     );
 
-    tx.send(RenderCommand::Video(video_frame(1280, 720)));
+    tx.send(RenderCommand::Video(
+        video_frame(1280, 720),
+        FrameEpoch::ALWAYS_FRESH,
+    ));
     render.pump();
 
     assert!(

@@ -14,7 +14,7 @@ use castaway_core::{ControlCapabilities, DecodedFrame, FrameImage, NowPlaying, P
 use pipeline::attract::AttractScene;
 use pipeline::demand::Demand;
 use pipeline::nowplaying_card::NowPlayingCard;
-use pipeline::render_pipeline::{RenderCommand, RenderLoop};
+use pipeline::render_pipeline::{FrameEpoch, RenderCommand, RenderLoop};
 
 const W: u32 = 640;
 const H: u32 = 360;
@@ -83,7 +83,10 @@ fn work_arriving_by_command_is_seen_on_that_same_frame() {
     // *before* stepping motions, so the very frame that received it already answers
     // "still moving" — with the opposite order the loop would go back to sleep on
     // exactly the frame something began to move.
-    tx.send(RenderCommand::Video(video_frame()));
+    tx.send(RenderCommand::Video(
+        video_frame(),
+        FrameEpoch::ALWAYS_FRESH,
+    ));
     assert_eq!(
         render.frame(TICK),
         Demand::Frame,
@@ -94,7 +97,10 @@ fn work_arriving_by_command_is_seen_on_that_same_frame() {
 #[test]
 fn a_scheduled_clear_is_a_deadline_not_a_spin() {
     let (tx, mut render) = home();
-    tx.send(RenderCommand::Video(video_frame()));
+    tx.send(RenderCommand::Video(
+        video_frame(),
+        FrameEpoch::ALWAYS_FRESH,
+    ));
     assert_eq!(settle(&mut render), Demand::Idle, "a still video is static");
 
     // The clear is deferred by its grace period (see `ClearVideo`); until it falls due

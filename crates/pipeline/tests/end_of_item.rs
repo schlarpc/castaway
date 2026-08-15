@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use castaway_core::{DecodedFrame, PixelFormat};
+use pipeline::render_pipeline::FrameEpoch;
 use pipeline::{render_channel, LayerId, RenderCommand};
 
 const W: u32 = 320;
@@ -46,7 +47,7 @@ fn the_last_frame_of_a_finished_item_does_not_stay_on_the_panel() {
     let mut render = render.with_clock(clock);
 
     // An item, playing: the layer is up.
-    tx.send(RenderCommand::Video(frame()));
+    tx.send(RenderCommand::Video(frame(), FrameEpoch::ALWAYS_FRESH));
     render.pump();
     assert!(
         render.layer_size(LayerId::Video).is_some(),
@@ -57,7 +58,7 @@ fn the_last_frame_of_a_finished_item_does_not_stay_on_the_panel() {
     // clear, because the decoder ran ahead of the render loop. Filling the lane is the
     // whole point of the test; a clear sent to an empty lane never had this bug.
     for _ in 0..8 {
-        tx.send(RenderCommand::Video(frame()));
+        tx.send(RenderCommand::Video(frame(), FrameEpoch::ALWAYS_FRESH));
     }
     tx.send(RenderCommand::ClearVideo);
 
@@ -85,16 +86,20 @@ fn a_frame_of_the_next_item_still_calls_off_the_clear() {
     };
     let mut render = render.with_clock(clock);
 
-    tx.send(RenderCommand::Video(frame()));
+    tx.begin_epoch();
+    tx.send_frame(frame());
     render.pump();
 
     // A scrub, as a control point that cannot seek in-band performs one: stop, then load
     // again. The frame arrives *after* the clear rather than behind it in the lane, and
     // that is the difference the fix has to keep — dropping stale frames must not turn
-    // into ignoring live ones, or every scrub bares the idle screen.
+    // into ignoring live ones, or every scrub bares the idle screen. The new item begins
+    // a session, so its frames outrank the clear (#358); this goes through the real epoch
+    // path rather than a fixture constant, because that ordering is the thing under test.
     tx.send(RenderCommand::ClearVideo);
     render.pump();
-    tx.send(RenderCommand::Video(frame()));
+    tx.begin_epoch();
+    tx.send_frame(frame());
     render.pump();
 
     // Three virtual seconds — well past the grace a live clear would have fired at.
@@ -107,4 +112,54 @@ fn a_frame_of_the_next_item_still_calls_off_the_clear() {
         );
         time.advance(FRAME);
     }
+}
+
+#[test]
+fn a_straggler_out_of_the_decoder_does_not_call_off_the_clear() {
+    // #358, seen on the panel: stopping an AirPlay mirror left the last frame frozen on
+    // the glass. `ClearVideo` drains the frame lane, but the mirror path is `encoded
+    // frames → decode → compositor` and a frame still *inside the decoder* is not in the
+    // lane to be drained. It arrived afterwards, cancelled the clear meant for the
+    // session it belonged to, and nothing re-armed it — so the picture stayed until the
+    // idle return two minutes later.
+    //
+    // The distinguishing fact is which session the frame speaks for, and nothing about
+    // its timing: this straggler is delivered exactly like the next item's frame in the
+    // test above, and must be treated the opposite way purely because no new session
+    // began.
+    let (tx, rx) = render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let Some(render) = pipeline::test_gpu::render_loop(W, H, rx) else {
+        return;
+    };
+    let mut render = render.with_clock(clock);
+
+    tx.begin_epoch();
+    tx.send_frame(frame());
+    render.pump();
+    assert!(
+        render.layer_size(LayerId::Video).is_some(),
+        "a frame should put the video layer on the panel"
+    );
+
+    // The session ends. No `begin_epoch` follows, because nothing new started.
+    tx.send(RenderCommand::ClearVideo);
+    render.pump();
+
+    // The decoder finishes the frame it was holding and pushes it at a loop that has
+    // already cleared. Before the fix this line alone kept a finished mirror on screen.
+    tx.send_frame(frame());
+    render.pump();
+
+    for _ in 0..320 {
+        render.pump();
+        render.tick_motion(FRAME);
+        if render.layer_size(LayerId::Video).is_none() {
+            return;
+        }
+        time.advance(FRAME);
+    }
+    panic!(
+        "a frame from a cleared session kept the video layer up: the mirror is frozen on the panel"
+    );
 }

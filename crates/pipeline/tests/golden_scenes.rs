@@ -415,6 +415,7 @@ fn a_session_playing_full_screen() {
     // 16:9 into 16:9: the picture fills the panel and the shell is behind it, invisible.
     tx.send(pipeline::render_pipeline::RenderCommand::Video(
         test_pattern(1280, 720),
+        pipeline::render_pipeline::FrameEpoch::ALWAYS_FRESH,
     ));
     render.pump();
     settle(&mut render);
@@ -437,6 +438,7 @@ fn a_session_demoted_to_the_corner_while_someone_uses_the_shell() {
     )));
     tx.send(pipeline::render_pipeline::RenderCommand::Video(
         test_pattern(1280, 720),
+        pipeline::render_pipeline::FrameEpoch::ALWAYS_FRESH,
     ));
     render.pump();
     render.set_shell_foreground(true);

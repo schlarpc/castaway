@@ -10,7 +10,7 @@
 use castaway_core::{ControlCapabilities, DecodedFrame, FrameImage, NowPlaying, PlaybackState};
 use pipeline::attract::AttractScene;
 use pipeline::nowplaying_card::NowPlayingCard;
-use pipeline::render_pipeline::{RenderCommand, RenderLoop};
+use pipeline::render_pipeline::{FrameEpoch, RenderCommand, RenderLoop};
 use pipeline::shell::{Screen, ScreenHit, ShellEvent};
 
 const W: u32 = 1920;
@@ -156,15 +156,18 @@ fn the_shell_does_not_answer_where_a_cast_is_covering_it() {
         "hittable with nothing over it"
     );
 
-    tx.send(RenderCommand::Video(DecodedFrame {
-        width: W,
-        height: H,
-        pts: std::time::Duration::ZERO,
-        image: FrameImage::Cpu {
-            format: castaway_core::PixelFormat::Rgba8,
-            data: bytes::Bytes::from(vec![0xff; (W * H * 4) as usize]),
+    tx.send(RenderCommand::Video(
+        DecodedFrame {
+            width: W,
+            height: H,
+            pts: std::time::Duration::ZERO,
+            image: FrameImage::Cpu {
+                format: castaway_core::PixelFormat::Rgba8,
+                data: bytes::Bytes::from(vec![0xff; (W * H * 4) as usize]),
+            },
         },
-    }));
+        FrameEpoch::ALWAYS_FRESH,
+    ));
     render.pump();
 
     assert_eq!(

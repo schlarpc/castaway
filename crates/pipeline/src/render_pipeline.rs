@@ -118,9 +118,36 @@ const CARD_MIN_SCALE: f32 = 0.82;
 /// How fast the finger has to be moving for a flick to win over where it let go.
 const FLICK: f32 = 1.6;
 
+/// Which session a video frame belongs to (#358).
+///
+/// A frame arriving is normally "the session speaking", and that is why applying one
+/// cancels a pending [`RenderCommand::ClearVideo`] — a control point that cannot seek
+/// in-band stops the item and loads it again, and the clear must not bare the idle screen
+/// between the two. What that rule could not express is *which* session is speaking: a
+/// frame still inside the decoder when the clear ran arrives afterwards, cancels the clear
+/// meant for the session it belongs to, and nothing re-arms it. The panel then holds the
+/// last frame of a finished mirror until the idle return two minutes later.
+///
+/// Stamping the frame makes the distinction representable instead of inferred from
+/// timing: the loop retires the epoch it clears, and a frame from a retired epoch is not
+/// the session speaking, however late it is. Widening the discard window instead would be
+/// a guess about how long a decoder takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FrameEpoch(u64);
+
+impl FrameEpoch {
+    /// An epoch no clear can retire, for frames with no session behind them.
+    ///
+    /// Test fixtures and any producer that pushes pixels outside a session use this: the
+    /// comparison is `<=`, so `MAX` is never stale and such a frame behaves exactly as it
+    /// did before epochs existed.
+    pub const ALWAYS_FRESH: Self = Self(u64::MAX);
+}
+
 pub enum RenderCommand {
-    /// Upload a decoded frame as the video layer.
-    Video(DecodedFrame),
+    /// Upload a decoded frame as the video layer, tagged with the session that produced
+    /// it (#358).
+    Video(DecodedFrame, FrameEpoch),
     /// Drop the video layer (playback stopped).
     ClearVideo,
     /// Show or update the now-playing card. Carries the metadata rather than pixels: a
@@ -194,6 +221,11 @@ pub struct RenderTx {
     /// Wakes the kiosk loop, which sleeps between frames (#59). Every send wakes it:
     /// a command sitting in a channel nobody is spinning on is otherwise invisible.
     waker: castaway_core::Waker,
+    /// The session frames are currently being stamped with (#358). Shared with the
+    /// receiving half so the loop can name the epoch it is clearing, and bumped by
+    /// [`RenderPipeline::begin_session`] rather than by any producer — a producer that
+    /// could mint its own epoch could outrun a clear meant for it.
+    epoch: Arc<AtomicU64>,
 }
 
 impl RenderTx {
@@ -204,10 +236,23 @@ impl RenderTx {
     /// itself is gone and there is no panel left to desynchronise.
     pub fn send(&self, cmd: RenderCommand) {
         match cmd {
-            RenderCommand::Video(_) => drop(self.frames.try_send(cmd)),
+            RenderCommand::Video(..) => drop(self.frames.try_send(cmd)),
             control => drop(self.control.send(control)),
         }
         self.waker.wake();
+    }
+
+    /// Retire the frames of the session that was running and start a new one (#358).
+    ///
+    /// Called once per session start, before the producer that will push its frames
+    /// exists, so every frame of the new session outranks every clear armed for the old.
+    pub fn begin_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The epoch frames are being stamped with right now.
+    fn epoch(&self) -> FrameEpoch {
+        FrameEpoch(self.epoch.load(Ordering::SeqCst))
     }
 
     /// Send a video frame, answering whether the render loop is still there.
@@ -216,7 +261,8 @@ impl RenderTx {
     /// mirror loops use the answer to stop pushing at a loop that is gone.
     pub fn send_frame(&self, frame: DecodedFrame) -> bool {
         let alive = !matches!(
-            self.frames.try_send(RenderCommand::Video(frame)),
+            self.frames
+                .try_send(RenderCommand::Video(frame, self.epoch())),
             Err(TrySendError::Disconnected(_))
         );
         self.waker.wake();
@@ -237,6 +283,9 @@ pub struct RenderRx {
     frames: Receiver<RenderCommand>,
     control: Receiver<RenderCommand>,
     waker: castaway_core::Waker,
+    /// The counter [`RenderTx`] stamps frames from, so a clear can name the epoch it
+    /// retires without having to be told (#358).
+    epoch: Arc<AtomicU64>,
 }
 
 impl RenderRx {
@@ -264,6 +313,14 @@ impl RenderRx {
             dropped += 1;
         }
         dropped
+    }
+
+    /// The epoch frames are being stamped with right now — what a clear retires (#358).
+    ///
+    /// Read at the moment the clear is armed rather than when it fires: a session that
+    /// starts during the grace bumps this, and its frames must outrank the clear.
+    fn epoch(&self) -> FrameEpoch {
+        FrameEpoch(self.epoch.load(Ordering::SeqCst))
     }
 
     /// Block up to `timeout` for the next command. Two receivers share the timeout by
@@ -296,16 +353,19 @@ pub fn render_channel(frame_depth: usize) -> (RenderTx, RenderRx) {
     let (frames_tx, frames_rx) = sync_channel(frame_depth.max(1));
     let (control_tx, control_rx) = std::sync::mpsc::channel();
     let waker = castaway_core::Waker::new();
+    let epoch = Arc::new(AtomicU64::new(0));
     (
         RenderTx {
             frames: frames_tx,
             control: control_tx,
             waker: waker.clone(),
+            epoch: Arc::clone(&epoch),
         },
         RenderRx {
             frames: frames_rx,
             control: control_rx,
             waker,
+            epoch,
         },
     )
 }
@@ -850,6 +910,9 @@ impl RenderPipeline {
     /// reason (#109).
     #[must_use]
     fn begin_session(&self) -> Arc<AtomicBool> {
+        // Before the producer exists, so every frame it sends outranks any clear armed
+        // for the session this one replaces (#358).
+        self.tx.begin_epoch();
         let stop = Arc::new(AtomicBool::new(false));
         if let Ok(mut guard) = self.active.lock() {
             *guard = Some(Arc::clone(&stop));
@@ -1022,6 +1085,11 @@ impl Pipeline for RenderPipeline {
             FrameSource::Url(uri) => self.play(uri.into(), None).await,
             FrameSource::Decoded(mut rx) => {
                 info!("render pipeline: MIRROR (decoded frames → compositor)");
+                // This arm keeps no stop flag of its own — the producer is upstream and
+                // ends by closing `rx` — so it does not go through `begin_session`. It
+                // still starts a session as far as the panel is concerned, and its frames
+                // must outrank a clear left over from the last one (#358).
+                self.tx.begin_epoch();
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     while let Some(frame) = rx.recv().await {
@@ -1524,6 +1592,13 @@ pub struct RenderLoop {
     /// deferral exists for control points that "seek" by stopping and re-loading the
     /// item: an immediate clear bared the idle screen for the gap between the two.
     video_clear_due: Option<std::time::Instant>,
+    /// The newest session whose frames have been cleared (#358).
+    ///
+    /// A frame at or below this is a straggler of something already over — typically out
+    /// of the mirror decoder, which the lane drain in `ClearVideo` cannot reach — and is
+    /// dropped rather than allowed to cancel the clear that retired it. `None` until the
+    /// first clear, so nothing is stale before anything has ended.
+    cleared_through: Option<FrameEpoch>,
     /// The now-playing card's counterpart of [`Self::video_clear_due`].
     card_clear_due: Option<std::time::Instant>,
     /// The side the close badge was last rasterized at; `0` when it is not up.
@@ -1711,6 +1786,7 @@ impl RenderLoop {
             #[cfg(feature = "audio")]
             visualizer: None,
             video_clear_due: None,
+            cleared_through: None,
             video_size: None,
             card_clear_due: None,
             close_badge_side: 0,
@@ -3334,9 +3410,16 @@ impl RenderLoop {
     /// Apply one command. Returns true if it was a video frame.
     fn apply(&mut self, cmd: RenderCommand) -> bool {
         match cmd {
-            RenderCommand::Video(frame) => {
+            RenderCommand::Video(frame, epoch) => {
                 // A frame arriving is the session speaking; whatever clear was pending
-                // belonged to the item this one replaces.
+                // belonged to the item this one replaces. Unless it is not speaking for
+                // any session that still exists: a straggler out of the decoder of a
+                // session that has already been cleared says nothing about the panel's
+                // future, and letting it cancel the clear is what froze the last frame of
+                // a stopped mirror on the glass until the idle return (#358).
+                if self.cleared_through.is_some_and(|cleared| epoch <= cleared) {
+                    return false;
+                }
                 self.video_clear_due = None;
                 // Two ways pixels reach the video layer: uploaded from system memory
                 // (software decode) or imported in place from a surface the decoder
@@ -3525,6 +3608,12 @@ impl RenderLoop {
                 // through the grace instead of around it. Found by #98's first
                 // end-to-end run against a real compositor.
                 self.rx.discard_queued_frames();
+                // Draining the lane cannot reach a frame that is still inside a decoder,
+                // and the mirror path has one: `MIRROR (encoded frames → decode →
+                // compositor)`. Such a frame arrives after this point, and before #358 it
+                // cancelled this very clear. Retiring the epoch is what the discard cannot
+                // do — it covers frames that do not exist yet.
+                self.cleared_through = Some(self.rx.epoch());
 
                 // Only *then*, and not yet. A control point that cannot seek in-band
                 // restarts the item — VLC's live stream sends STOP then a fresh LOAD for

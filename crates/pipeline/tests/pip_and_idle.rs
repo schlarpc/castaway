@@ -14,7 +14,7 @@
 
 use castaway_core::{DecodedFrame, FrameImage};
 use pipeline::attract::AttractScene;
-use pipeline::render_pipeline::{RenderCommand, RenderLoop};
+use pipeline::render_pipeline::{FrameEpoch, RenderCommand, RenderLoop};
 
 const W: u32 = 1920;
 const H: u32 = 1080;
@@ -35,7 +35,7 @@ fn playing() -> (pipeline::RenderTx, RenderLoop) {
     let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
     tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
-    tx.send(RenderCommand::Video(frame()));
+    tx.send(RenderCommand::Video(frame(), FrameEpoch::ALWAYS_FRESH));
     render.pump();
     (tx, render)
 }
@@ -92,7 +92,7 @@ fn a_cast_starting_while_someone_navigates_arrives_in_the_corner() {
     render.pump();
     render.set_shell_foreground(true);
 
-    tx.send(RenderCommand::Video(frame()));
+    tx.send(RenderCommand::Video(frame(), FrameEpoch::ALWAYS_FRESH));
     render.pump();
 
     assert!(render.pip_rect().is_some(), "it should arrive demoted");

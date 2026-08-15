@@ -19,7 +19,7 @@ use pipeline::attract::{AttractScene, WidgetSlot};
 use pipeline::browser::BrowserRole;
 use pipeline::compositor::{DirtyRect, LayerId};
 use pipeline::panel::Surface;
-use pipeline::render_pipeline::{RenderCommand, RenderLoop};
+use pipeline::render_pipeline::{FrameEpoch, RenderCommand, RenderLoop};
 
 const W: u32 = 1920;
 const H: u32 = 1080;
@@ -240,15 +240,18 @@ fn a_demoted_video_is_nowhere_near_her_and_leaves_her_alone() {
     // Video demotes to the PiP corner, not the slot. Driving her from "is a session present"
     // would have hidden her for a video in the opposite corner of the panel.
     let (tx, mut render, _time) = idle_with_widget();
-    tx.send(RenderCommand::Video(castaway_core::DecodedFrame {
-        width: W,
-        height: H,
-        pts: std::time::Duration::ZERO,
-        image: castaway_core::FrameImage::Cpu {
-            format: castaway_core::PixelFormat::Rgba8,
-            data: bytes::Bytes::from(vec![0x40; (W * H * 4) as usize]),
+    tx.send(RenderCommand::Video(
+        castaway_core::DecodedFrame {
+            width: W,
+            height: H,
+            pts: std::time::Duration::ZERO,
+            image: castaway_core::FrameImage::Cpu {
+                format: castaway_core::PixelFormat::Rgba8,
+                data: bytes::Bytes::from(vec![0x40; (W * H * 4) as usize]),
+            },
         },
-    }));
+        FrameEpoch::ALWAYS_FRESH,
+    ));
     settle(&mut render);
     render.set_shell_foreground(true);
     settle(&mut render);
