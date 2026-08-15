@@ -15,6 +15,7 @@ mod instance;
 mod logging;
 mod screen;
 mod shutdown;
+mod watchdog;
 // The network-surface registry (#22/#30): every socket, as data, generating the doc,
 // the firewall JSON, and the --network-surface query.
 mod surface;
@@ -178,6 +179,13 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
+
+    // Before anything else is wired: the watchdog is the one thing that has to keep
+    // working when the rest does not, and it is cheap enough to start unconditionally
+    // (one thread, one timer a second) — see `watchdog` and #368.
+    let beats = watchdog::Beats::new(std::time::Instant::now());
+    let watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    watchdog::spawn(runtime.handle(), &beats, Arc::clone(&watchdog_stop));
 
     let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(64);
     let shutdown = shutdown::Shutdown::new();
@@ -732,6 +740,9 @@ fn main() -> anyhow::Result<()> {
             shell_sink,
             remote_input: Some(remote_input),
             touch_surface: Some(touch_surface),
+            // The loop stamps this on every pass, so the watchdog can say whether the
+            // panel is asleep (ordinary) or wedged (#368) without guessing from outside.
+            heartbeat: Some(beats.render.clone()),
             #[cfg(feature = "audio")]
             visualizer,
         };
@@ -741,6 +752,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "electron"))]
         pipeline::kiosk::run(rx, wiring).map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         shutdown.fire();
+        watchdog_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         // Dropping the runtime waits for every blocking task that has already started —
         // and the SponsorBlock Lounge stream is a blocking read that can sit inside its
         // 90-second timeout with nothing to interrupt it. The window is gone; nobody is

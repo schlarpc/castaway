@@ -36,6 +36,16 @@ use crate::stream::feed::{LiveFeed, Subscription};
 
 use crate::ice_ports::PortPool;
 
+/// The window a peer's loops are judged over, and what counts as a runaway in it.
+///
+/// Generous against real traffic: a 60 fps video pump turns 60 times a second, an input
+/// channel a few hundred at the very most while a finger is down. A thousand a second is
+/// something no peer produces and a spinning loop reaches instantly — which is the state
+/// #368 recorded, where two threads burned two cores and nothing said which loops they
+/// were turning.
+const PEER_SPIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+const PEER_SPIN_LIMIT: u64 = 2_000;
+
 /// The H.264 payload type this end *registers*.
 ///
 /// Not the one packets go out stamped with — an answerer uses the offerer's numbering, and
@@ -489,7 +499,16 @@ impl RemoteService {
                 }
             };
             debug!(peer = id.get(), payload_type, "remote: sending video");
+            let mut spin = castaway_core::SpinWatch::new(PEER_SPIN_WINDOW, PEER_SPIN_LIMIT);
             while let Some(frame) = subscription.next().await {
+                if let Some(report) = spin.turn(std::time::Instant::now()) {
+                    warn!(
+                        peer = id.get(),
+                        turns = report.turns,
+                        per_second = report.per_second(),
+                        "remote: the video pump is spinning (#368)"
+                    );
+                }
                 let sample = rtc::media::Sample {
                     data: bytes::Bytes::copy_from_slice(&frame.data),
                     duration: frame.duration,
@@ -536,7 +555,16 @@ impl RemoteService {
                 }
             };
             debug!(peer = id.get(), payload_type, "remote: sending audio");
+            let mut spin = castaway_core::SpinWatch::new(PEER_SPIN_WINDOW, PEER_SPIN_LIMIT);
             loop {
+                if let Some(report) = spin.turn(std::time::Instant::now()) {
+                    warn!(
+                        peer = id.get(),
+                        turns = report.turns,
+                        per_second = report.per_second(),
+                        "remote: the audio pump is spinning (#368)"
+                    );
+                }
                 // The video pump learns of a dead peer from its writes, because frames
                 // always flow while a peer is up. Sound does not have that property — a
                 // build with no audio path publishes nothing, ever — so a pump parked on
@@ -770,7 +798,20 @@ impl PeerConnectionEventHandler for PeerHandler {
         // The channel is polled rather than handed a callback, so it needs a task. It
         // ends when the channel does, which is when the connection does.
         self.service.runtime.spawn(Box::pin(async move {
+            let mut spin = castaway_core::SpinWatch::new(PEER_SPIN_WINDOW, PEER_SPIN_LIMIT);
             while let Some(event) = channel.poll().await {
+                // The suspect shape, and the reason this loop is watched at all: `poll`
+                // answering immediately with an event this `match` ignores turns the loop
+                // as fast as the scheduler allows, forever, and says nothing while doing
+                // it (#368).
+                if let Some(report) = spin.turn(std::time::Instant::now()) {
+                    warn!(
+                        peer = id.get(),
+                        turns = report.turns,
+                        per_second = report.per_second(),
+                        "remote: the input channel loop is spinning (#368)"
+                    );
+                }
                 match event {
                     DataChannelEvent::OnMessage(message) => {
                         match std::str::from_utf8(&message.data) {

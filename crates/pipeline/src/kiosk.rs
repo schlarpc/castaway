@@ -119,6 +119,13 @@ struct KioskApp {
     /// wherever the loop runs, so it obeys the same wake-and-sleep discipline as every
     /// other producer rather than needing a winit user-event type of its own.
     remote_input: Option<Arc<input_touch::RemoteInputQueue>>,
+    /// Liveness for the watchdog: stamped on every pass of this loop, so a thread that
+    /// cannot be starved by it can say whether the panel is asleep or wedged (#368).
+    heartbeat: Option<castaway_core::Heartbeat>,
+    /// How fast this loop is turning. A free-running kiosk is a known failure — the
+    /// unconditional `request_redraw` #59 replaced burned a core at ~970 fps — and it is
+    /// invisible from the log, because a loop drawing an idle shell says nothing at all.
+    spin: castaway_core::SpinWatch,
     /// The active session's touch surface — see [`KioskWiring::touch_surface`].
     touch_surface: Option<castaway_core::TouchHandle>,
     /// The surface [`Self::panel_size_known`] has already told the panel size to, so a
@@ -854,6 +861,15 @@ impl KioskApp {
     }
 }
 
+/// The window the loop's rate is judged over, and what counts as a runaway in it.
+///
+/// A kiosk that is drawing owes the glass at most one frame per refresh, so 240 passes a
+/// second is four times what a 60 Hz panel can present and twice what a 120 Hz one can —
+/// far enough above the ceiling that a busy cast never trips it, far enough below a real
+/// free-run (measured at ~970 fps before #59) that one cannot hide under it.
+const SPIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+const SPIN_LIMIT: u64 = 480;
+
 /// One frame at 60 Hz, until the monitor says otherwise (see `resumed`).
 const FALLBACK_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
 
@@ -1089,6 +1105,17 @@ impl ApplicationHandler for KioskApp {
             }
             WindowEvent::RedrawRequested => {
                 let now = std::time::Instant::now();
+                if let Some(beat) = &self.heartbeat {
+                    beat.beat(now);
+                }
+                if let Some(report) = self.spin.turn(now) {
+                    warn!(
+                        passes = report.turns,
+                        per_second = report.per_second(),
+                        "kiosk: the render loop is free-running rather than sleeping \
+                         between frames (#59, #368)"
+                    );
+                }
                 self.dirty = false;
                 self.next_frame_at = Some(now + self.frame_interval);
                 // Browser first: its pump may deliver a fresh frame, which
@@ -1124,6 +1151,12 @@ impl ApplicationHandler for KioskApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Stamped here as well as on a redraw, so the age means "this loop is cycling"
+        // rather than "this loop is drawing" — a panel that wakes for a banner and goes
+        // back to sleep is alive, and a watchdog told otherwise would cry wolf (#368).
+        if let Some(beat) = &self.heartbeat {
+            beat.beat(std::time::Instant::now());
+        }
         // Before deciding whether the panel may sleep, take anything a peer queued: a
         // pending input is work owed, and sleeping on it would hold the contact until
         // something unrelated woke the loop.
@@ -1197,6 +1230,9 @@ pub struct KioskWiring {
     /// UIBC negotiated — takes the panel ahead of the browser layer for the whole time it
     /// is the active source, because the picture on screen is its picture (#125).
     pub touch_surface: Option<castaway_core::TouchHandle>,
+    /// Where this loop reports that it is still going (#368). `None` in tests and in
+    /// builds with nobody watching.
+    pub heartbeat: Option<castaway_core::Heartbeat>,
 }
 
 impl KioskWiring {
@@ -1213,6 +1249,8 @@ impl KioskWiring {
             shell_sink: self.shell_sink,
             remote_input: self.remote_input,
             touch_surface: self.touch_surface,
+            heartbeat: self.heartbeat,
+            spin: castaway_core::SpinWatch::new(SPIN_WINDOW, SPIN_LIMIT),
             sized_surface: None,
             window: None,
             render: None,
@@ -1328,6 +1366,8 @@ mod tests {
             render: None,
             controls: None,
             shell_sink: None,
+            heartbeat: None,
+            spin: castaway_core::SpinWatch::new(SPIN_WINDOW, SPIN_LIMIT),
             remote_input: None,
             contacts: std::collections::HashMap::new(),
             drag_last: std::collections::HashMap::new(),
