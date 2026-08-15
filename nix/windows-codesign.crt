@@ -1,5 +1,26 @@
-# castaway's Authenticode certificate (#344) — none generated yet.
-#
-# `nix run .#windows-codesign-keygen` writes the certificate here and prints the two
-# Actions secrets that go with it. Until then the release publishes unsigned, loudly,
-# and #346 has nothing to import into the box's trust store.
+-----BEGIN CERTIFICATE-----
+MIIEejCCAuKgAwIBAgIUMwlL84agGPYw9DoEHRzgRc7AWLUwDQYJKoZIhvcNAQEL
+BQAwOjElMCMGA1UEAwwcY2FzdGF3YXkga2lvc2sgKHNlbGYtc2lnbmVkKTERMA8G
+A1UECgwIY2FzdGF3YXkwHhcNMjYwODE1MDEyNTI5WhcNMzYwODEyMDEyNTI5WjA6
+MSUwIwYDVQQDDBxjYXN0YXdheSBraW9zayAoc2VsZi1zaWduZWQpMREwDwYDVQQK
+DAhjYXN0YXdheTCCAaIwDQYJKoZIhvcNAQEBBQADggGPADCCAYoCggGBAKcGzwfM
+g8IpGnj2tFTns8NmkAcsIt6IqdpI1bZ+P072n17ffA5o1K6Dt5ODf0Q/y97OEcpM
+FTFmMyXmbcbyM5EMBpnc6cXu1VKox3CSNFi+HAqQt8LZg3ZYQ7c6fAKqVJHGbO1f
+hOhL3uqmGELiC087zKSL06VX+3npQXKwJw1B19OhqoYLQzevp/rdsmU+xjYS+hL+
+uJvjmifChlwi5AYJlFMP+0oVwJb6mFUY+3iQfp6FIbDpPeOPujvWFCriif+gh54c
+BZx92CAQ838kBOJNdrnRkdCTUwRxciXjWIzfuYGljW4tLxZO80i6+XnkmRy0bWXE
+y5pOwKh7E6E4oG/NzS5j3ay6yOEK3qsC2GAd72FWulBzF/OwiKWjWA8Hoiab+s2D
+R1dVftb0GDSJs0SB99qR1WB2tBsg0qcLnPOchz6ULRiDoK8892XnRFUsButC2gCy
+dEOkYX2mZB++RoIZwKXCOwrqqX0VoWAU1On5WutptZ7il425F5PLE0/QwQIDAQAB
+o3gwdjAdBgNVHQ4EFgQUqMdujur58OGsRMh69atv30/XEC8wHwYDVR0jBBgwFoAU
+qMdujur58OGsRMh69atv30/XEC8wDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMC
+B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwMwDQYJKoZIhvcNAQELBQADggGBAGCV
+YmMaBjy3LVaBEk5KfsRfBhOClqIPpDha4dx56grMLFRmFjCRvIWkmlVCtQk1lTh8
+ERgr/N5vuMbD1ISxGfQeZLqrXKYMc3MEZiZS7AoLHiERdQIHZ5YRWt2ZF2qI/20f
+4S4xa9c7OC90+FbtWkWY3Aoh+E1zdJnC8dnpofyx8Y5JulpE/jqxfdxdml1zz3lA
+xUpqKul99mhBAmGNON1LJUnEKcOA0YHL7t70Z5A7x7hVZepmxYO88UM3p2LK2oSz
++KTAGifp7UGnhxt7hrYHS0OVlZtuYaYiUyv/6uTFMCO3nmjBu5gdZjic6LZvobV/
+mM6tRuU8d8HDq2AKV6KYC8iA/Y8nkdcFFdo5S3kjRBS28NCeupeaYrEyBxVlYvvf
+W15y4DOshafy5cTkhgY7Dpf7FsKmwCrTShPrQl9uy+8mc3dJX+F988xgkV+N+F9W
+VXCXCA6pURlbWzH3oZaaWe5inDoSV4ReXDmRyzwFwt4ZU3WEj/vOviNYDn173w==
+-----END CERTIFICATE-----
