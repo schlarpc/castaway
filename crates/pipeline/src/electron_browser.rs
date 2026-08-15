@@ -209,6 +209,7 @@ use crate::audio_decode::PcmBlock;
 use crate::browser::{BrowserCommand, BrowserRole, BrowserView};
 use crate::browser_proto::{
     encode, FdTransport, FromBrowser, LineFramer, PixelOrder, PlaneInfo, Surface, ToBrowser,
+    ViewGeneration,
 };
 use crate::error::PipelineError;
 use crate::hwaccel::remote_handle::{ProcessRef, RemoteHandle};
@@ -323,6 +324,31 @@ struct Health {
     /// for the whole life of an audio-only page and for the window before the first such
     /// pairing.
     av_skew_seen: std::sync::atomic::AtomicBool,
+    /// Paints that reached the compositor as a layer — the only counter that means
+    /// "something is on the glass" (#359).
+    ///
+    /// Every other frame counter here answers a question one step short of that: `drops`
+    /// is what the *browser* threw away, `scm_frames`/`pulled_frames` are how descriptors
+    /// travelled. A session could report a healthy skew, zero browser drops and a
+    /// perfectly transported descriptor for every frame while the panel stayed black,
+    /// because nothing counted the last step. That is exactly what happened, and reading
+    /// the browser's own numbers as evidence about the panel is what made the bug take a
+    /// session to find rather than a log line.
+    imported_frames: AtomicU64,
+    /// Paints dropped because their placement is over (#359) — a resize or role change
+    /// raced them. A handful per placement change is normal; a count that tracks the
+    /// paint rate means the generation is not being echoed and nothing will ever be shown.
+    dropped_stale_view: AtomicU64,
+    /// Paints dropped because that window has no page: a blanked window still paints, and
+    /// importing `about:blank` would put a white layer where "hidden" belongs.
+    dropped_no_page: AtomicU64,
+    /// Paints dropped because the window is not on the glass — the panel answered
+    /// `Hidden`, a card owns the slot, or a demoted page does. Expected, and the number
+    /// that distinguishes "not shown on purpose" from "shown and empty".
+    dropped_not_on_glass: AtomicU64,
+    /// Paints whose buffer could not be fetched or imported — the descriptor did not
+    /// come across, or the GPU refused the texture.
+    dropped_import_failed: AtomicU64,
     /// Frames imported from descriptors the browser *passed* (`SCM_RIGHTS`, #271).
     scm_frames: AtomicU64,
     /// Frames imported by *reaching in* (`pidfd_getfd`/`DuplicateHandle`).
@@ -401,8 +427,12 @@ struct BrowserAudio {
 struct PendingPaint {
     id: u64,
     format: PixelOrder,
+    /// The texture's *coded* size, for the import. Not an identity check — the browser
+    /// does not paint at exactly the size it is asked for (#359).
     width: u32,
     height: u32,
+    /// Which placement painted it, matched against the current one on import (#359).
+    generation: ViewGeneration,
     modifier: u64,
     plane: PlaneInfo,
     /// The plane's descriptor, already ours, when the browser passed it with
@@ -848,6 +878,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             format,
             width,
             height,
+            generation,
             media_time,
             modifier,
             fd_transport,
@@ -939,6 +970,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                     format,
                     width,
                     height,
+                    generation,
                     modifier,
                     plane,
                     // One plane (checked above), so the first descriptor is the frame.
@@ -958,13 +990,29 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             health.drops.store(total, Ordering::Relaxed);
         }
         FromBrowser::NoTexture { detail } => {
-            if !health.software_fallback.swap(true, Ordering::Relaxed) {
-                error!(
+            // A single textureless paint at startup is ordinary — Chromium's GPU
+            // capability is gathered asynchronously, so the first paint or two can land
+            // before the shared-texture path is up. Only a window that has *never* had a
+            // textured paint is actually on the software path.
+            //
+            // This used to latch on the first one and announce, at `error`, that "the
+            // browser layer will stay empty" — a claim it neither caused nor checked, and
+            // which nothing outside this module reads. On the deploy box that single
+            // startup line was the only visible symptom of an unrelated bug (#359), and
+            // it sent the diagnosis a session in the wrong direction. Say what was
+            // observed; let `imported` in the session report say whether it mattered.
+            if health.imported_frames.load(Ordering::Relaxed) == 0
+                && !health.software_fallback.swap(true, Ordering::Relaxed)
+            {
+                warn!(
                     target: "castaway::browser",
                     %detail,
-                    "browser cannot produce GPU frames; the zero-copy path is unavailable \
-                     and the browser layer will stay empty (D36/#64)"
+                    "a paint arrived without a shared texture and nothing has been \
+                     composited yet; if `imported` stays 0 this build is on the software \
+                     path (D36/#64)"
                 );
+            } else {
+                debug!(target: "castaway::browser", %detail, "textureless paint");
             }
         }
         FromBrowser::ScriptletQuery { id, url } => {
@@ -1151,6 +1199,8 @@ pub struct ElectronHost {
     /// trip, which is why this is remembered rather than recomputed into the subprocess
     /// every frame.
     views: Views,
+    /// The placement each window is painting for, matched against every paint (#359).
+    generations: Generations,
     ladder: RecoveryLadder,
     gave_up: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Which window holds the left button, and therefore owns the pointer even where it
@@ -1201,6 +1251,39 @@ impl Views {
     }
 
     const fn get(&self, surface: Surface) -> Option<BrowserView> {
+        match surface {
+            Surface::Widget => self.widget,
+            Surface::Page => self.page,
+        }
+    }
+}
+
+/// The placement each window is currently painting for (#359).
+///
+/// Bumped on every `Navigate`/`Resize` — the two messages that establish a viewport —
+/// and compared against the stamp a paint comes back with. Per surface, because the
+/// windows are placed independently: a cast opening fullscreen must not invalidate the
+/// clock's in-flight paint.
+#[derive(Default)]
+struct Generations {
+    widget: ViewGeneration,
+    page: ViewGeneration,
+}
+
+impl Generations {
+    /// Start the next placement for `surface` and answer its stamp.
+    fn next(&mut self, surface: Surface) -> ViewGeneration {
+        let slot = match surface {
+            Surface::Widget => &mut self.widget,
+            Surface::Page => &mut self.page,
+        };
+        // Real generations start at 1, so a bump from the default never yields
+        // `UNSTAMPED` and an unstamped paint stays distinguishable from a real one.
+        slot.0 += 1;
+        *slot
+    }
+
+    const fn get(&self, surface: Surface) -> ViewGeneration {
         match surface {
             Surface::Widget => self.widget,
             Surface::Page => self.page,
@@ -1321,6 +1404,7 @@ impl ElectronHost {
             widget_started: false,
             page_url: None,
             views: Views::default(),
+            generations: Generations::default(),
             ladder: RecoveryLadder::default(),
             gave_up: None,
             left_down: None,
@@ -1395,10 +1479,12 @@ impl ElectronHost {
                 render.clear_browser_layer(had.layer);
             }
             if let Some(view) = want {
+                let generation = self.generations.next(surface);
                 self.send(&ToBrowser::Resize {
                     surface,
                     width: view.rect.width,
                     height: view.rect.height,
+                    generation,
                 });
             }
         }
@@ -1465,23 +1551,43 @@ impl ElectronHost {
         // where "hidden" should be — and after a dismiss the old page's last paints are
         // still arriving.
         if !self.has_page(surface) {
+            electron
+                .health
+                .dropped_no_page
+                .fetch_add(1, Ordering::Relaxed);
             return; // `borrow` drops here, releasing the frame.
         }
         let Some(view) = self.views.get(surface) else {
             // Not on the glass: the panel answered `Hidden`, a card owns the slot, or —
             // for the clock — a demoted page does. The window keeps painting; the frames
             // go back.
+            electron
+                .health
+                .dropped_not_on_glass
+                .fetch_add(1, Ordering::Relaxed);
             return; // `borrow` drops here, releasing the frame.
         };
-        // A frame sized for a viewport we are no longer showing: the paint raced a role
+        // A frame painted for a viewport we are no longer showing: the paint raced a role
         // change or a resize. Stretching one frame of the old thing across the new rect
         // is worse than one frame of nothing.
-        if (paint.width, paint.height) != (view.rect.width, view.rect.height) {
+        //
+        // Matched by *placement*, not by pixel size. The size comparison this replaces
+        // assumed the browser paints at exactly the size it is asked for; Chromium's
+        // offscreen path returns 3841x2161 for a 3840x2160 viewport on the deploy box, so
+        // every frame read as stale and the browser layer stayed empty for the life of the
+        // session — audible YouTube, black panel — with only a `debug!` to say so (#359).
+        let current = self.generations.get(surface);
+        if !paint.generation.matches(current) {
+            electron
+                .health
+                .dropped_stale_view
+                .fetch_add(1, Ordering::Relaxed);
             debug!(
                 target: "castaway::browser",
-                got = format_args!("{}x{}", paint.width, paint.height),
-                want = format_args!("{}x{}", view.rect.width, view.rect.height),
-                "dropping a stale-sized paint"
+                got = paint.generation.0,
+                want = current.0,
+                size = format_args!("{}x{}", paint.width, paint.height),
+                "dropping a paint from a placement that is over"
             );
             return; // `borrow` drops here, releasing the frame.
         }
@@ -1504,6 +1610,10 @@ impl ElectronHost {
                     handle
                 }
                 Err(e) => {
+                    electron
+                        .health
+                        .dropped_import_failed
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(target: "castaway::browser", error = %e, "could not fetch the frame's buffer");
                     return; // `borrow` drops here, releasing the frame.
                 }
@@ -1519,6 +1629,10 @@ impl ElectronHost {
                 handle
             }
             Err(e) => {
+                electron
+                    .health
+                    .dropped_import_failed
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(target: "castaway::browser", error = %e, "could not fetch the frame's buffer");
                 return; // `borrow` drops here, releasing the frame.
             }
@@ -1543,24 +1657,36 @@ impl ElectronHost {
             view.transform,
             view.layer,
         ) {
-            Ok(()) => trace!(
-                target: "castaway::browser",
-                id = paint.id,
-                width = paint.width,
-                height = paint.height,
-                layer = ?view.layer,
-                "frame imported"
-            ),
-            Err(e) => warn!(
-                target: "castaway::browser",
-                error = %e,
-                width = paint.width,
-                height = paint.height,
-                modifier = format_args!("{:#x}", paint.modifier),
-                stride = paint.plane.stride,
-                offset = paint.plane.offset,
-                "browser frame import failed"
-            ),
+            Ok(()) => {
+                electron
+                    .health
+                    .imported_frames
+                    .fetch_add(1, Ordering::Relaxed);
+                trace!(
+                    target: "castaway::browser",
+                    id = paint.id,
+                    width = paint.width,
+                    height = paint.height,
+                    layer = ?view.layer,
+                    "frame imported"
+                );
+            }
+            Err(e) => {
+                electron
+                    .health
+                    .dropped_import_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    target: "castaway::browser",
+                    error = %e,
+                    width = paint.width,
+                    height = paint.height,
+                    modifier = format_args!("{:#x}", paint.modifier),
+                    stride = paint.plane.stride,
+                    offset = paint.plane.offset,
+                    "browser frame import failed"
+                );
+            }
         }
     }
 
@@ -1689,11 +1815,13 @@ impl ElectronHost {
             || BrowserRole::AttractWidget.view(self.size).rect,
             |v| v.rect,
         );
+        let generation = self.generations.next(Surface::Widget);
         self.send(&ToBrowser::Navigate {
             surface: Surface::Widget,
             url,
             width: rect.width,
             height: rect.height,
+            generation,
         });
     }
 
@@ -1728,11 +1856,13 @@ impl ElectronHost {
         let view = render.page_view(true);
         *self.views.slot(Surface::Page) = view;
         let rect = view.map_or_else(|| BrowserRole::Fullscreen.view(self.size).rect, |v| v.rect);
+        let generation = self.generations.next(Surface::Page);
         self.send(&ToBrowser::Navigate {
             surface: Surface::Page,
             url: url.to_string(),
             width: rect.width,
             height: rect.height,
+            generation,
         });
     }
 
@@ -1842,15 +1972,31 @@ impl ElectronHost {
             return;
         }
         self.next_report = now + std::time::Duration::from_secs(5);
-        if let Some(skew) = electron.av_skew_ms() {
-            info!(
-                target: "castaway::browser",
-                av_skew_ms = skew,
-                audio_blocks = electron.audio_blocks(),
-                drops = electron.drops(),
-                "browser session"
-            );
-        }
+        let h = &electron.health;
+        let imported = h.imported_frames.load(Ordering::Relaxed);
+        let stale = h.dropped_stale_view.load(Ordering::Relaxed);
+        let no_page = h.dropped_no_page.load(Ordering::Relaxed);
+        let off_glass = h.dropped_not_on_glass.load(Ordering::Relaxed);
+        let failed = h.dropped_import_failed.load(Ordering::Relaxed);
+        // Unconditional, and `imported` is why. This used to log only when the skew gauge
+        // had paired something, so a session with no page audio said nothing at all — and
+        // when it *did* log, every number in it was about the browser's side of the wire.
+        // A panel showing nothing could report a perfect skew, zero drops and clean
+        // descriptor transport, because none of those count the step that puts a frame on
+        // the glass. `imported=0` with paints arriving is the whole bug in one field
+        // (#359), and the drop reasons say which way it went.
+        info!(
+            target: "castaway::browser",
+            av_skew_ms = electron.av_skew_ms(),
+            audio_blocks = electron.audio_blocks(),
+            browser_drops = electron.drops(),
+            imported,
+            dropped_stale_view = stale,
+            dropped_no_page = no_page,
+            dropped_not_on_glass = off_glass,
+            dropped_import_failed = failed,
+            "browser session"
+        );
     }
 
     /// Ask the cast page a question. Test-only; see [`Electron::probe`].

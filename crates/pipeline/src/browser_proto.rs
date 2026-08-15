@@ -145,9 +145,17 @@ pub enum FromBrowser {
         /// Channel order.
         format: PixelOrder,
         /// Coded width in pixels.
+        ///
+        /// The *coded* size, which is what the texture is allocated at — not a promise
+        /// that it equals the viewport that was asked for. It does not on Windows
+        /// (#359), so this is geometry for the import, never an identity check.
         width: u32,
-        /// Coded height in pixels.
+        /// Coded height in pixels. See [`FromBrowser::Paint::width`].
         height: u32,
+        /// Which placement painted it (#359). Defaulted so a host app that does not
+        /// stamp decodes as [`ViewGeneration::UNSTAMPED`] and is accepted.
+        #[serde(default)]
+        generation: ViewGeneration,
         /// Chromium's paint timestamp in seconds — the compositor's frame clock, on an
         /// origin of Chromium's choosing. **Not** the media clock
         /// [`FromBrowser::Audio::media_time`] is on: the two share a rate, not an
@@ -273,6 +281,42 @@ pub enum FromBrowser {
     },
 }
 
+/// Which placement of a window a message is about (#359).
+///
+/// A paint has to be matched against the viewport that asked for it, because a paint in
+/// flight when the placement changed is pixels of something no longer on the glass. That
+/// used to be inferred from the frame's *size* — if it did not equal the view rect it was
+/// stale — which quietly assumed the browser paints at exactly the size it is asked for.
+/// It does not: Chromium's offscreen path returned 3841x2161 for a 3840x2160 viewport on
+/// the deploy box, so every frame read as stale and the browser layer stayed empty with
+/// only a `debug!` to say so.
+///
+/// The generation says the same thing without the assumption. It is stamped on the
+/// `Navigate`/`Resize` that establishes a placement, echoed on every paint from it, and
+/// compared for equality — so a stale paint is identified by *which viewport it belongs
+/// to*, which is what "stale" meant all along, rather than by a pixel count the browser
+/// never promised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ViewGeneration(pub u64);
+
+impl ViewGeneration {
+    /// The generation of a host app that does not stamp its paints.
+    ///
+    /// Real generations start at 1, so this cannot collide with one. A paint carrying it
+    /// is accepted rather than dropped: the host app ships inside the same artifact as
+    /// the receiver, so the two disagreeing means something is badly wrong already, and
+    /// showing the page is a better failure than a permanently blank layer — which is
+    /// exactly the bug this type exists to end.
+    pub const UNSTAMPED: Self = Self(0);
+
+    /// Does a paint carrying `self` belong to the placement at `current`?
+    #[must_use]
+    pub const fn matches(self, current: Self) -> bool {
+        self.0 == current.0 || self.0 == Self::UNSTAMPED.0
+    }
+}
+
 /// What we send the browser.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -298,6 +342,8 @@ pub enum ToBrowser {
         width: u32,
         /// Viewport height in pixels.
         height: u32,
+        /// The placement this navigation establishes; echoed on its paints (#359).
+        generation: ViewGeneration,
     },
     /// Stop painting and drop one window's page. The other window is untouched — this
     /// is what lets a cast end without the clock so much as blinking.
@@ -317,6 +363,8 @@ pub enum ToBrowser {
         width: u32,
         /// New height in pixels.
         height: u32,
+        /// The placement this resize establishes; echoed on its paints (#359).
+        generation: ViewGeneration,
     },
     /// A touch point, in browser view pixels.
     Touch {
@@ -827,6 +875,63 @@ mod tests {
     }
 
     #[test]
+    fn a_paint_is_matched_by_placement_and_never_by_its_pixel_size() {
+        // #359. The panel showed a black browser layer with working audio for a whole
+        // session because staleness was inferred from the frame's dimensions: Chromium's
+        // offscreen path paints 3841x2161 for a 3840x2160 viewport on the deploy box, so
+        // every frame compared unequal to the view rect and was released unimported.
+        //
+        // The point of the generation is that no size appears in this decision at all.
+        // There is deliberately nothing to assert about width and height here — if a
+        // future change reintroduces a size comparison, it cannot be expressed through
+        // this type, which is the guarantee being pinned.
+        let current = ViewGeneration(4);
+        assert!(
+            ViewGeneration(4).matches(current),
+            "a paint from the placement now on the glass is not stale, whatever it measures"
+        );
+        assert!(
+            !ViewGeneration(3).matches(current),
+            "a paint for the previous placement is pixels of something no longer shown"
+        );
+        assert!(
+            !ViewGeneration(5).matches(current),
+            "a paint from a placement this side has not established yet is not current either"
+        );
+    }
+
+    #[test]
+    fn an_unstamped_paint_is_shown_rather_than_discarded() {
+        // A host app that does not stamp decodes as UNSTAMPED. It ships inside the same
+        // artifact as the receiver, so this means something is already badly wrong — and
+        // the right failure is the page appearing, not a layer that is blank for ever,
+        // which is the bug this type was introduced to end.
+        assert!(ViewGeneration::UNSTAMPED.matches(ViewGeneration(11)));
+        // And a real generation never collides with it, so "unstamped" stays a distinct
+        // statement rather than an alias for the first placement.
+        assert_ne!(ViewGeneration::UNSTAMPED, ViewGeneration(1));
+    }
+
+    #[test]
+    fn a_paint_without_a_generation_still_decodes() {
+        // `#[serde(default)]`: an older host app sends no `generation` at all, and a
+        // paint that fails to decode is a frame silently lost.
+        let line = r#"{"type":"paint","surface":"page","id":1,"format":"bgra","width":3841,"height":2161,"planes":[{"fd":7,"stride":0,"offset":0}]}"#;
+        let msg: FromBrowser = serde_json::from_str(line).expect("paint should decode");
+        let FromBrowser::Paint {
+            generation, width, ..
+        } = msg
+        else {
+            panic!("expected paint")
+        };
+        assert_eq!(generation, ViewGeneration::UNSTAMPED);
+        assert_eq!(
+            width, 3841,
+            "the coded size is carried, it is just not a verdict"
+        );
+    }
+
+    #[test]
     fn window_commands_name_their_surface_in_the_words_the_host_app_reads() {
         // Byte-level, like the decode fixture above and for the same reason: the Rust
         // side agreeing with itself proves nothing about the JavaScript that switches on
@@ -839,8 +944,9 @@ mod tests {
                     url: "https://clock/".into(),
                     width: 640,
                     height: 360,
+                    generation: ViewGeneration(7),
                 },
-                r#"{"type":"navigate","surface":"widget","url":"https://clock/","width":640,"height":360}"#,
+                r#"{"type":"navigate","surface":"widget","url":"https://clock/","width":640,"height":360,"generation":7}"#,
             ),
             (
                 ToBrowser::Blank {
@@ -853,8 +959,9 @@ mod tests {
                     surface: Surface::Page,
                     width: 1920,
                     height: 1080,
+                    generation: ViewGeneration(9),
                 },
-                r#"{"type":"resize","surface":"page","width":1920,"height":1080}"#,
+                r#"{"type":"resize","surface":"page","width":1920,"height":1080,"generation":9}"#,
             ),
             (
                 ToBrowser::Touch {

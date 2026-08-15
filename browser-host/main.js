@@ -703,14 +703,15 @@ function dispatchPointer(msg) {
  * creation fails and another window exists, both surfaces share it — single-window
  * behaviour as a logged fallback, because a receiver with a clock through its cast page
  * is degraded and a receiver that crashed is gone. */
-function ensureWindow(surface, width, height) {
+function ensureWindow(surface, width, height, generation) {
   const existing = getWindow(surface);
   if (existing) {
+    existing.__viewGen = generation || 0;
     existing.setContentSize(width, height);
     return existing;
   }
   try {
-    const w = createWindow(surface, width, height);
+    const w = createWindow(surface, width, height, generation);
     wins.set(surface, w);
     return w;
   } catch (e) {
@@ -721,12 +722,13 @@ function ensureWindow(surface, width, height) {
       `creating the ${surface} window failed (${e}); sharing one window for both surfaces`
     );
     wins.set(surface, survivor);
+    survivor.__viewGen = generation || 0;
     survivor.setContentSize(width, height);
     return survivor;
   }
 }
 
-function createWindow(surface, width, height) {
+function createWindow(surface, width, height, generation) {
   const w = new BrowserWindow({
     show: false,
     webPreferences: {
@@ -744,6 +746,12 @@ function createWindow(surface, width, height) {
   // message about this window carries; navigate re-stamps it, which only matters when
   // one window is serving both surfaces.
   w.__surface = surface;
+  // Which placement castaway last asked this window for (#359). Echoed on every paint
+  // so the consumer can tell a frame of the current viewport from one still in flight
+  // for the previous — a judgement it used to make by comparing pixel dimensions, which
+  // silently discarded every frame on a platform where Chromium does not paint at
+  // exactly the requested size.
+  w.__viewGen = generation || 0;
   w.__touchPoints = new Map();
   w.__lent = 0;
   w.__scriptletHandle = null;
@@ -814,6 +822,7 @@ function createWindow(surface, width, height) {
       format: info.pixelFormat === 'rgba' ? 'rgba' : 'bgra',
       width: info.codedSize.width,
       height: info.codedSize.height,
+      generation: w.__viewGen || 0,
       // The compositor's frame timestamp (microseconds → seconds), on an origin of
       // Chromium's choosing — not the media element's clock. castaway pairs it with
       // the audio tap's `mediaTime` by subtracting the session-start offset (#278).
@@ -858,10 +867,13 @@ function handle(msg) {
       return;
     }
     case 'navigate': {
-      const win = ensureWindow(msg.surface, msg.width, msg.height);
+      const win = ensureWindow(msg.surface, msg.width, msg.height, msg.generation);
       // Re-stamped on every navigate: a no-op with two windows, and the thing that
-      // keeps paints truthfully tagged when one window is serving both surfaces.
+      // keeps paints truthfully tagged when one window is serving both surfaces. The
+      // placement stamp is re-applied for the same reason (#359) — with a shared window
+      // the two surfaces' generations are unrelated counters.
       win.__surface = msg.surface;
+      win.__viewGen = msg.generation || 0;
       // Ask for this page's scriptlets and arm them *before* navigating: uBO rules are
       // domain-scoped, and arming after the load has already begun races the very page
       // scripts the patches exist to get in front of.
@@ -883,6 +895,9 @@ function handle(msg) {
     case 'resize': {
       const win = getWindow(msg.surface);
       if (win) {
+        // Before `setContentSize`, so the forced repaint below already carries the new
+        // stamp and the first frame at the new placement is accepted (#359).
+        win.__viewGen = msg.generation || 0;
         win.setContentSize(msg.width, msg.height);
         // Demand a paint at the new size — even when the size did not change, because
         // castaway also resizes a window it just put back on the glass. Two reasons a
