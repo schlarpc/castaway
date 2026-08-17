@@ -38,7 +38,7 @@ ffmpeg-next = { version = "7.1", optional = true }
 # depends on (same version, so there is only ever one libav binding in the tree).
 ffmpeg-sys-next = { version = "7.1", optional = true }
 ab_glyph = { version = "0.2", optional = true }
-png = { version = "0.17", optional = true }
+png = { version = "0.18", optional = true }
 # QR matrix generation for on-glass pairing codes (the FCast connection URL,
 # #248; Matter commissioning and the remote-control URL are the anticipated
 # reuse). A pure-algorithm format library, the flatbuffers/serde carve-out — the
