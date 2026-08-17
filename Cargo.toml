@@ -207,7 +207,7 @@ sha2 = "0.10"
 sha1 = "0.10"
 # Only for the CKS `sig` query parameter, whose shape is the backend's choice
 # (MD5 of a constant and a timestamp). Nothing here relies on it for security.
-md-5 = "0.10"
+md-5 = "0.11"
 # Opening AirServer's credential database, whose every BLOB is a libsodium
 # `crypto_secretbox` (XSalsa20-Poly1305) under a BLAKE2b-derived key.
 #
