@@ -84,7 +84,7 @@ base64 = { workspace = true, optional = true }
 # (see `assets/glyphs/README.md`). `text` is off because the marks are pure paths — it
 # would pull in fontdb and a font database lookup for nothing. Pure Rust, so the Windows
 # cross-build is unaffected.
-resvg = { version = "0.45", default-features = false, optional = true }
+resvg = { version = "0.48", default-features = false, optional = true }
 # A JS engine, to evaluate uBlock Origin's scriptlet modules and read their own registry
 # rather than parsing them. Cross-builds for the Windows MSVC target (checked).
 rquickjs = { version = "0.12", features = ["loader"], optional = true }
