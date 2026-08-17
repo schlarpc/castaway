@@ -201,7 +201,7 @@ x25519-dalek = { version = "3", features = ["getrandom", "static_secrets"] }
 aes = "0.8"
 ctr = "0.9"
 # AirPlay 1 audio is AES-128-CBC; Cast mirroring is CTR. Both, deliberately named.
-cbc = "0.1"
+cbc = "0.2"
 rsa = { version = "0.9", features = ["sha2", "sha1"] }
 sha2 = "0.10"
 sha1 = "0.10"
