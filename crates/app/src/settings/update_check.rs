@@ -62,11 +62,14 @@ impl Setting for UpdateCheckSetting {
         if matches!(*self.handle.progress().borrow(), Progress::StoodDown { .. }) {
             return "Not available on this build".into();
         }
-        let running = format!("Running build {}", self.installed);
+        // A menu row's detail line, so it is held to the length of one: the sentences
+        // belong on the drill-down, where there is room for them. "Running build 957 —
+        // automatic updates are off" ran off the side of the panel.
+        let running = format!("Build {}", self.installed);
         if self.armed {
             running
         } else {
-            format!("{running} — automatic updates are off")
+            format!("{running} — auto-update off")
         }
     }
 
@@ -407,5 +410,29 @@ mod tests {
             false,
         );
         assert!(!mid.say.contains("Automatic"), "{}", mid.say);
+    }
+
+    #[test]
+    fn the_menu_rows_summary_stays_a_label_rather_than_a_sentence() {
+        // It is a settings-menu detail line, and the picker does not wrap or clip one: a
+        // sentence there runs off the side of the panel, which is what "Running build 957
+        // — automatic updates are off" did. The ceiling is not a measurement of the glass,
+        // it is what keeps this the same shape as every other setting's summary ("System
+        // default", "off").
+        const LABEL: usize = 32;
+        let (handle, _inbox) = castaway_update::agent::control();
+        for armed in [true, false] {
+            let setting =
+                UpdateCheckSetting::new(handle.clone(), InstalledBuild::Known(build(957)), armed);
+            let summary = setting.summary();
+            assert!(
+                summary.chars().count() <= LABEL,
+                "{summary:?} is {} characters",
+                summary.chars().count()
+            );
+            // Still says which build, because that is the number somebody standing at the
+            // panel came to check.
+            assert!(summary.contains("957"), "{summary}");
+        }
     }
 }
