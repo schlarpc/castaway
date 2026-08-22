@@ -27,6 +27,10 @@ lcov.info
 coverage/
 htmlcov/
 
+# Claude Code's working state: agent worktrees and whatever settings a given machine
+# happens to have. Per-box and disposable, like .idea/ and .vscode/ below it.
+.claude/
+
 # IDE and editor files
 .idea/
 .vscode/
