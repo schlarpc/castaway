@@ -11,6 +11,8 @@
     clippy::too_many_arguments
 )]
 
+use std::borrow::Cow;
+
 use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont};
 
 use crate::error::PipelineError;
@@ -272,6 +274,60 @@ pub fn measure(face: &Face, text: &str, px: f32) -> f32 {
     width
 }
 
+/// The mark that says a string was cut. One character, so it costs one advance.
+const ELLIPSIS: &str = "…";
+
+/// Cut `text` to what fits `avail` pixels at `px`, ending in an ellipsis when it does not.
+///
+/// Borrows when the whole string fits, which is the common case: a row's text is normally
+/// short and this should cost a measure, not an allocation.
+///
+/// The alternative — shrinking the size until it fits, as the now-playing card does — is
+/// right for one line that owns its box and wrong for a list, where it would give every
+/// row a different type size according to the length of its own text.
+///
+/// Walks the same resolution and kerning chain [`measure`] and [`draw_text`] do, for the
+/// same reason: a cut computed against different metrics from the ones the glyphs are
+/// drawn with is a cut in the wrong place.
+#[must_use]
+pub fn ellipsize<'a>(face: &Face, text: &'a str, px: f32, avail: f32) -> Cow<'a, str> {
+    if measure(face, text, px) <= avail {
+        return Cow::Borrowed(text);
+    }
+    let mark = measure(face, ELLIPSIS, px);
+    if mark > avail {
+        // No room even for the mark. Nothing is the honest answer: a bare "…" here would
+        // itself overrun the box this call exists to keep text inside.
+        return Cow::Borrowed("");
+    }
+    let scale = PxScale::from(px);
+    let mut width = 0.0;
+    let mut prev: Option<(usize, GlyphId)> = None;
+    let mut cut = 0;
+    for (i, ch) in text.char_indices() {
+        let (font, gid) = face.resolve(ch);
+        let scaled = font.as_scaled(scale);
+        let key = std::ptr::from_ref::<FontRef<'static>>(font) as usize;
+        let kern = match prev {
+            Some((prev_key, p)) if prev_key == key => scaled.kern(p, gid),
+            _ => 0.0,
+        };
+        let step = kern + scaled.h_advance(gid);
+        if width + step + mark > avail {
+            break;
+        }
+        width += step;
+        prev = Some((key, gid));
+        // Byte index past this character: `text` is sliced there, so it must land on a
+        // boundary — hence `char_indices` rather than a running count.
+        cut = i + ch.len_utf8();
+    }
+    let mut out = String::with_capacity(cut + ELLIPSIS.len());
+    out.push_str(&text[..cut]);
+    out.push_str(ELLIPSIS);
+    Cow::Owned(out)
+}
+
 /// The ascent (baseline-to-top) at `px`.
 ///
 /// From the primary font only, deliberately. Taking the maximum across the chain would
@@ -513,5 +569,52 @@ mod tests {
         let sum: u64 = buf.chunks_exact(4).map(|p| u64::from(p[0])).sum();
         let mean = sum as f64 / f64::from(w * h);
         assert!((mean - 10.5).abs() < 0.05, "mean drifted: {mean}");
+    }
+
+    #[test]
+    fn text_that_fits_is_returned_untouched_and_unallocated() {
+        let f = fonts().unwrap();
+        let fits = measure(&f.regular, "Build 957", 22.0) + 1.0;
+        let out = ellipsize(&f.regular, "Build 957", 22.0, fits);
+        assert!(matches!(out, Cow::Borrowed("Build 957")), "{out:?}");
+    }
+
+    #[test]
+    fn text_that_does_not_fit_is_cut_to_the_width_it_was_given() {
+        // The property the caller needs, and the one that is easy to get wrong by a
+        // character: what comes back must *measure* within the box, ellipsis included.
+        let f = fonts().unwrap();
+        let long = "Running build 957 — automatic updates are off";
+        for avail in [40.0, 90.0, 150.0, 300.0] {
+            let out = ellipsize(&f.regular, long, 22.0, avail);
+            assert!(
+                measure(&f.regular, &out, 22.0) <= avail,
+                "{out:?} is wider than {avail}"
+            );
+            assert!(out.ends_with('…'), "{out:?} does not say it was cut");
+            assert!(long.starts_with(out.trim_end_matches('…')), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_cut_lands_on_a_character_and_never_inside_one() {
+        // A byte-index cut would panic on a multi-byte character. The CJK fallback makes
+        // that the normal case, not the exotic one — these are the widest glyphs here, so
+        // most of this string is past any sensible box.
+        let f = fonts().unwrap();
+        let cjk = "日本語のトラックタイトル";
+        for avail in (10..200u16).step_by(7) {
+            let avail = f32::from(avail);
+            let out = ellipsize(&f.regular, cjk, 22.0, avail);
+            assert!(measure(&f.regular, &out, 22.0) <= avail, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_box_too_narrow_for_the_mark_gets_nothing_rather_than_an_overrun() {
+        let f = fonts().unwrap();
+        let mark = measure(&f.regular, "…", 22.0);
+        let out = ellipsize(&f.regular, "anything at all", 22.0, mark - 0.5);
+        assert_eq!(out, "");
     }
 }

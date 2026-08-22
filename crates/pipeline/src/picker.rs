@@ -396,6 +396,11 @@ pub fn render(picker: &Picker, width: u32, height: u32) -> Result<Vec<u8>, Pipel
     for (item, (_, rect)) in picker.items.iter().zip(&l.rows) {
         shape::rounded_rect(&mut buf, width, height, *rect, 14.0 * s, pal.row_bg);
         let tx = rect.x + 28.0 * s;
+        // Neither line wraps, so a long one is a line that runs off the plate, across the
+        // chevron and off the side of the panel — which is what a settings summary written
+        // as a sentence did. The right edge clears the chevron (centred at rect.w - 40·s,
+        // arms 11·s) with a gap, so text stops before the mark rather than under it.
+        let avail = (rect.w - 68.0 * s - 28.0 * s).max(0.0);
         let has_detail = item.detail.is_some();
         let title_baseline = if has_detail {
             rect.y + rect.h * 0.42
@@ -408,7 +413,7 @@ pub fn render(picker: &Picker, width: u32, height: u32) -> Result<Vec<u8>, Pipel
             height,
             tx,
             title_baseline,
-            &item.title,
+            &text::ellipsize(&f.bold, &item.title, 30.0 * s, avail),
             30.0 * s,
             pal.row_title,
             &f.bold,
@@ -420,7 +425,7 @@ pub fn render(picker: &Picker, width: u32, height: u32) -> Result<Vec<u8>, Pipel
                 height,
                 tx,
                 rect.y + rect.h * 0.78,
-                detail,
+                &text::ellipsize(&f.regular, detail, 22.0 * s, avail),
                 22.0 * s,
                 pal.row_detail,
                 &f.regular,
@@ -723,6 +728,33 @@ mod tests {
         let a = render(&plain, 1280, 720).unwrap();
         let b = render(&marked, 1280, 720).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_row_that_is_too_long_is_cut_rather_than_drawn_off_the_panel() {
+        // Two rows differing only in text far past where the row ends. If the lines are
+        // cut to the row, the two pictures are the same one; if they are not, the panel
+        // is showing whatever a caller happened to write — which is how a settings
+        // summary written as a sentence ran off the side of the glass.
+        let of = |tail: &str| {
+            // The run of A's is longer than any row, so both variants are cut inside it
+            // and the tails differ only where nothing may be drawn.
+            let over = format!("{}{tail}", "A".repeat(200));
+            Picker::loading("Settings", "…").with_items(
+                vec![PickerItem::new("a", format!("Check for updates {over}"))
+                    .with_detail(format!("Build 957 {over}"))],
+                "none",
+            )
+        };
+        let x = render(&of("xxxxxxxxxx"), 1280, 720).unwrap();
+        let y = render(&of("yyyyyyyyyy"), 1280, 720).unwrap();
+        assert!(x == y, "text past the row's edge reached the panel");
+        // And a cut row is still a drawn row, not a blank one.
+        let short = Picker::loading("Settings", "…").with_items(
+            vec![PickerItem::new("a", "Check for updates").with_detail("Build 957")],
+            "none",
+        );
+        assert!(x != render(&short, 1280, 720).unwrap());
     }
 
     #[test]
