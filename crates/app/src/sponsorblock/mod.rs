@@ -172,6 +172,11 @@ pub trait PanelAudio: Send + Sync {
     fn frames_written(&self) -> u64;
 }
 
+/// The trait is unconditional and this impl is not: `pipeline::mixer` is behind
+/// `feature = "audio"`, and the VM tests boot a `--no-default-features` receiver. A build
+/// with no mixer still has a watchdog, it just has nothing to implement the second witness
+/// with — which is what `IdleWatch` taking an `Arc<dyn PanelAudio>` already says.
+#[cfg(feature = "audio")]
 impl PanelAudio for pipeline::mixer::AudioMixer {
     fn frames_written(&self) -> u64 {
         self.counters().written
