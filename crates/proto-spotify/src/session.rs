@@ -28,7 +28,7 @@ use librespot_core::{Session, SessionConfig};
 use librespot_metadata::audio::{AudioItem, UniqueFields};
 use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
-use librespot_playback::mixer::{Mixer, MixerConfig};
+use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume, VolumeGetter};
 use librespot_playback::player::{Player, PlayerEvent};
 use librespot_protocol::connect::ClusterUpdate;
 use librespot_protocol::player::ProvidedTrack;
@@ -45,6 +45,27 @@ use crate::sink::PcmSink;
 /// Only used to keep the now-playing card's progress honest. One second is the coarsest
 /// interval that still looks like it is moving.
 const POSITION_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What librespot's player multiplies the decoded samples by: nothing.
+///
+/// The taper belongs to the output gain, and to *only* the output gain (#85).
+///
+/// Handing `Player::new` the `SoftMixer`'s own `get_soft_volume` applies the slider a
+/// second time, because `PlayerEvent::VolumeChanged` already comes back round as a
+/// `ControlTxn::Volume` and lands on that gain. Both sides run a 60 dB logarithmic curve —
+/// librespot's from `MixerConfig::default()`, ours from `Volume::from_position` — so they
+/// agree exactly and the result is the *square* of the intended gain. A slider at its 0.5
+/// default is 0.0316 × 0.0316: **-60 dB**, against a browser playing the same panel at
+/// unity (#383).
+///
+/// `NoOpVolume` is librespot's own answer for this, and its comment in `player.rs` says
+/// why: "in the case of hardware volume control this will always be 1.0 (no change)". Our
+/// output gain is that control — the one thing every source on this panel goes through,
+/// which is what makes Spotify and a cast comparable at all. Normalisation is untouched: it
+/// runs on its own config flag, before any volume attenuation would apply.
+fn player_volume() -> Box<dyn VolumeGetter + Send> {
+    Box::new(NoOpVolume)
+}
 
 /// Everything the panel needs in order to *present* this session, in one place.
 ///
@@ -707,6 +728,9 @@ async fn start(
         None,
     );
 
+    // The mixer is here for `Spirc`, which needs somewhere to keep the slider so the
+    // phone's UI is right and `VolumeChanged` fires. It is deliberately *not* what
+    // attenuates the audio — see [`player_volume`].
     let mixer = Arc::new(
         SoftMixer::open(MixerConfig::default())
             .map_err(|e| SpotifyError::Login(format!("mixer: {e}")))?,
@@ -737,7 +761,7 @@ async fn start(
             ..PlayerConfig::default()
         },
         session.clone(),
-        mixer.get_soft_volume(),
+        player_volume(),
         move || Box::new(PcmSink::new(sink_link)),
     );
     let events = player.get_player_event_channel();
@@ -1991,6 +2015,41 @@ mod tests {
         assert_eq!(volume_to_spotify(0.0), 0);
         assert_eq!(volume_to_spotify(1.0), u16::MAX);
         assert_eq!(volume_to_spotify(2.0), u16::MAX);
+    }
+
+    #[test]
+    fn the_player_gets_no_volume_because_the_output_gain_owns_the_taper() {
+        // #383, with the numbers the panel produced. What is under test is the
+        // *composition*: librespot's mixer and our `Volume` run the same 60 dB logarithmic
+        // curve, so handing the player the mixer's own getter squares the gain rather than
+        // doubling anything visible.
+        let mixer = SoftMixer::open(MixerConfig::default()).expect("a soft mixer");
+        mixer.set_volume(volume_to_spotify(0.5));
+
+        // Librespot's half: what it would apply, given the mixer's own getter.
+        let librespot = mixer.get_soft_volume().attenuation_factor();
+        // Ours, which is where the taper belongs and where it still runs.
+        let ours =
+            f64::from(crate::control::volume_from_spotify(volume_to_spotify(0.5)).amplitude());
+        assert!(
+            (librespot - ours).abs() < 1e-3,
+            "the two tapers have diverged: librespot {librespot:.6}, ours {ours:.6}. They \
+             agreeing is not the bug — it is why the bug squared exactly — but a test that \
+             assumed it should say so rather than quietly stop meaning anything"
+        );
+        assert!(
+            (librespot - 0.0316).abs() < 1e-3,
+            "a half-way slider is -30 dB on a 60 dB curve; got {librespot:.6}"
+        );
+
+        // The player attenuates by nothing, so the panel plays Spotify at the same -30 dB a
+        // cast at the same slider gets, rather than 0.0316 squared.
+        let handed = player_volume().attenuation_factor();
+        assert!(
+            (handed - 1.0).abs() < f64::EPSILON,
+            "librespot was handed an attenuation of {handed:.6}; anything but 1.0 is the \
+             output gain's taper being applied a second time (#383)"
+        );
     }
 
     /// An `AudioItem` the way the metadata layer hands one over, minus the parts the
