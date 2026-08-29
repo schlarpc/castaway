@@ -241,8 +241,18 @@ let
       # ranking refused, which for a self-signed package against an inbox WHQL driver is
       # always. Running both unconditionally is idempotent and one round trip cheaper than
       # deciding.
-      on_box "powershell -NoProfile -ExecutionPolicy Bypass -File winusb-bind.ps1 -HardwareId '$hwid'" || true
-      on_box "powershell -NoProfile -ExecutionPolicy Bypass -File winusb-force.ps1 -HardwareId '$hwid'"
+      #
+      # **Double quotes, not single.** A hardware ID contains `&`, and cmd.exe -- which is
+      # what OpenSSH-for-Windows hands the command string to -- treats `&` as a command
+      # separator everywhere except inside double quotes. Single quotes mean nothing to
+      # cmd, so `-HardwareId 'USB\VID_8087&PID_0033'` was split into a powershell call
+      # ending at `'USB\VID_8087` and a second command `PID_0033'`. Every controller this
+      # is pointed at has an `&` in its ID, so the default invocation could not work:
+      # PowerShell reported "no present device matches 'USB\VID_8087" and cmd reported
+      # "'PID_0033''' is not recognized", which reads as a hardware or driver problem
+      # rather than a quoting one.
+      on_box "powershell -NoProfile -ExecutionPolicy Bypass -File winusb-bind.ps1 -HardwareId \"$hwid\"" || true
+      on_box "powershell -NoProfile -ExecutionPolicy Bypass -File winusb-force.ps1 -HardwareId \"$hwid\""
     '';
   };
 
