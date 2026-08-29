@@ -460,7 +460,7 @@ working on the layers above.
 
 ### 11.3a-i First hardware bring-up
 
-`cargo run -p hci-transport --example probe` is the tool: it lists attached controllers,
+`cargo run -p hci-probe` is the tool: it lists attached controllers,
 names which loader claims each, and says up front whether the firmware images that
 controller needs are actually in the build. Pass a `vendor:product` and it claims the
 device, runs the loader, resets, and reads back the controller's address — which is the
@@ -471,7 +471,7 @@ On Linux the kernel's `btusb` holds the device until told otherwise:
 ```sh
 ls /sys/bus/usb/drivers/btusb/                          # find the interface, e.g. 3-10:1.0
 echo 3-10:1.0 | sudo tee /sys/bus/usb/drivers/btusb/unbind
-cargo run -p hci-transport --example probe -- 8087:0029
+cargo run -p hci-probe -- 8087:0029
 ```
 
 Unbinding is **required** to test firmware loading at all, not merely convenient:

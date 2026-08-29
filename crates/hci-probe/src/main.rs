@@ -5,9 +5,16 @@
 //! receiver and watching it not work.
 //!
 //! ```text
-//! cargo run -p hci-transport --example probe            # list what is attached
-//! cargo run -p hci-transport --example probe -- 8087:0029   # claim and initialise
+//! cargo run -p hci-probe                  # list what is attached
+//! cargo run -p hci-probe -- 8087:0029     # claim and initialise
 //! ```
+//!
+//! Its own crate with its own `[[bin]]`, rather than an example on `hci-transport`, for
+//! two reasons that both point the same way: cargo examples are not cross-compiled, so an
+//! example can never become the `probe.exe` the Windows box needs (`nix run
+//! .#windows-probe`); and a `[[bin]]` inside `hci-transport` would pull
+//! `tracing-subscriber` and a multi-thread runtime out of that crate's dev-dependencies
+//! and into the dependency graph of everything that links it.
 //!
 //! On Linux the kernel's `btusb` driver holds the device until told otherwise:
 //!
@@ -26,15 +33,37 @@
 //! path the part has to be sent back to its bootloader:
 //!
 //! ```text
-//! modprobe -r btusb                                      # nothing may re-bind it
-//! cargo run -p hci-transport --example probe -- 8087:0032 --to-bootloader
-//! cargo run -p hci-transport --example probe -- 8087:0032    # now it loads firmware
+//! modprobe -r btusb                                # nothing may re-bind it
+//! cargo run -p hci-probe -- 8087:0032 --to-bootloader
+//! cargo run -p hci-probe -- 8087:0032              # now it loads firmware
 //! ```
 //!
 //! On Linux, `udev` re-loads `btusb` the moment the part re-enumerates, which reloads the
 //! firmware behind you; `echo 'install btusb /bin/true' > /run/modprobe.d/no-btusb.conf`
 //! holds it off, and deleting that file plus `modprobe btusb` gives the machine its
 //! Bluetooth back.
+//!
+//! # On the Windows box
+//!
+//! Same two commands, through `nix run .#windows-probe --`, which pushes this binary to a
+//! scratch directory and runs it there:
+//!
+//! ```text
+//! nix run .#windows-probe -- 8087:0032 --to-bootloader
+//! nix run .#windows-probe -- 8087:0032
+//! ```
+//!
+//! Two things have to be true on that box first, and neither is per-iteration:
+//!
+//! - the controller is bound to WinUSB rather than the Microsoft Bluetooth driver
+//!   (`nix run .#windows-winusb`, `-- --undo` to give it back). That binding is a signed
+//!   INF package keyed on hardware ID, so it is re-applied whenever the part
+//!   re-enumerates — which is what `--to-bootloader` causes. A part whose bootloader
+//!   enumerates under a *different* product ID needs that ID bound too;
+//! - the receiver is not holding the radio. A USB claim is exclusive, so `castaway.exe`
+//!   with `[enable] bluetooth = true` owns the controller and this cannot open it. Set
+//!   `bluetooth = false` in the box's `castaway.toml` and restart it once: the receiver
+//!   goes on casting and painting, and simply does not claim the device.
 
 use hci_transport::init::{self, UsbId};
 use hci_transport::{usb, FirmwareSet};

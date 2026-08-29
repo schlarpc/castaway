@@ -1,0 +1,30 @@
+[package]
+name = "hci-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Find, claim and initialise a Bluetooth controller, one step at a time — the first thing to run against real hardware."
+
+[[bin]]
+name = "hci-probe"
+path = "src/main.rs"
+
+[dependencies]
+# `usb` only, and no default features: `socket` is the Linux kernel HCI socket, which
+# hands over a controller the kernel has *already* initialised and so can never exercise
+# the loader this exists to test.
+#
+# Named by path rather than inherited from `[workspace.dependencies]`, which is the one
+# place in this tree that does so: cargo *ignores* a member's `default-features = false`
+# when the workspace entry does not itself set `default-features`, and says so only as a
+# warning. Inheriting here would silently give this crate the full default set.
+hci-transport = { path = "../hci-transport", default-features = false, features = ["usb"] }
+substrate-hci.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

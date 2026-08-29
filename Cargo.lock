@@ -3063,6 +3063,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hci-probe"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hci-transport",
+ "substrate-hci",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hci-transport"
 version = "0.1.0"
 dependencies = [

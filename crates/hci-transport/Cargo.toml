@@ -38,10 +38,6 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-mult
 tracing-subscriber.workspace = true
 
 [[example]]
-name = "probe"
-required-features = ["usb"]
-
-[[example]]
 name = "vhci"
 required-features = ["socket"]
 
