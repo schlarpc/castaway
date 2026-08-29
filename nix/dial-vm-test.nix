@@ -35,6 +35,7 @@ let
   configUuid = "0f8c2e10-0000-4000-8000-0000000c0572";
 
   ssdpSearch = import ./ssdp-search.nix { inherit pkgs; };
+  ssdpListen = import ./ssdp-listen.nix { inherit pkgs; };
 in
 pkgs.testers.runNixOSTest {
   name = "castaway-dial";
@@ -115,7 +116,7 @@ pkgs.testers.runNixOSTest {
       # conntrack can't associate with a datagram sent to 239.255.255.250 — the default
       # firewall would drop every reply and fail the test for the wrong reason.
       networking.firewall.enable = false;
-      environment.systemPackages = [ pkgs.curl ssdpSearch ];
+      environment.systemPackages = [ pkgs.curl ssdpSearch ssdpListen ];
     };
   };
 
@@ -220,5 +221,48 @@ pkgs.testers.runNixOSTest {
             assert seen.setdefault(usn, location) == location, (
                 f"USN {usn} answered with two LOCATIONs: {seen[usn]} and {location}"
             )
+
+    with subtest("a service stop takes the receiver off the wire rather than abandoning it"):
+        # `systemctl stop` sends SIGTERM, which is the only way this deployment is ever
+        # asked to stop — and a receiver that dies on the default disposition leaves its
+        # SSDP records behind, so a sender goes on listing a device that is not there and
+        # a launch into it does nothing (#384, #388, #390).
+        #
+        # The listener starts first and from the other host: `ssdp:byebye` is unsolicited
+        # and arrives once, so a control point that is not already joined never hears it,
+        # and no search after the fact can tell "gone quietly" from "gone loudly".
+        # Outlives the wait below on purpose: a listener whose window closes first turns
+        # "the byebye never came" and "we stopped looking" into the same result.
+        sender.succeed(f"systemd-run --unit=byebye --collect ssdp-listen 120 {lan}")
+        # Joining a multicast group is not instant, and a byebye that beats the membership
+        # is a silent miss — it arrives once. So this waits for the listener's own word
+        # that it is joined, not for its unit to be active, which is true immediately and
+        # says nothing.
+        sender.wait_until_succeeds(
+            "journalctl -u byebye --no-pager | grep -q 'listening on 239.255.255.250'",
+            timeout=60,
+        )
+        receiver.succeed("systemctl stop castaway")
+
+        # Our side's account first, because it says *which* exit this was: the signal is
+        # named, and the service teardown is what puts the byebye on the wire at all.
+        journal = receiver.succeed(
+            "journalctl -u castaway --no-pager | grep -E "
+            "'asked to stop|services: shutting down|kiosk: stopped|listener stopping' || true"
+        )
+        # The signal is named in the same line, quoted the way tracing renders a string
+        # field: which signal arrived is the difference between a stop that tore down and
+        # one that was killed, so the two are asserted together rather than separately.
+        assert 'asked to stop: shutting down signal="SIGTERM"' in journal, journal
+        assert "services: shutting down" in journal, journal
+        assert "kiosk: stopped because it was asked to" in journal, journal
+
+        # And the wire's, which is the half a sender actually sees.
+        sender.wait_until_succeeds(
+            "journalctl -u byebye --no-pager | grep -q 'ssdp:byebye'", timeout=30
+        )
+        heard = sender.succeed("journalctl -u byebye --no-pager")
+        assert f"uuid:{DIAL_UUID}::upnp:rootdevice" in heard, heard[-4000:]
+        assert f"uuid:{CFG_UUID}::upnp:rootdevice" in heard, heard[-4000:]
   '';
 }

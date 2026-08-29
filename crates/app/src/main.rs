@@ -716,7 +716,7 @@ fn main() -> anyhow::Result<()> {
         // Chromium's SIGINT handler used to be installed into *this* process during
         // `cef_initialize`, silently replacing ours, so this had to come after it. The
         // browser owns its own signals now.
-        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, wake.clone(), remote);
+        spawn_stop_signal(&runtime, &shutdown, &kiosk_exit, wake.clone(), remote);
         // Armed after the session manager, because it needs that handle, and before the
         // kiosk loop takes the main thread, because after that there is nowhere to spawn
         // from. Returns the code the process ends on: zero, unless an update activates.
@@ -842,7 +842,7 @@ fn main() -> anyhow::Result<()> {
         // Headless: no renderer, so drain the OSD channel to the log.
         std::thread::spawn(move || drain_osd_to_log(&osd_rx));
         // No kiosk loop to wake in this build; the waker stays unarmed and inert.
-        spawn_ctrl_c(
+        spawn_stop_signal(
             &runtime,
             &shutdown,
             &kiosk_exit,
@@ -888,12 +888,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Exit with the launcher's handshake code, if the updater set it.
-///
-/// A bare `std::process::exit` rather than a returned `ExitCode`, because this is the end
-/// of a receiver that has already shut everything down and because `main` returns
-/// `anyhow::Result<()>` — an update activating is not an error and must not be reported
-/// as one. Zero means nothing activated, and the ordinary path falls through.
 /// Block until the service layer has finished stopping, or `grace` runs out.
 ///
 /// Returns whether it stopped in time, and logs when it did not — a receiver that leaves
@@ -920,6 +914,12 @@ fn wait_for_services(
     stopped.is_ok()
 }
 
+/// Exit with the launcher's handshake code, if the updater set it.
+///
+/// A bare `std::process::exit` rather than a returned `ExitCode`, because this is the end
+/// of a receiver that has already shut everything down and because `main` returns
+/// `anyhow::Result<()>` — an update activating is not an error and must not be reported
+/// as one. Zero means nothing activated, and the ordinary path falls through.
 fn hand_over_if_updating(code: &std::sync::atomic::AtomicI32) {
     let code = code.load(std::sync::atomic::Ordering::SeqCst);
     if code != 0 {
@@ -964,9 +964,45 @@ fn record_the_mix(config: &Config, mixer: &Arc<pipeline::mixer::AudioMixer>) {
     }
 }
 
-/// ctrl-c triggers the same shutdown as a kiosk window close: stop the services and
+/// Resolve when the OS asks the receiver to stop, naming what asked.
+///
+/// SIGINT and SIGTERM mean the same thing to a receiver and both have to run the teardown:
+/// a console sends the first, `systemctl stop` sends the second, and a process killed on
+/// the default disposition leaves its SSDP and mDNS records on the wire for senders to go
+/// on listing (#390).
+#[cfg(unix)]
+async fn stop_requested() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            // Losing SIGTERM is worth a line rather than a panic: a console still stops
+            // this cleanly, and refusing to boot over it would be the worse trade.
+            warn!(error = %e, "cannot listen for SIGTERM; a service stop will not shut down cleanly");
+            tokio::signal::ctrl_c().await.ok();
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = terminate.recv() => "SIGTERM",
+    }
+}
+
+/// The same, where the console control handler already covers every way to be asked.
+///
+/// `ctrl_c` on Windows is `SetConsoleCtrlHandler`, which fires for CTRL_C, CTRL_BREAK,
+/// CTRL_CLOSE, CTRL_LOGOFF and CTRL_SHUTDOWN.
+#[cfg(not(unix))]
+async fn stop_requested() -> &'static str {
+    tokio::signal::ctrl_c().await.ok();
+    "a console control event"
+}
+
+/// A stop signal triggers the same shutdown as a kiosk window close: stop the services and
 /// tell the winit loop to exit.
-fn spawn_ctrl_c(
+fn spawn_stop_signal(
     runtime: &tokio::runtime::Runtime,
     shutdown: &Shutdown,
     kiosk_exit: &Arc<std::sync::atomic::AtomicBool>,
@@ -976,8 +1012,8 @@ fn spawn_ctrl_c(
     let shutdown = shutdown.clone();
     let kiosk_exit = kiosk_exit.clone();
     runtime.spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("ctrl-c: shutting down");
+        let signal = stop_requested().await;
+        info!(signal, "asked to stop: shutting down");
         // Tell whoever is sending to stop, before the thing they are sending to goes
         // away. A phone streaming A2DP into a receiver that has exited does not find out
         // quickly — it keeps encoding into a link that is gone, and the person holding it
@@ -996,8 +1032,8 @@ fn spawn_ctrl_c(
             }
         }
         kiosk_exit.store(true, std::sync::atomic::Ordering::Relaxed);
-        // The kiosk sleeps between frames (#59) and checks the flag when awake; a
-        // ctrl-c on an idle panel has to wake it to be noticed.
+        // The kiosk sleeps between frames (#59) and checks the flag when awake; a stop
+        // signal arriving at an idle panel has to wake it to be noticed.
         kiosk_wake.wake();
         shutdown.fire();
     });
