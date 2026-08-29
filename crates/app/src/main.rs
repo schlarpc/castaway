@@ -70,6 +70,17 @@ use crate::shutdown::Shutdown;
 /// the box, however many services it publishes.
 const MDNS_HOST: &str = "castaway";
 
+/// How long the service layer gets to stop once the panel has gone (#388).
+///
+/// What it is spending: an SSDP byebye and an mDNS unregister, each a single unsolicited
+/// packet on a LAN, plus whatever the adapters need to drop their listeners. Seconds is
+/// generous for all of it.
+///
+/// Bounded, because a peer that has stopped answering must not hold the process open. Worth
+/// waiting for at all, because a receiver that leaves without its byebye is one senders go
+/// on listing — and a launch into a device that is not there reads as "it didn't start".
+const SERVICES_STOP_GRACE: Duration = Duration::from_secs(5);
+
 /// The command line. Small on purpose: the config file is the interface, and the flags
 /// only answer "which file?" and the read-only surface query.
 #[derive(Debug, clap::Parser)]
@@ -565,7 +576,9 @@ fn main() -> anyhow::Result<()> {
                 home: std::sync::Arc::clone(&home_cell),
             }),
         };
-        runtime.spawn(async move {
+        // The handle is kept: the exit path waits on it, so the SSDP byebye and the mDNS
+        // unregister go out before the process leaves (#388).
+        let services = runtime.spawn(async move {
             if let Err(e) = serve(
                 serve_cfg,
                 serve_tx,
@@ -735,7 +748,7 @@ fn main() -> anyhow::Result<()> {
         let wiring = pipeline::kiosk::KioskWiring {
             attract,
             osd: Some(osd_controller),
-            exit: Some(kiosk_exit),
+            exit: Some(Arc::clone(&kiosk_exit)),
             controls,
             shell_sink,
             remote_input: Some(remote_input),
@@ -747,12 +760,32 @@ fn main() -> anyhow::Result<()> {
             visualizer,
         };
         #[cfg(feature = "electron")]
-        pipeline::kiosk::run_with_browser(rx, wiring, browser_host)
-            .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        let kiosk_result = pipeline::kiosk::run_with_browser(rx, wiring, browser_host);
         #[cfg(not(feature = "electron"))]
-        pipeline::kiosk::run(rx, wiring).map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        let kiosk_result = pipeline::kiosk::run(rx, wiring);
+
+        // Why the panel stopped, before anything is torn down: without it a window-close
+        // and a dead process leave the same three lines in the journal (#388). The `exit`
+        // flag is the discriminator — ctrl-c and the update handover both set it, a closed
+        // window does not.
+        match &kiosk_result {
+            Ok(()) if kiosk_exit.load(std::sync::atomic::Ordering::Relaxed) => {
+                info!("kiosk: stopped because it was asked to");
+            }
+            Ok(()) => info!("kiosk: the window closed"),
+            Err(e) => warn!(error = %e, "kiosk: stopped on an error"),
+        }
         shutdown.fire();
         watchdog_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Firing the latch only releases the waiters; this waits for the service task to
+        // act on it, so the SSDP byebye and the mDNS unregister are on the wire before the
+        // process leaves (#388). Going straight on to `shutdown_timeout` races a runtime
+        // that is already being torn down, and the service task loses.
+        //
+        // Costs the ctrl-c path nothing: it fires the latch from inside the runtime, so by
+        // the time the kiosk's own exit reaches here the task has finished and the await
+        // returns at once.
+        wait_for_services(&runtime, services, SERVICES_STOP_GRACE);
         // Dropping the runtime waits for every blocking task that has already started —
         // and the SponsorBlock Lounge stream is a blocking read that can sit inside its
         // 90-second timeout with nothing to interrupt it. The window is gone; nobody is
@@ -760,8 +793,12 @@ fn main() -> anyhow::Result<()> {
         // DNS lookup) finish, then the process leaves and the OS reclaims the rest.
         runtime.shutdown_timeout(Duration::from_secs(1));
         // Last, and only after the runtime is down: the launcher reads this to tell an
-        // update handing over from a receiver that fell over.
+        // update handing over from a receiver that fell over. Before the kiosk's own error
+        // is propagated, because "fell over" is exactly the case it is there for — and the
+        // error is propagated last for the same reason the teardown above runs first: a
+        // panel that failed still has services to stop.
         hand_over_if_updating(&activation_exit);
+        kiosk_result.map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
     }
 
     #[cfg(not(feature = "render"))]
@@ -849,6 +886,32 @@ fn main() -> anyhow::Result<()> {
 /// of a receiver that has already shut everything down and because `main` returns
 /// `anyhow::Result<()>` — an update activating is not an error and must not be reported
 /// as one. Zero means nothing activated, and the ordinary path falls through.
+/// Block until the service layer has finished stopping, or `grace` runs out.
+///
+/// Returns whether it stopped in time, and logs when it did not — a receiver that leaves
+/// without its byebye is a receiver senders go on listing, and the person holding the phone
+/// gets a launch into nothing rather than a device that is missing (#384, #388).
+///
+/// The latch is already fired by the time this is called; what this waits for is the task
+/// *acting* on it. Nothing here interrupts the work — the bound only decides how long the
+/// process is willing to be held by a peer that has stopped answering.
+fn wait_for_services(
+    runtime: &tokio::runtime::Runtime,
+    services: tokio::task::JoinHandle<()>,
+    grace: Duration,
+) -> bool {
+    let stopped = runtime.block_on(async { tokio::time::timeout(grace, services).await });
+    if stopped.is_err() {
+        warn!(
+            grace_s = grace.as_secs(),
+            "the service layer did not stop in time; SSDP byebye and the mDNS unregister \
+             may not have gone out, so senders will list this receiver until the records \
+             expire"
+        );
+    }
+    stopped.is_ok()
+}
+
 fn hand_over_if_updating(code: &std::sync::atomic::AtomicI32) {
     let code = code.load(std::sync::atomic::Ordering::SeqCst);
     if code != 0 {
@@ -2724,6 +2787,56 @@ mod tests {
     use super::device_uuid;
     #[cfg(feature = "render")]
     use super::{build_attract, recolour, HomeState};
+
+    /// The exit path's wait on the service layer (#388), both ways round.
+    mod stopping {
+        use std::time::Duration;
+
+        use super::super::wait_for_services;
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+        }
+
+        #[test]
+        fn a_service_layer_that_stops_is_waited_for() {
+            // The property the byebye rests on: the process does not leave until the task
+            // acting on the latch has finished. Asserted by observing the task's own effect
+            // rather than by timing it — a wait that returned early would leave this unset.
+            let runtime = runtime();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = std::sync::Arc::clone(&done);
+            let services = runtime.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            assert!(
+                wait_for_services(&runtime, services, Duration::from_secs(30)),
+                "a service layer that stops well inside the grace must be reported as stopped"
+            );
+            assert!(
+                done.load(std::sync::atomic::Ordering::SeqCst),
+                "the wait returned before the service task had run"
+            );
+        }
+
+        #[test]
+        fn a_service_layer_that_will_not_stop_does_not_hold_the_process() {
+            // The other half, and why the wait is bounded: an adapter parked on a peer that
+            // has stopped answering must cost the exit its grace and no more. The grace is
+            // passed in, so this is 50 ms of real time rather than the shipped five
+            // seconds — what is under test is that the bound is honoured at all.
+            let runtime = runtime();
+            let services = runtime.spawn(async { std::future::pending::<()>().await });
+            assert!(
+                !wait_for_services(&runtime, services, Duration::from_millis(50)),
+                "a service layer that never stops must be reported as not stopped"
+            );
+        }
+    }
 
     /// The date-driven palette, tested at fixed instants (#263): the clock is read at
     /// the call sites, so June is provable in March and — the part the golden-scene
