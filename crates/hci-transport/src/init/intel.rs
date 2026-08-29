@@ -14,7 +14,7 @@
 //! `hci-probe --to-bootloader`.
 
 use substrate_hci::{Command, HciPacket, HciTransport, OpCode};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::TransportError;
 use crate::firmware::FirmwareSet;
@@ -513,10 +513,108 @@ async fn download_firmware(
     secure_send(hci, fragment::PUBLIC_KEY, parts.public_key).await?;
     secure_send(hci, fragment::SIGNATURE, parts.signature).await?;
 
-    for block in split_command_blocks(parts.blocks) {
-        secure_send(hci, fragment::DATA, block).await?;
+    // The upload is the one step that is both long and silent, and "it returned `Ok`" is
+    // a weaker statement than it looks: `split_command_blocks` stops at the first
+    // fragment it cannot close, so a payload it only partly covers is uploaded *happily*
+    // and short. Saying how much was covered turns that into something the log shows
+    // rather than something the boot step reports as an unexplained silence.
+    let blocks = split_command_blocks(parts.blocks);
+    let covered: usize = blocks.iter().map(|b| b.len()).sum();
+    debug!(
+        fragments = blocks.len(),
+        covered,
+        payload = parts.blocks.len(),
+        "intel: uploading firmware payload"
+    );
+    if covered != parts.blocks.len() {
+        warn!(
+            covered,
+            payload = parts.blocks.len(),
+            "intel: the image does not split into whole fragments; uploading it short"
+        );
     }
-    Ok(())
+
+    for (index, block) in blocks.iter().enumerate() {
+        if let Err(e) = secure_send(hci, fragment::DATA, block).await {
+            // *Which* fragment stopped separates failures that look identical from
+            // outside: a refusal at 0 is a header or layout problem, and one at 2873 is
+            // not.
+            warn!(index, of = blocks.len(), error = %e, "intel: firmware fragment refused");
+            return Err(e);
+        }
+    }
+    debug!(
+        fragments = blocks.len(),
+        "intel: every firmware fragment was acknowledged"
+    );
+
+    // Every fragment being acknowledged is *not* the same as the download being finished,
+    // and the difference is the whole of #391. The bootloader acknowledges each
+    // `Secure_Send` as it lands and then, separately, emits a vendor notification saying
+    // the image as a whole was accepted. `btusb` waits for that before it resets:
+    //
+    //   "Before switching the device into operational mode and with that booting the
+    //    loaded firmware, wait for the bootloader notification that all fragments have
+    //    been sent successfully."
+    //
+    // Resetting without it left the AX211 with no operational image and no bus presence:
+    // the notification then arrived 367us *after* `Intel_Reset` had already gone out, was
+    // discarded as "not the bootup notification", and the part never came back.
+    await_download_result(hci).await
+}
+
+/// Intel's "the image was accepted" vendor notification, and how long to allow it.
+///
+/// The payload is `btintel`'s `intel_secure_send_result`: a result byte, the opcode that
+/// produced it, and a status. Only the first matters here — a non-zero result is a
+/// refused image, which is worth reporting as such rather than as the boot timeout it
+/// would otherwise become five seconds later.
+const SECURE_SEND_RESULT: u8 = 0x06;
+const DOWNLOAD_RESULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait for the bootloader to say the uploaded image is good.
+async fn await_download_result(hci: &dyn HciTransport) -> Result<(), TransportError> {
+    let deadline = tokio::time::Instant::now() + DOWNLOAD_RESULT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(TransportError::Timeout("intel firmware download result"));
+        }
+        let packet = tokio::time::timeout(remaining, hci.recv())
+            .await
+            .map_err(|_| TransportError::Timeout("intel firmware download result"))??;
+        let HciPacket::Event { code, params } = packet else {
+            continue;
+        };
+        if code != VENDOR_EVENT || params.first() != Some(&SECURE_SEND_RESULT) {
+            debug!(
+                event = format!("{code:#04x}"),
+                params = %hex(&params),
+                "intel: not the download result; still waiting"
+            );
+            continue;
+        }
+        match params.get(1) {
+            Some(0) => {
+                debug!("intel: the bootloader accepted the image");
+                return Ok(());
+            }
+            // A result byte that is present and non-zero is the controller refusing the
+            // image it was just given; one that is absent is a notification we do not
+            // understand, and booting on either would be booting on a guess.
+            other => {
+                return Err(TransportError::Controller {
+                    what: "intel firmware download",
+                    detail: match other {
+                        Some(result) => {
+                            format!("the bootloader refused the image: result {result:#04x}")
+                        }
+                        None => format!("truncated download result: {}", hex(&params)),
+                    },
+                })
+            }
+        }
+    }
 }
 
 /// Split the payload into fragments the controller will accept.
@@ -564,6 +662,10 @@ async fn boot(hci: &dyn HciTransport, boot_addr: u32) -> Result<(), TransportErr
     // reset type, patch enable, ddc reload, boot option, then the boot address.
     let mut params = vec![0x00, 0x01, 0x00, 0x01];
     params.extend_from_slice(&boot_addr.to_le_bytes());
+    debug!(
+        boot_addr = format!("{boot_addr:#010x}"),
+        "intel: resetting into the operational image"
+    );
     hci.send(
         Command::Vendor {
             opcode: INTEL_RESET,
@@ -572,6 +674,10 @@ async fn boot(hci: &dyn HciTransport, boot_addr: u32) -> Result<(), TransportErr
         .encode()?,
     )
     .await?;
+    // Its own line, because the two halves fail differently and the timestamps separate
+    // them: everything before this is the upload, everything after is the part deciding
+    // whether to come back.
+    debug!("intel: reset sent; waiting for the bootup notification");
 
     let deadline = tokio::time::Instant::now() + BOOT_TIMEOUT;
     loop {
@@ -590,6 +696,16 @@ async fn boot(hci: &dyn HciTransport, boot_addr: u32) -> Result<(), TransportErr
                 );
                 return Ok(());
             }
+            // A part that answers *something* here and one that answers nothing are
+            // different failures, and discarding the something reported them as the same
+            // five-second silence.
+            debug!(
+                event = format!("{code:#04x}"),
+                params = %hex(&params),
+                "intel: not the bootup notification; still waiting"
+            );
+        } else {
+            debug!("intel: a non-event packet arrived while waiting for the bootup notification");
         }
     }
 }
@@ -659,9 +775,31 @@ mod tests {
     /// that is what the real part does (`btusb` injects the fake completion that hides
     /// this). A fake that completed it would agree with a loader that waits for the wrong
     /// thing, which is the failure mode ground rule 6 names by hand.
-    fn controller(version_tlv: Vec<u8>) -> ScriptedTransport {
+    /// The common case: a part that accepts the image it is given.
+    fn controller(version_tlv: Vec<u8>, payload_len: usize) -> ScriptedTransport {
+        controller_announcing(version_tlv, payload_len, 0x00)
+    }
+
+    /// As above, but the acceptance carries `result` — and a `payload_len` of
+    /// [`usize::MAX`] is a part that never announces at all.
+    ///
+    /// The download result is emitted **once**, after the fragment that completes the
+    /// payload, which is where the AX211 put it: 950us after the last fragment's
+    /// command-complete and unprompted by anything the loader sent. Announcing it per
+    /// fragment instead would agree with a loader that never waits for it, which is the
+    /// failure this fake exists to refuse (#391).
+    fn controller_announcing(
+        version_tlv: Vec<u8>,
+        payload_len: usize,
+        result: u8,
+    ) -> ScriptedTransport {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let data_seen = AtomicUsize::new(0);
+        let signature_seen = AtomicBool::new(false);
+        let announced = AtomicBool::new(false);
+
         ScriptedTransport::new().with_responder(move |sent| {
-            let HciPacket::Command { opcode, .. } = sent else {
+            let HciPacket::Command { opcode, params } = sent else {
                 return Vec::new();
             };
             if *opcode == INTEL_RESET {
@@ -678,17 +816,57 @@ mod tests {
                     ]),
                 }];
             }
-            let mut params = vec![0x01];
-            params.extend_from_slice(&opcode.raw().to_le_bytes());
-            params.push(0x00); // status: success
+
+            let mut complete = vec![0x01];
+            complete.extend_from_slice(&opcode.raw().to_le_bytes());
+            complete.push(0x00); // status: success
             if *opcode == READ_VERSION {
-                params.extend_from_slice(&version_tlv);
+                complete.extend_from_slice(&version_tlv);
             }
-            vec![HciPacket::Event {
+            let mut out = vec![HciPacket::Event {
                 code: code::COMMAND_COMPLETE,
-                params: bytes::Bytes::from(params),
-            }]
+                params: bytes::Bytes::from(complete),
+            }];
+
+            if *opcode == SECURE_SEND {
+                match params.first().copied() {
+                    Some(fragment::SIGNATURE) => signature_seen.store(true, Ordering::Relaxed),
+                    // The type byte is a parameter but not payload.
+                    Some(fragment::DATA) => {
+                        data_seen.fetch_add(params.len() - 1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                if signature_seen.load(Ordering::Relaxed)
+                    && data_seen.load(Ordering::Relaxed) >= payload_len
+                    && !announced.swap(true, Ordering::Relaxed)
+                {
+                    out.push(HciPacket::Event {
+                        code: VENDOR_EVENT,
+                        params: bytes::Bytes::from(vec![
+                            SECURE_SEND_RESULT,
+                            result,
+                            0x00,
+                            0x00,
+                            0x00,
+                        ]),
+                    });
+                }
+            }
+            out
         })
+    }
+
+    /// How many payload bytes the loader will actually upload, which the fake counts to
+    /// know the image is complete.
+    ///
+    /// Not the same as how many the image *holds*: `split_command_blocks` stops at the
+    /// first fragment it cannot close on a 4-byte boundary, so a tail that does not align
+    /// is never sent. Expecting the image's length instead leaves the fake waiting for
+    /// bytes that are never coming — which is a fake that fails a correct loader.
+    fn uploaded_len(image: &[u8], secure_boot: SecureBoot) -> usize {
+        let payload = &image[secure_boot.layout().payload..];
+        split_command_blocks(payload).iter().map(|b| b.len()).sum()
     }
 
     /// The **real** `Read_Version` response from the AX200 in this dev box, captured
@@ -944,9 +1122,13 @@ mod tests {
         // Order is fixed by the protocol. Out of order the controller rejects — the good
         // case; the bad case is a part that accepts a partial upload and boots an image
         // that half-works.
-        let transport = controller(version_tlv(tlv_image::BOOTLOADER));
+        let image = sfi(&command_block(8));
+        let transport = controller(
+            version_tlv(tlv_image::BOOTLOADER),
+            uploaded_len(&image, SecureBoot::Rsa),
+        );
         IntelInit
-            .init(AX200, &transport, &firmware_with(sfi(&command_block(8))))
+            .init(AX200, &transport, &firmware_with(image))
             .await
             .unwrap();
 
@@ -973,9 +1155,13 @@ mod tests {
     async fn fragments_respect_the_single_byte_parameter_length() {
         // A 256-byte key cannot go in one command: the parameter length field is one
         // byte and the fragment type eats one of them.
-        let transport = controller(version_tlv(tlv_image::BOOTLOADER));
+        let image = sfi(&command_block(0));
+        let transport = controller(
+            version_tlv(tlv_image::BOOTLOADER),
+            uploaded_len(&image, SecureBoot::Rsa),
+        );
         IntelInit
-            .init(AX200, &transport, &firmware_with(sfi(&command_block(0))))
+            .init(AX200, &transport, &firmware_with(image))
             .await
             .unwrap();
 
@@ -996,7 +1182,7 @@ mod tests {
     async fn an_already_operational_controller_is_left_alone() {
         // A warm reboot leaves the part running its firmware. Re-uploading is neither
         // possible nor needed, and erroring here would make every second start fail.
-        let transport = controller(version_tlv(tlv_image::OPERATIONAL));
+        let transport = controller(version_tlv(tlv_image::OPERATIONAL), 0);
         IntelInit
             .init(AX200, &transport, &FirmwareSet::new())
             .await
@@ -1010,7 +1196,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_image_fails_before_the_upload_starts() {
-        let transport = controller(version_tlv(tlv_image::BOOTLOADER));
+        let transport = controller(version_tlv(tlv_image::BOOTLOADER), 0);
         let err = IntelInit
             .init(AX200, &transport, &FirmwareSet::new())
             .await
@@ -1021,9 +1207,13 @@ mod tests {
 
     #[tokio::test]
     async fn the_reset_comes_after_the_firmware_and_not_before() {
-        let transport = controller(version_tlv(tlv_image::BOOTLOADER));
+        let image = sfi(&command_block(2));
+        let transport = controller(
+            version_tlv(tlv_image::BOOTLOADER),
+            uploaded_len(&image, SecureBoot::Rsa),
+        );
         IntelInit
-            .init(AX200, &transport, &firmware_with(sfi(&command_block(2))))
+            .init(AX200, &transport, &firmware_with(image))
             .await
             .unwrap();
 
@@ -1031,6 +1221,62 @@ mod tests {
         let last_send = opcodes.iter().rposition(|o| *o == SECURE_SEND).unwrap();
         let reset = opcodes.iter().position(|o| *o == INTEL_RESET).unwrap();
         assert!(reset > last_send, "reset must follow the whole upload");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_controller_that_never_accepts_the_image_is_not_reset() {
+        // #391. Every fragment being acknowledged is not the image being accepted: the
+        // bootloader acknowledges each `Secure_Send` as it lands and announces the image
+        // as a whole separately. Resetting on the acknowledgements alone left the AX211
+        // with no operational firmware and no USB presence at all, recoverable only by
+        // `pnputil /scan-devices`, and the announcement then arrived 367us after the
+        // reset had already gone out.
+        //
+        // So a part that never announces has to stop the loader *before* `Intel_Reset` —
+        // which is the assertion below, and the one that fails against the old loader.
+        // `usize::MAX` is the fake never reaching the end of its payload.
+        let image = sfi(&command_block(2));
+        let transport = controller(version_tlv(tlv_image::BOOTLOADER), usize::MAX);
+        let err = IntelInit
+            .init(AX200, &transport, &firmware_with(image))
+            .await
+            .unwrap_err();
+
+        // In virtual time, so the shipped five seconds is asserted rather than waited out.
+        assert!(
+            format!("{err}").contains("download result"),
+            "the timeout must name the step that expired: {err}"
+        );
+        assert!(
+            !transport.sent_commands().contains(&INTEL_RESET),
+            "an unconfirmed image must not be booted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_image_is_reported_as_a_refusal_rather_than_a_boot_timeout() {
+        // The same event carries the bootloader's verdict, and a non-zero result is the
+        // image being rejected outright. Left unread it would surface five seconds later
+        // as "no bootup notification", which points at the boot step rather than at the
+        // image that was refused before it.
+        let image = sfi(&command_block(2));
+        let len = uploaded_len(&image, SecureBoot::Rsa);
+        let transport = controller_announcing(version_tlv(tlv_image::BOOTLOADER), len, 0x0D);
+        let err = IntelInit
+            .init(AX200, &transport, &firmware_with(image))
+            .await
+            .unwrap_err();
+
+        let text = format!("{err}");
+        assert!(text.contains("refused the image"), "got: {text}");
+        assert!(
+            text.contains("0x0d"),
+            "the result byte is the diagnosis: {text}"
+        );
+        assert!(
+            !transport.sent_commands().contains(&INTEL_RESET),
+            "a refused image must not be booted"
+        );
     }
 
     /// The AX200 in the dev box.

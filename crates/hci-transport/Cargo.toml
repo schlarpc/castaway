@@ -34,7 +34,9 @@ futures = { workspace = true, optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+# `test-util` for `start_paused`: the loader's timeouts are seconds long, and a test that
+# asserts the shipped constant has to advance the clock rather than wait it out (#208).
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread", "test-util"] }
 tracing-subscriber.workspace = true
 
 [[example]]
