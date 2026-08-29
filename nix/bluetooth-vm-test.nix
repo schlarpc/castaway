@@ -252,7 +252,22 @@ pkgs.testers.runNixOSTest {
         machine.succeed("pkill -f 'bin/btvirt'")
         machine.wait_until_succeeds("! hciconfig | grep -q hci1", timeout=60)
         machine.succeed(f"{env} ${bluezWithBtvirt}/bin/btvirt -l2 >>/tmp/btvirt.log 2>&1 &")
-        machine.wait_until_succeeds("hciconfig | grep -q hci1", timeout=60)
+        try:
+            machine.wait_until_succeeds("hciconfig | grep -q hci1", timeout=60)
+        except Exception:
+            # What the controllers did instead. When this expired on 2026-08-13 the run
+            # reported only "action timed out after 60.67 seconds", and the reason was in
+            # btvirt's own log and the kernel's — neither of which was printed (#357).
+            # `execute` throughout: this runs only once the restart has already failed,
+            # and a diagnostic that raises would replace the failure with its own.
+            for name, cmd in [
+                ("btvirt", "tail -40 /tmp/btvirt.log"),
+                ("hciconfig", "hciconfig -a"),
+                ("kernel", "dmesg | tail -40"),
+                ("bluetoothd", "journalctl -u bluetooth --no-pager | tail -40"),
+            ]:
+                print(f"--- {name} ---\n{machine.execute(cmd)[1]}")
+            raise
         bring_up("hci0")
 
     with subtest("the two controllers can see each other"):
@@ -795,6 +810,66 @@ pkgs.testers.runNixOSTest {
         if status != 0:
             print(machine.succeed("journalctl -u castaway-rec | tail -60"))
             raise Exception(f"the audio did not survive the path:\n{report}")
+
+        # And the audio graph is handed back — in order, and before anything underneath it
+        # moves. This is teardown and it is load-bearing (#357).
+        #
+        # wireplumber's bluez5 plugin holds a device, a transport and a node for as long
+        # as the profile is connected, and the ERTM section below pulls the controllers
+        # out from under all three the moment `restart_btvirt` runs `pkill btvirt`. On
+        # 2026-08-13 that cost the whole check: this subtest finished green, wireplumber
+        # took a general protection fault in `libspa-bluez5` nineteen seconds later, and
+        # the restart that followed never saw hci1 come back inside its minute. The
+        # subtest that failed was not the one that was wrong.
+        #
+        # Worth ordering rather than re-running, because `promote` is what moves the
+        # **Latest** pointer the in-app updater follows (#345, #346): a check that reddens
+        # at random withholds releases from every panel on the auto-update path, silently,
+        # for as long as nobody notices the pointer has stopped moving.
+        # Best-effort, and its output is printed rather than dropped: bluetoothd may
+        # already have torn the link down with the receiver, in which case this says so
+        # and nothing below depends on it either way.
+        print(machine.execute(
+            f"timeout 60 bluetoothctl --timeout 30 disconnect {sink_addr} 2>&1"
+        )[1])
+
+        # The audio graph is stopped outright, and *that* is the quiesce — not the profile
+        # disconnect above.
+        #
+        # The first attempt at this waited for the `bluez_output` node to leave the graph
+        # after a disconnect, and it never did: ninety seconds later `wpctl status` still
+        # listed both the bluez5 device and its sink. Which is the useful finding — the
+        # node's lifetime is not the profile's, so there is no disconnect this harness can
+        # issue that reliably ends it. What ends it is the process exiting.
+        #
+        # `execute`, not `succeed`: the unit names are the graph's, not ours, and a run
+        # must not fail because one of them was renamed upstream. The condition asserted
+        # below is the observable one — wireplumber is no longer running — which is the
+        # thing that actually has to be true, and which a wrong unit name fails anyway.
+        machine.execute(
+            "systemctl --user --machine=tester@.host stop "
+            "wireplumber.service pipewire.service pipewire.socket pipewire-pulse.socket"
+        )
+        try:
+            machine.wait_until_succeeds("! pgrep -u tester -x wireplumber", timeout=60)
+        except Exception:
+            for name, cmd in [
+                ("units",
+                 "systemctl --user --machine=tester@.host list-units --all "
+                 "'pipewire*' 'wireplumber*'"),
+                ("processes", "pgrep -au tester"),
+                ("wireplumber",
+                 "journalctl _SYSTEMD_USER_UNIT=wireplumber.service --no-pager | tail -40"),
+            ]:
+                print(f"--- {name} ---\n{machine.execute(cmd)[1]}")
+            # Ground rule 6: a harness that cannot quiesce says *that*, rather than leaving
+            # the next section to fail as though a controller had gone wrong — which is
+            # exactly how this was mis-read the first time.
+            raise Exception(
+                "wireplumber is still running after its units were stopped, so the audio "
+                "graph cannot be quiesced before the controllers are restarted. This is "
+                "the harness, not the receiver (#357)."
+            )
 
     # ------------------------------------------------------------------------------
     # ERTM against the kernel's own L2CAP (#210).
