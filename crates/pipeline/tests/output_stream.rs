@@ -138,15 +138,21 @@ impl Published {
     /// reporting a sync defect. `starved` is the discriminator: it counts a pass that
     /// found a live input empty, so it separates "the source did not produce" from "the
     /// mix mislaid what it produced" — the two diagnoses #208 spent a week between.
-    fn assert_the_source_kept_up(&self) {
+    ///
+    /// Reported rather than asserted (#378): a premise this returns is a fact about the
+    /// box, and one sample of a box is not evidence — see [`measured`], which attempts the
+    /// whole measurement again instead of reddening the run on the first refusal.
+    fn source_kept_up(&self) -> Result<(), Unmeasurable> {
         let counters = self.mixer.counters();
         let starved = counters.starved as f64 / f64::from(RATE);
-        assert!(
-            starved < 0.05,
-            "the harness source was descheduled for {starved:.3}s, so this box cannot \
-             measure sync — not a defect in the stream. {}",
-            self.sound_diagnostics()
-        );
+        if starved >= 0.05 {
+            return Err(Unmeasurable(format!(
+                "the harness source was descheduled for {starved:.3}s, so this box cannot \
+                 measure sync — not a defect in the stream. {}",
+                self.sound_diagnostics()
+            )));
+        }
+        Ok(())
     }
 
     /// Fail unless the encode thread kept draining the mix on its schedule.
@@ -174,6 +180,74 @@ impl std::ops::Deref for Published {
     fn deref(&self) -> &LiveStream {
         &self.state
     }
+}
+
+/// Why one attempt at a measurement could not be taken *on this box*.
+///
+/// Carries the premise's own report — the counters and the arithmetic that identified the
+/// box rather than the stream. Distinct from a panic on purpose: a premise is a fact about
+/// the run that produced it, so it is a value the caller decides about, not a verdict
+/// (#378).
+struct Unmeasurable(String);
+
+/// The outcome of one attempt at a measurement whose premise a loaded box can fail.
+enum Attempt<T> {
+    /// Taken, and this is the measurement.
+    Took(T),
+    /// Not taken: the premise says this run could not measure it.
+    Unmeasurable(Unmeasurable),
+    /// There is honestly no GPU and no encoder here — a skip, not a premise (#182).
+    NoRenderer,
+}
+
+/// How many independent attempts a measurement gets before its premise becomes the report.
+///
+/// Three, because one sample of a box is not evidence about the box. The nightly reddened
+/// every few days on `invented` fills of 54–64 ms that the premise itself had already
+/// identified as unmeasurable, on a commit that changed nothing (#378) — and a chronically
+/// red `main` is what let #377's break sit unnoticed for eight days (#334).
+const MEASUREMENT_ATTEMPTS: usize = 3;
+
+/// Attempt a measurement until it is taken, and make its premise the report only when
+/// every attempt lands there.
+///
+/// The answer to #378, and deliberately *not* a skip. Skipping the assertion would leave a
+/// box that can never measure placement reporting `ok` having measured nothing, which is
+/// the failure `test_media` exists because of — `checks.audio` was green for weeks having
+/// decoded nothing. So the run still reds when the box genuinely cannot measure; it just
+/// takes three refusals in a row to say so, which turns a per-run rate of roughly one in
+/// eight into roughly one in five hundred, and the message it fails with is then evidence
+/// about the box rather than one sample of it.
+///
+/// Costs nothing on the happy path: a first attempt that measures returns immediately, so
+/// the normal run is the single attempt it always was (#238).
+fn measured<T>(what: &str, mut attempt: impl FnMut() -> Attempt<T>) -> Option<T> {
+    let mut refused: Vec<String> = Vec::new();
+    for n in 1..=MEASUREMENT_ATTEMPTS {
+        match attempt() {
+            Attempt::Took(value) => {
+                if !refused.is_empty() {
+                    eprintln!(
+                        "{what}: measured on attempt {n} of {MEASUREMENT_ATTEMPTS}; \
+                         {} earlier attempt(s) could not",
+                        refused.len()
+                    );
+                }
+                return Some(value);
+            }
+            Attempt::NoRenderer => return None,
+            Attempt::Unmeasurable(Unmeasurable(why)) => {
+                eprintln!("{what}: attempt {n} of {MEASUREMENT_ATTEMPTS} could not measure: {why}");
+                refused.push(format!("attempt {n}: {why}"));
+            }
+        }
+    }
+    panic!(
+        "{what}: all {MEASUREMENT_ATTEMPTS} attempts landed inside the premise, so this box \
+         cannot measure it — not a defect in the stream, but nothing here was checked \
+         either, and a green run would be one that measured nothing. {}",
+        refused.join(" || ")
+    );
 }
 
 /// What the panel is doing while the stream records it.
@@ -845,15 +919,25 @@ fn letting_the_tap_go_takes_the_stream_live_status_with_it() {
 
 #[test]
 fn sound_played_on_the_panel_comes_back_in_the_stream() {
+    // Attempted, for the reason `tone_onset` is: the marker grid rests on the same premise
+    // the placement assertion does, and a descheduled mixer thread refuses it here too
+    // (#378).
+    measured("the tone through the shipped path", || {
+        sound_comes_back_once()
+    });
+}
+
+/// One attempt at [`sound_played_on_the_panel_comes_back_in_the_stream`].
+fn sound_comes_back_once() -> Attempt<()> {
     // Through the shipped path: a session takes an output from the tee'd factory and
     // writes to it exactly as a cast does. If the tee, the resampler, the mix, the AAC
     // encoder, the `esds` or the second `traf` is wrong, this is silence.
     //
     // A tenth of a second of silence first, not zero: the head of the track decodes
-    // through the codec's start-up ramp (see `assert_the_marker_blocks_line_up`), and a
-    // tone starting inside it hands the marker grid a smeared onset to anchor on. The
-    // lead puts the ramp on silence — where the shipped track always has it — and costs
-    // the assertions nothing.
+    // through the codec's start-up ramp (see `marker_blocks_line_up`), and a tone starting
+    // inside it hands the marker grid a smeared onset to anchor on. The lead puts the ramp
+    // on silence — where the shipped track always has it — and costs the assertions
+    // nothing.
     let Some(state) = publish_with(
         320,
         176,
@@ -863,7 +947,7 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
             ..Scenario::default()
         },
     ) else {
-        return;
+        return Attempt::NoRenderer;
     };
     let file = playable(&state, 3);
     let sound = decode_audio(file.path()).expect("an audio track");
@@ -895,7 +979,10 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
     // A third segment carries the track past 12k frames, so eight blocks are asked of a
     // window with room for fifteen — a floor with margin rather than a knife edge. The
     // premise check inside the assertion is what says so if that ever stops being true.
-    assert_the_marker_blocks_line_up(&state, &sound, 8);
+    if let Err(premise) = marker_blocks_line_up(&state, &sound, 8) {
+        return Attempt::Unmeasurable(premise);
+    }
+    Attempt::Took(())
 }
 
 #[test]
@@ -986,7 +1073,15 @@ fn the_audio_track_trails_the_live_edge_and_never_leads_it() {
 /// interior, clear of the codec's own step response at the boundaries ([`MARKER_MARGIN`]).
 /// Only whole blocks are held to a level: the track is cut mid-block at the live edge, and
 /// a partial block is the cut, not a defect.
-fn assert_the_marker_blocks_line_up(state: &Published, sound: &Sound, at_least: usize) {
+///
+/// `Err` is the box, not the stream — the same premise `source_kept_up` reports, seen at a
+/// marker block rather than in the counters at the end, and returned so the caller can
+/// attempt the measurement again (#378). A defect still panics from inside here.
+fn marker_blocks_line_up(
+    state: &Published,
+    sound: &Sound,
+    at_least: usize,
+) -> Result<(), Unmeasurable> {
     let onset = usize::try_from(sound.onset.expect("a tone to line up")).unwrap();
     let last_loud = sound
         .mono
@@ -1060,14 +1155,15 @@ fn assert_the_marker_blocks_line_up(state: &Published, sound: &Sound, at_least: 
             // Either one both holes and shifts the tone.
             let starved = state.mixer.counters().starved;
             let invented = state.audio.mix().invented();
-            assert!(
-                starved == 0 && invented == 0,
-                "marker block {k} decoded to {mean:.3} where {want:.2} belongs, but \
-                 starved={starved} invented={invented} frames of silence went into the \
-                 tone's place, so this box cannot measure continuity — not a defect in \
-                 the stream. {}",
-                state.sound_diagnostics()
-            );
+            if starved != 0 || invented != 0 {
+                return Err(Unmeasurable(format!(
+                    "marker block {k} decoded to {mean:.3} where {want:.2} belongs, but \
+                     starved={starved} invented={invented} frames of silence went into the \
+                     tone's place, so this box cannot measure continuity — not a defect in \
+                     the stream. {}",
+                    state.sound_diagnostics()
+                )));
+            }
             panic!(
                 "marker block {k} decoded to a mean of {mean:.3} where {want:.2} belongs — \
                  a hole, repeat or reorder {} ms after the onset. {}",
@@ -1083,6 +1179,7 @@ fn assert_the_marker_blocks_line_up(state: &Published, sound: &Sound, at_least: 
         worst.0,
         worst.1
     );
+    Ok(())
 }
 
 /// How long the panel is quiet before the tone, in the two placement tests.
@@ -1131,11 +1228,69 @@ fn the_placement_premise_excuses_only_what_the_fill_accounts_for() {
     );
 }
 
+#[test]
+fn a_measurement_is_attempted_again_before_its_premise_becomes_the_report() {
+    // The retry policy itself, checked where it runs in every build — no GPU and no
+    // encoder needed (#378). A box that refuses and then measures is a green run, because
+    // the measurement was taken: that is the whole fix, and it is the arithmetic above it
+    // that decides which attempts count as refusals.
+    let mut attempts = 0usize;
+    let taken = measured("a premise that clears", || {
+        attempts += 1;
+        if attempts < MEASUREMENT_ATTEMPTS {
+            Attempt::Unmeasurable(Unmeasurable(format!(
+                "attempt {attempts} was on a loaded box"
+            )))
+        } else {
+            Attempt::Took(attempts)
+        }
+    });
+    assert_eq!(taken, Some(MEASUREMENT_ATTEMPTS));
+}
+
+#[test]
+fn a_renderer_that_is_not_there_is_a_skip_rather_than_a_retry() {
+    // A box with no GPU does not grow one on the second attempt, and #182's skip is not a
+    // premise failure: it takes the one attempt it always did.
+    let mut attempts = 0usize;
+    let taken: Option<()> = measured("a box with no renderer", || {
+        attempts += 1;
+        Attempt::NoRenderer
+    });
+    assert_eq!(taken, None);
+    assert_eq!(attempts, 1, "a missing renderer was retried");
+}
+
+#[test]
+#[should_panic(expected = "attempts landed inside the premise")]
+fn a_box_that_never_measures_still_reds_the_run() {
+    // The half of #378's fix that keeps it from being a skip. `test_media` exists because
+    // `checks.audio` was green for weeks having decoded nothing; a placement assertion
+    // that shrugged off every refusal would be the same check. Retrying buys two orders of
+    // magnitude on the flake rate and gives up none of that.
+    let _: Option<()> = measured("a premise that never clears", || {
+        Attempt::Unmeasurable(Unmeasurable("this box is loaded".into()))
+    });
+}
+
 /// Where the tone came back in the decoded track, or `None` where there is no GPU.
+///
+/// Attempted rather than measured once (#378): every premise inside [`tone_onset_once`] is
+/// a statement about the box that ran it, and the box is what varies between a green
+/// nightly and a red one on the same commit.
 fn tone_onset(scenario: Scenario) -> Option<f64> {
+    measured("tone placement", || tone_onset_once(scenario))
+}
+
+/// One attempt at [`tone_onset`]: a fresh render loop, mixer and source, measured through.
+fn tone_onset_once(scenario: Scenario) -> Attempt<f64> {
     let segments = 4;
-    let state = publish_with(320, 176, segments, scenario)?;
-    state.assert_the_source_kept_up();
+    let Some(state) = publish_with(320, 176, segments, scenario) else {
+        return Attempt::NoRenderer;
+    };
+    if let Err(premise) = state.source_kept_up() {
+        return Attempt::Unmeasurable(premise);
+    }
     let file = playable(&state, segments);
     let sound = decode_audio(file.path()).unwrap();
     let onset = sound.onset.unwrap_or_else(|| {
@@ -1164,14 +1319,16 @@ fn tone_onset(scenario: Scenario) -> Option<f64> {
     // quiet; this says every 10 ms of it is the 10 ms that was played, in order, once.
     // Four 200 ms segments minus the settle and the uncut tail leave the tone at least
     // 200 ms of track after its quarter second of silence.
-    assert_the_marker_blocks_line_up(&state, &sound, 20);
+    if let Err(premise) = marker_blocks_line_up(&state, &sound, 20) {
+        return Attempt::Unmeasurable(premise);
+    }
     // The claim — and its premise, checked first when it is about to fail (#236, #314).
     // Silence the mixer invented goes into the track *ahead* of the tone and pushes the
     // onset late by its own length, so a box that descheduled the mixer thread produces
     // this failure with the stream doing nothing wrong: one run under triple-suite
     // contention showed `invented=4096`, `starved=0` — 85 ms of fill, an onset at 0.335 s
-    // — which `assert_the_source_kept_up` cannot see, because it bounds the *harness
-    // source's* schedule and this is the mixer thread's.
+    // — which `source_kept_up` cannot see, because it bounds the *harness source's*
+    // schedule and this is the mixer thread's.
     //
     // Only the explained part is excused, and only in the one direction the mechanism
     // works: the fill can push the tone late, never early, and never by more than it
@@ -1182,22 +1339,23 @@ fn tone_onset(scenario: Scenario) -> Option<f64> {
     if miss.abs() >= PLACEMENT_SLACK {
         let invented = state.audio.mix().invented();
         let invented_s = invented as f64 / f64::from(RATE);
-        assert!(
-            !invented_silence_explains(miss, invented_s),
-            "the tone starts {at:.3}s in rather than {:.3}s, and the mixer counted \
-             {invented} frames ({invented_s:.3}s) of invented silence — enough to account \
-             for the miss, so this box could not measure placement; not a defect in the \
-             stream. {}",
-            QUIET.as_secs_f64(),
-            state.sound_diagnostics()
-        );
+        if invented_silence_explains(miss, invented_s) {
+            return Attempt::Unmeasurable(Unmeasurable(format!(
+                "the tone starts {at:.3}s in rather than {:.3}s, and the mixer counted \
+                 {invented} frames ({invented_s:.3}s) of invented silence — enough to \
+                 account for the miss, so this box could not measure placement; not a \
+                 defect in the stream. {}",
+                QUIET.as_secs_f64(),
+                state.sound_diagnostics()
+            )));
+        }
         panic!(
             "the tone starts {at:.3}s in; it was played at {:.3}s. {}",
             QUIET.as_secs_f64(),
             state.sound_diagnostics()
         );
     }
-    Some(at)
+    Attempt::Took(at)
 }
 
 #[test]
