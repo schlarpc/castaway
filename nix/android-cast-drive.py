@@ -43,17 +43,40 @@ def shell(*args, timeout=60):
     return adb("shell", *args, timeout=timeout)
 
 
-def wait_for(what, predicate, timeout, interval=2):
-    """Poll until `predicate()` is truthy, with the failure naming the step."""
+def wait_for(what, predicate, timeout, interval=2, diagnose=None):
+    """Poll until `predicate()` is truthy, with the failure naming the step.
+
+    `diagnose` is what the *step* knows and its name does not — the interface list
+    behind "no address on the segment", the adapter state behind "no A2DP stream" —
+    printed when the poll expires. Optional only because not every step has one; a
+    step that does and omits it is #386: the segment-address poll timed out on the
+    2026-08-28 nightly having printed nothing but its own name, so nothing in the run
+    could say whether eth0 was up with the wrong address, up with none, or absent.
+    This file's docstring promises the last thing printed is the diagnosis, and this
+    is what keeps that true on the path where it matters.
+
+    Best-effort: a step that has already lost the device must still report the step it
+    lost rather than an exception raised trying to describe it.
+
+    The elapsed time is printed on success too. A step that starts creeping towards its
+    ceiling is a timeout about to become a flake, and the run that says "ok (after 12s)"
+    every night is the one that makes "ok (after 170s)" legible when it happens.
+    """
     print(f"waiting for {what} (up to {timeout}s)", flush=True)
-    deadline = time.monotonic() + timeout
+    began = time.monotonic()
+    deadline = began + timeout
     while time.monotonic() < deadline:
         value = predicate()
         if value:
-            print(f"  {what}: ok", flush=True)
+            print(f"  {what}: ok (after {time.monotonic() - began:.0f}s)", flush=True)
             return value
         time.sleep(interval)
-    raise SystemExit(f"FAIL: timed out waiting for {what}")
+    if diagnose is not None:
+        try:
+            print(f"  what {what} found instead:\n{diagnose()}", flush=True)
+        except Exception as exc:  # noqa: BLE001 — a failed dump must not mask the step
+            print(f"  (the diagnostic for {what} raised {exc!r})", flush=True)
+    raise SystemExit(f"FAIL: timed out waiting for {what} after {timeout}s")
 
 
 # `CASTAWAY_LOG` is the app's own journal, which `logging.rs` writes without ANSI on
@@ -70,6 +93,20 @@ def log_has(needle):
             return needle in ANSI.sub("", f.read())
     except FileNotFoundError:
         return False
+
+
+def log_tail(lines=40):
+    """The end of castaway's own journal — the diagnosis for a step that waited on it.
+
+    A `log_has` poll that expires has, by construction, no idea what the journal *does*
+    say; this is what `wait_for`'s `diagnose` prints so the run does not have to be
+    reproduced to find out (#386).
+    """
+    try:
+        with open(CASTAWAY_LOG, encoding="utf-8", errors="replace") as f:
+            return "".join(ANSI.sub("", f.read()).splitlines(keepends=True)[-lines:])
+    except FileNotFoundError:
+        return f"<no journal at {CASTAWAY_LOG}>"
 
 
 def ui_dump():
@@ -122,10 +159,24 @@ def main():
     # Polled rather than read once: eth0 is configured a good while *after*
     # `sys.boot_completed` goes to 1 — it came up as link index 15 on this image — and a
     # single read right after boot reports only `lo` and blames the network for a race.
+    #
+    # Five minutes rather than the three this had on the 2026-08-28 nightly, where it
+    # expired (#386). Three was a guess and so is five; what is not a guess is that the
+    # ceiling costs a healthy run nothing — the poll returns the moment the address is
+    # there, and the "ok (after Ns)" it prints is what will say whether a slow runner was
+    # ever the explanation. `diagnose` is the other half: the two candidate causes — a
+    # hosted runner slower than the ceiling, and a guest that has stopped taking SLIRP's
+    # fixed address — look identical from the step's name alone, and a longer timeout
+    # would otherwise just hide the second one for longer.
     wait_for(
         f"the guest's address on the segment ({GUEST_IP})",
         lambda: GUEST_IP in shell("ip", "-o", "-4", "addr", "show")[1],
-        180,
+        300,
+        diagnose=lambda: (
+            f"addresses:\n{shell('ip', '-o', '-4', 'addr', 'show')[1]}"
+            f"links:\n{shell('ip', '-o', 'link', 'show')[1]}"
+            f"routes:\n{shell('ip', '-o', 'route', 'show')[1]}"
+        ),
     )
     print(f"guest addresses:\n{shell('ip', '-o', '-4', 'addr', 'show')[1]}", flush=True)
     # Wi-Fi off, and this is load-bearing rather than tidying.
@@ -146,16 +197,27 @@ def main():
         "wlan0 to leave the segment",
         lambda: GUEST_WIFI_IP not in shell("ip", "-o", "-4", "addr", "show")[1],
         120,
+        diagnose=lambda: f"addresses:\n{shell('ip', '-o', '-4', 'addr', 'show')[1]}",
     )
     wait_for(
         "the guest reaching the receiver's address",
         lambda: shell("ping", "-c", "2", "-W", "2", RECEIVER_IP)[0] == 0,
         120,
+        diagnose=lambda: (
+            f"ping:\n{shell('ping', '-c', '2', '-W', '2', RECEIVER_IP)[1]}"
+            f"addresses:\n{shell('ip', '-o', '-4', 'addr', 'show')[1]}"
+            f"routes:\n{shell('ip', '-o', 'route', 'show')[1]}"
+        ),
     )
 
     # Our side must be advertising before the picker is opened, or the first scan finds
     # nothing and Play Services backs off for longer than this check waits.
-    wait_for("castaway advertising Cast", lambda: log_has("CASTv2 TLS listener ready"), 180)
+    wait_for(
+        "castaway advertising Cast",
+        lambda: log_has("CASTv2 TLS listener ready"),
+        180,
+        diagnose=log_tail,
+    )
 
     # The sender: Android's own system Cast picker. This is the surface #226 was
     # invisible on — GMS filters it by the DNS-SD sub-types in the mDNS answer, so
@@ -167,7 +229,14 @@ def main():
 
     # Generous: Play Services' scanner batches its browse and the first answer can land
     # after a back-off. A picker that never lists us is #226 all over again.
-    row = wait_for(f"{RECEIVER_NAME!r} in the system Cast picker", receiver_row, 240)
+    row = wait_for(
+        f"{RECEIVER_NAME!r} in the system Cast picker",
+        receiver_row,
+        240,
+        # What the picker *is* showing is the whole diagnosis here: an empty scan, some
+        # other receiver, or a row whose text has moved. #226 was invisible without it.
+        diagnose=lambda: f"the picker:\n{ui_dump()[:4000]}\nour journal:\n{log_tail()}",
+    )
 
     print("tapping the receiver row", flush=True)
     tap(row)
@@ -226,7 +295,12 @@ def main():
     # Everything from here is judged from our own journal: the sender connects over TLS
     # on 8009, challenges us, and we answer. Device auth against *real* Play Services is
     # what #40 said a borrowed credential could not pass, and it does.
-    wait_for("the sender's CASTv2 connection", lambda: log_has("CASTv2 sender connected"), 120)
+    wait_for(
+        "the sender's CASTv2 connection",
+        lambda: log_has("CASTv2 sender connected"),
+        120,
+        diagnose=log_tail,
+    )
 
     # …and it came over the segment. Without this the check would pass on a connection
     # that reached us through the emulator's NAT (see the Wi-Fi note above) — green, and
@@ -240,6 +314,7 @@ def main():
         "device auth against real Play Services",
         lambda: log_has("answered a sender's device-auth challenge"),
         120,
+        diagnose=log_tail,
     )
     # Deliberately not asserted here: `GET_APP_AVAILABILITY` and the `eureka_info` probe.
     # Both are real and both are answered — they are how #226 was found — but Play
@@ -251,20 +326,20 @@ def main():
     # …and then it mirrors. The picker's tap is a screen-mirror request, so a completed
     # OFFER/ANSWER is the phone agreeing to send its screen to us over RTP — the thing
     # #226 closed as "still unproven".
-    try:
-        wait_for(
-            "a negotiated mirroring session", lambda: log_has("Cast mirroring negotiated"), 180
-        )
-    except SystemExit:
+    wait_for(
+        "a negotiated mirroring session",
+        lambda: log_has("Cast mirroring negotiated"),
+        180,
         # Whatever the phone is showing instead is the diagnosis, and it is gone as soon
-        # as the emulator is killed.
-        print("--- the screen at the moment of failure ---", flush=True)
-        print(ui_dump()[:4000], flush=True)
-        raise
+        # as the emulator is killed. This was a `try`/`except SystemExit` around the call
+        # until `wait_for` grew somewhere to put it (#386).
+        diagnose=lambda: f"the screen:\n{ui_dump()[:4000]}\nour journal:\n{log_tail()}",
+    )
     wait_for(
         "the RTP receive loop",
         lambda: log_has("Cast mirroring RTP receive loop started"),
         60,
+        diagnose=log_tail,
     )
 
     # Let the phone actually send for a while; the builder counts what landed on the
