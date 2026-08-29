@@ -17,7 +17,7 @@
 #
 # The host is deliberately *not* baked in: `CASTAWAY_WINDOWS_HOST=user@host`. It is one box on
 # one LAN, and the repo is not the place for it.
-{ pkgs }:
+{ pkgs, probe }:
 let
   inherit (pkgs) lib;
 
@@ -242,8 +242,8 @@ let
       # always. Running both unconditionally is idempotent and one round trip cheaper than
       # deciding.
       #
-      # **Double quotes, not single.** A hardware ID contains `&`, and cmd.exe -- which is
-      # what OpenSSH-for-Windows hands the command string to -- treats `&` as a command
+      # **Double quotes, not single.** A hardware ID contains `&`, and cmd.exe — which is
+      # what OpenSSH-for-Windows hands the command string to — treats `&` as a command
       # separator everywhere except inside double quotes. Single quotes mean nothing to
       # cmd, so `-HardwareId 'USB\VID_8087&PID_0033'` was split into a powershell call
       # ending at `'USB\VID_8087` and a second command `PID_0033'`. Every controller this
@@ -253,6 +253,100 @@ let
       # rather than a quoting one.
       on_box "powershell -NoProfile -ExecutionPolicy Bypass -File winusb-bind.ps1 -HardwareId \"$hwid\"" || true
       on_box "powershell -NoProfile -ExecutionPolicy Bypass -File winusb-force.ps1 -HardwareId \"$hwid\""
+    '';
+  };
+
+  # The controller bring-up loop (#287). Everything else in this file installs or replaces
+  # the receiver; this deliberately does neither, because the thing being iterated on is a
+  # firmware loader and the panel should stay up while it is.
+  #
+  # Three properties, each one a reason this is not `deploy`:
+  #
+  #   1. **It touches nothing the receiver owns.** One .exe into
+  #      `%LOCALAPPDATA%\castaway-probe`, which is beside the install root rather than
+  #      inside it, so no version tree, no `current` pointer and no scheduled task is
+  #      involved. Removing the directory is the whole uninstall.
+  #   2. **It re-copies only on change.** The binary is a couple of megabytes and the loop
+  #      is run many times per sitting, most of them with the same binary and different
+  #      arguments; comparing hashes first turns those into one round trip.
+  #   3. **It runs in the SSH session, not the console one.** `deploy` needs
+  #      `schtasks /IT` because the receiver has to put pixels on the panel. The probe
+  #      writes to stdout and claims a USB device, and both of those work in session 0 —
+  #      which is what makes this a normal command whose output and exit status come
+  #      straight back.
+  #
+  # What it does *not* do is arrange the two preconditions, because both are per-box
+  # rather than per-run and neither is reversible by accident: the controller has to be
+  # bound to WinUSB (`nix run .#windows-winusb`), and the receiver has to not be holding
+  # it (`[enable] bluetooth = false` in the box's castaway.toml, then restart it once).
+  # A USB claim is exclusive, so with the receiver's Bluetooth on, this cannot open the
+  # device at all — the probe says so, and names the command.
+  probeApp = pkgs.writeShellApplication {
+    name = "castaway-windows-probe";
+    runtimeInputs = [ pkgs.openssh pkgs.coreutils pkgs.gnugrep ];
+    text = preamble + ''
+      # OpenSSH-for-Windows hands the command string to cmd.exe, which applies its own
+      # metacharacters and does no word-splitting. So the arguments are checked against
+      # what the probe actually accepts rather than forwarded blind: `&` or `>` in an
+      # argument would otherwise be run by the remote shell instead of reaching the .exe.
+      args=()
+      for a in "$@"; do
+        case "$a" in
+          --identify|--to-bootloader) ;;
+          [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+          *)
+            echo "error: unexpected argument '$a'" >&2
+            echo >&2
+            echo "usage: castaway-windows-probe [vendor:product] [--identify|--to-bootloader]" >&2
+            echo "  (no arguments lists the controllers the box can see)" >&2
+            exit 1 ;;
+        esac
+        args+=("$a")
+      done
+
+      base=$(on_box 'echo %LOCALAPPDATA%' | unix)
+      # cmd echoes the value with no trailing newline handling of its own; strip trailing
+      # whitespace rather than letting it become part of a path.
+      base="''${base%"''${base##*[![:space:]]}"}"
+      if [ -z "$base" ]; then
+        echo "error: could not resolve %LOCALAPPDATA% on $host" >&2
+        exit 1
+      fi
+      dir="$base\\castaway-probe"
+      # scp speaks forward slashes even to a Windows host; cmd takes either.
+      dir_fwd="''${dir//\\//}"
+
+      want=$(sha256sum ${probe}/bin/hci-probe.exe | cut -d' ' -f1)
+      if [ "$(remote_sha256 "$dir\\hci-probe.exe")" = "$want" ]; then
+        echo "==> hci-probe.exe on $host is current"
+      else
+        echo "==> copying hci-probe.exe to $dir"
+        on_box "if not exist \"$dir\" mkdir \"$dir\""
+        scp "''${ssh_opts[@]}" -q ${probe}/bin/hci-probe.exe "$host:$dir_fwd/hci-probe.exe"
+        # Read it back rather than trusting scp's exit status: the failure this catches is
+        # a partial copy, which scp reports as success and the probe reports as a
+        # confusing crash at some later point in a firmware upload.
+        got=$(remote_sha256 "$dir\\hci-probe.exe")
+        if [ "$got" != "$want" ]; then
+          echo "error: hci-probe.exe did not land intact (want $want, got ''${got:-nothing})" >&2
+          exit 1
+        fi
+      fi
+
+      # The loader's own tracing is the point of running this at all, so the filter is
+      # exposed rather than left at the binary's default. Same reasoning as the argument
+      # check above for why it is not simply interpolated.
+      log="''${CASTAWAY_PROBE_LOG:-debug}"
+      if ! printf '%s' "$log" | grep -qE '^[A-Za-z0-9_,=:-]+$'; then
+        echo "error: CASTAWAY_PROBE_LOG='$log' is not a plain tracing filter" >&2
+        exit 1
+      fi
+
+      echo "==> hci-probe.exe ''${args[*]-}"
+      # `set "VAR=value"` rather than `set VAR=value`: cmd takes everything up to the
+      # `&&` as the value, trailing space included, so the unquoted form would set the
+      # filter to "debug " and leave EnvFilter to make what it can of that.
+      on_box "cd /d \"$dir\" && set \"RUST_LOG=$log\" && hci-probe.exe ''${args[*]-}" | unix
     '';
   };
 
@@ -744,4 +838,10 @@ let
   };
 
 in
-{ inherit deploy migrate firewall winusb; }
+{
+  inherit deploy migrate firewall winusb;
+  # `probeApp` inside, `probe` outside: the argument of that name is the cross-built
+  # binary, and shadowing it here would make the two impossible to tell apart at the
+  # call site.
+  probe = probeApp;
+}

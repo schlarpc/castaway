@@ -749,7 +749,10 @@
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let
             windows = windowsFor system;
-            windowsDeploy = import ./nix/deploy-windows.nix { inherit pkgs; };
+            windowsDeploy = import ./nix/deploy-windows.nix {
+              inherit pkgs;
+              probe = windows.probe;
+            };
           in
           {
             # On Linux the default is the real receiver: every optional feature, `ldac`
@@ -844,6 +847,14 @@
             # Hand a USB device to castaway's own stack: `nix run .#windows-winusb`
             # (`-- --undo` gives it back to Windows). Defaults to the Intel radio.
             windows-winusb = windowsDeploy.winusb;
+
+            # The controller bring-up tool, cross-built for the box.
+            castaway-probe-windows = windows.probe;
+
+            # …and the loop that runs it there: `nix run .#windows-probe -- 8087:0032`.
+            # Pushes just that one .exe to a scratch directory and runs it, leaving the
+            # installed receiver and its version trees alone.
+            windows-probe = windowsDeploy.probe;
           }
         ));
 

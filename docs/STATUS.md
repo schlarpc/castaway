@@ -244,6 +244,15 @@ the resulting refresh token into `.env.local` itself rather than asking for a pa
   aarch64 equally aspirational — so the portable build survives purely as that fixture.
 - `packages.castaway-windows-electron` — the Windows deploy artifact, cross-compiled
   (append `.archive` for the same tree as a single zip).
+- `packages.castaway-probe-windows` — the controller bring-up tool (`hci-probe`) for the
+  Windows box, and the only cross-built artifact that is not part of a release. Pushed and
+  run by `nix run .#windows-probe -- <vendor:product> [--identify|--to-bootloader]`, which
+  copies one .exe into `%LOCALAPPDATA%\castaway-probe` — beside the install root, not
+  inside it — so a firmware-loader iteration leaves the running receiver, its version
+  trees and its scheduled task alone (#287). Two per-box preconditions it does not
+  arrange: the controller bound to WinUSB (`nix run .#windows-winusb`), and
+  `[enable] bluetooth = false` in the box's castaway.toml, because a USB claim is
+  exclusive and the receiver would otherwise be holding the radio.
 
 ## A YouTube cast, with no phone (`nix run .#yt-selfplay -- http://<receiver>:8080`)
 The one path a VM test cannot cover: YouTube's Lounge servers are a third party to the

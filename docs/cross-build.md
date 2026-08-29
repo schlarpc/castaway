@@ -36,6 +36,7 @@ exercises your *future* Linux target.
 | Output | Features | What it's for |
 |---|---|---|
 | `.#castaway-windows-electron` | `--no-default-features --features electron,audio-out` | the deploy artifact, and since D55 the only one: render + hwaccel + the Electron browser subprocess, with the ECS distribution, our host app, and the Widevine CDM staged, plus WASAPI output through cpal |
+| `.#castaway-probe-windows` | `--package hci-probe` (`usb` only) | the controller bring-up tool, and the one cross-built artifact that is not part of a release: a single small .exe with no ffmpeg, no browser and no receiver, so it rebuilds and reaches the box in a fraction of the time the deploy artifact does (#287) |
 | `.#msvc-sysroot` | — | the MSVC CRT + Windows SDK sysroot, built and cached independently |
 
 There were four artifacts until D55: a bare canary, `render`, `hwaccel`, and the deploy build.
@@ -70,6 +71,40 @@ nix run .#deploy-windows              # build → copy → verify → point → 
 nix run .#deploy-windows -- --force   # re-copy even if the box already has these bits
 nix run .#deploy-windows -- --no-launch castaway-windows-electron
 ```
+
+### Bluetooth bring-up, without taking the panel down (#287)
+
+Iterating on a firmware loader is the one Windows loop that must not replace the receiver
+each time round, so it has its own path that touches nothing the receiver owns:
+
+```
+nix run .#windows-winusb                          # once per box; --undo gives the radio back
+nix run .#windows-probe                           # list what the box can see
+nix run .#windows-probe -- 8087:0032 --identify   # claim and ask, writing nothing
+nix run .#windows-probe -- 8087:0032 --to-bootloader
+nix run .#windows-probe -- 8087:0032              # now it exercises the loader
+```
+
+One .exe goes into `%LOCALAPPDATA%\castaway-probe` — beside the install root rather than
+inside it — and is re-copied only when its hash differs from what is already there, so a
+repeat run is a single round trip. It runs in the SSH session rather than through
+`schtasks /IT`: the probe writes to stdout and claims a USB device, neither of which needs
+the console session, which is what lets its output and exit status come straight back.
+
+Two preconditions the script deliberately does not arrange, because both are per-box and
+neither is reversible by accident:
+
+- **the controller is bound to WinUSB**, not the Microsoft Bluetooth driver. That binding
+  is a signed INF package keyed on hardware ID, so Windows re-applies it whenever the part
+  re-enumerates — which is what `--to-bootloader` causes, and is the one thing easier here
+  than on Linux, where `udev` re-loads `btusb` behind you. A part whose bootloader
+  enumerates under a *different* product ID needs that ID bound too;
+- **the receiver is not holding the radio.** A USB claim is exclusive, so `castaway.exe`
+  with `[enable] bluetooth = true` owns the controller and the probe cannot open it. Set
+  `bluetooth = false` in the box's castaway.toml and restart it once — the receiver goes on
+  casting, painting and serving, and simply does not claim the device. That is a runtime
+  switch rather than a rebuild (D55), so it costs one restart per sitting, not one per
+  iteration.
 
 ### The install layout
 
