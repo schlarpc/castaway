@@ -32,15 +32,34 @@
 //! and the loader takes the "already operational" branch every time. To reach the upload
 //! path the part has to be sent back to its bootloader:
 //!
+//! The part re-enumerates when it drops into the bootloader, and whatever binds it next
+//! loads firmware into it — so the window has to be held open across that re-enumeration,
+//! not just before it. Turning off USB driver autoprobing is what does that:
+//!
 //! ```text
-//! modprobe -r btusb                                # nothing may re-bind it
+//! echo 0 | sudo tee /sys/bus/usb/drivers_autoprobe   # nothing binds anything
+//! echo -n 3-10:1.0 | sudo tee /sys/bus/usb/drivers/btusb/unbind
 //! cargo run -p hci-probe -- 8087:0032 --to-bootloader
-//! cargo run -p hci-probe -- 8087:0032              # now it loads firmware
+//! echo -n 3-10 | sudo tee /sys/bus/usb/drivers/usb/bind   # see below
+//! cargo run -p hci-probe -- 8087:0032                # now it loads firmware
 //! ```
 //!
-//! On Linux, `udev` re-loads `btusb` the moment the part re-enumerates, which reloads the
-//! firmware behind you; `echo 'install btusb /bin/true' > /run/modprobe.d/no-btusb.conf`
-//! holds it off, and deleting that file plus `modprobe btusb` gives the machine its
+//! Three things about that, each one observed rather than assumed:
+//!
+//! - **`autoprobe` also stops the device-level driver, and that one is needed.** It is
+//!   `usb` — bound to `3-10`, not to `3-10:1.0` — that selects a configuration, and
+//!   without a configuration the device has no interfaces and cannot be opened at all
+//!   (`errno 22`). So it has to be bound by hand after each re-enumeration, which is what
+//!   the fourth line is for.
+//! - **Do not write `bConfigurationValue` to force the interfaces to appear.** It looks
+//!   like the shorter way to the same place and it wedges the part: `can't set config #1,
+//!   error -22`, then `runtime_status` goes to `error`, after which `authorized` cannot be
+//!   set back to 1 and neither unbinding nor re-authorising recovers it. A reboot does.
+//! - **`install btusb /bin/true` in `/run/modprobe.d` did not hold `btusb` off here** —
+//!   the module was reloaded and re-bound on the next re-enumeration regardless, and the
+//!   firmware went with it. `drivers_autoprobe` is the lever that works.
+//!
+//! `echo 1` back into `drivers_autoprobe` and `modprobe btusb` give the machine its
 //! Bluetooth back.
 //!
 //! # On the Windows box

@@ -25,7 +25,7 @@ use nusb::transfer::{
 use nusb::{Device, DeviceInfo, Endpoint, Interface, MaybeFuture};
 use substrate_hci::{HciError, HciPacket, HciTransport, OpCode, PacketType};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::error::TransportError;
 use crate::firmware::FirmwareSet;
@@ -582,12 +582,12 @@ impl HciTransport for UsbTransport {
             // and an idle controller sends events and no ACL whatsoever — which is
             // exactly how this hung the first time it met real hardware.
             let reader = &mut *reader;
-            let (kind, read) = tokio::select! {
+            let (kind, read, pipe) = tokio::select! {
                 completion = reader.events.next_complete() => {
                     let read = handle_completion(
                         &mut reader.events, completion, "interrupt in",
                     ).await?;
-                    (PacketType::Event, read)
+                    (PacketType::Event, read, "interrupt in")
                 }
                 completion = reader.acl.next_complete() => {
                     let read = handle_completion(
@@ -598,12 +598,15 @@ impl HciTransport for UsbTransport {
                     // firmware fragment instead. Reading it as ACL is what made a
                     // successful upload look like a timeout.
                     if self.bootloader.load(std::sync::atomic::Ordering::Relaxed) {
-                        (PacketType::Event, read)
+                        (PacketType::Event, read, "bulk in")
                     } else {
-                        (PacketType::AclData, read)
+                        (PacketType::AclData, read, "bulk in")
                     }
                 }
             };
+            // Which pipe a packet came in on is not recoverable from the packet, and it
+            // is the question every "the controller went quiet" investigation asks first.
+            trace!(pipe, "an HCI packet arrived");
 
             let Read::Data(data) = read else {
                 continue;
