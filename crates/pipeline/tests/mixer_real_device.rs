@@ -94,8 +94,9 @@ fn a_44_1k_source_is_drained_in_real_time_by_a_real_device() {
         share > ACCEPT_FLOOR,
         "the input accepted {rate:.0} frames/s of a {SOURCE_RATE} Hz source ({:.1}%); \
          a live sender cannot be slowed down, so its queue fills at the difference and \
-         then never drains again — a permanent drop rate and a permanent latency floor",
-        share * 100.0
+         then never drains again — a permanent drop rate and a permanent latency floor. {}",
+        share * 100.0,
+        starvation_accounting(&window, share),
     );
     invented_is_negligible(&window);
     emission_is_real_time(&window, elapsed);
@@ -138,6 +139,39 @@ fn the_source_was_never_found_empty(window: &MixerCounters) {
         WINDOW.as_secs_f64(),
         share * 100.0,
     );
+}
+
+/// How much of the shortfall the starvation this run counted can account for.
+///
+/// [`the_source_was_never_found_empty`] bounds starvation at the accept floor's own
+/// complement and passes anything under it, on the reasoning that starvation lands on the
+/// accept rate one-for-one. #340 is the reading that says it does not: on this box's real
+/// PipeWire sink, idle, 1.67% starvation against a 3.3-point shortfall, and 2.67% against
+/// 4.1 points. Both are inside the premise's bound, so the premise passed and the assertion
+/// above is what failed — and what it said was "a permanent drop rate and a permanent
+/// latency floor", which is the mixer's name on a box's failure, three times in four.
+///
+/// It is still the mixer's name to put there *if* the shortfall is unexplained. So the
+/// message says which, with the arithmetic done: a reader who sees "1.7 of the 3.3 points"
+/// knows to suspect the box before the mixer, and one who sees "0.0 of 3.3" knows not to.
+///
+/// Deliberately a sentence in a failure rather than a second threshold. What the residual
+/// term is — a shared graph's scheduling noise, or one structural gap per run, which is
+/// what the 2400 frames (exactly 50 ms) recurring across runs looks like — is the open
+/// question in #340, and a bound tuned to excuse it is the thing that would stop anyone
+/// answering it.
+fn starvation_accounting(window: &MixerCounters, share: f64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let starved = window.starved as f64 / f64::from(RATE);
+    let starved_share = starved / WINDOW.as_secs_f64();
+    let shortfall = 1.0 - share;
+    format!(
+        "The mixer found this source empty for {starved:.3}s of the window, which is {:.1} \
+         of the {:.1} points missing and leaves {:.1} unaccounted for. {window:?}",
+        starved_share * 100.0,
+        shortfall * 100.0,
+        (shortfall - starved_share) * 100.0,
+    )
 }
 
 /// The share of the device's frames the mixer made up, asserted rather than inferred.
