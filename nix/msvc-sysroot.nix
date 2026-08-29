@@ -43,8 +43,21 @@ stdenvNoCC.mkDerivation {
     # filesystems in the build sandbox, and a cross-device rename(2) fails with EXDEV.
     export HOME="$TMPDIR"
 
+    # `--http-retry` defaults to 0, so a single dropped connection to Microsoft's CDN
+    # fails the whole derivation — and it is half a gigabyte in, having already fetched
+    # everything else. The observed failure is "failed to retrieve
+    # Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base.vsix after 1 tries due to I/O failures
+    # reading the response body".
+    #
+    # `--timeout` is raised with it because the default 60s is per *download*, not per
+    # stall, and the payload that fails is the largest one in the set at 205 MiB — which
+    # that budget only covers above about 3.5 MB/s sustained. That makes the timeout a
+    # likely cause of the truncated body rather than merely a second thing to harden;
+    # retries alone would then just spend five attempts hitting the same wall.
     xwin \
       --accept-license \
+      --http-retry 5 \
+      --timeout 600s \
       --cache-dir "$TMPDIR/xwin-cache" \
       --manifest-version 17 \
       --channel release \
