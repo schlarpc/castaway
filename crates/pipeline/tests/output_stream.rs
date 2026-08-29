@@ -922,9 +922,7 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
     // Attempted, for the reason `tone_onset` is: the marker grid rests on the same premise
     // the placement assertion does, and a descheduled mixer thread refuses it here too
     // (#378).
-    measured("the tone through the shipped path", || {
-        sound_comes_back_once()
-    });
+    measured("the tone through the shipped path", sound_comes_back_once);
 }
 
 /// One attempt at [`sound_played_on_the_panel_comes_back_in_the_stream`].
