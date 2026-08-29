@@ -312,15 +312,22 @@ fn main() -> anyhow::Result<()> {
         // look alike written down (#85). A log with only the position cannot tell you the
         // panel came up inaudible, which is exactly what it did not tell anyone (#178).
         #[cfg(feature = "audio")]
-        {
+        let room_level = {
             let start = castaway_core::Volume::from_position(config.initial_volume);
             render_pipeline.gain().set(start);
+            // And the same level in the scale a joining source reads it in, so a device
+            // that has to publish one publishes the room's (#389).
+            let room = render_pipeline.room_level();
+            room.set(start);
             info!(
                 position = config.initial_volume,
                 amplitude = start.amplitude(),
                 "output volume starts where the config says"
             );
-        }
+            Some(room)
+        };
+        #[cfg(not(feature = "audio"))]
+        let room_level: Option<Arc<castaway_core::RoomLevel>> = None;
 
         // DIAL launch → navigate the main-thread browser to YouTube leanback with
         // the sender's pairing params, so the phone binds to this screen; DIAL stop →
@@ -543,6 +550,7 @@ fn main() -> anyhow::Result<()> {
         };
         let handles = PipelineHandles {
             screenshot: Some(shot_handle),
+            room_level,
             #[cfg(feature = "stream")]
             stream: Some(stream_handle),
             #[cfg(not(feature = "stream"))]
@@ -1030,6 +1038,10 @@ struct PipelineHandles {
     /// …and what makes that duplicate *touchable*, for `/remote/*` (#18). `None` when
     /// `remote.enable` is off, or when no async runtime could be found to drive it.
     remote: Option<remote_http::Remote>,
+    /// Where the room's volume stands, so a source that has to publish a level joins at
+    /// the panel's rather than announcing one of its own (#389). `None` in a build with no
+    /// audio, which has no room to join.
+    room_level: Option<Arc<castaway_core::RoomLevel>>,
     /// Where the media-URL session has got to, for the protocols in which the receiver is
     /// the player and has to report its own position. Absent in a build with no decoder,
     /// which then honestly answers "no such information" rather than inventing a zero.
@@ -1127,6 +1139,7 @@ async fn serve(
         screenshot,
         stream,
         remote,
+        room_level,
         playback,
         mirror,
         #[cfg(feature = "render")]
@@ -1210,7 +1223,7 @@ async fn serve(
         .with_playback(
             sink,
             proto_spotify::PlaybackQuality {
-                initial_volume: config.spotify.initial_volume,
+                room_level: room_level.clone(),
                 bitrate: config.spotify.bitrate,
                 normalisation: config.spotify.normalisation,
                 local_file_directories: config.spotify.local_file_directories.clone(),

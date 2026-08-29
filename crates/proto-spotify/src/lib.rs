@@ -60,8 +60,13 @@ struct SpotifyStateInner {
 /// choice — rather than anything the pairing handshake depends on.
 #[derive(Debug, Clone)]
 pub struct PlaybackQuality {
-    /// Volume the device comes up at, `0.0..=1.0`.
-    pub initial_volume: f32,
+    /// The room's level, read when a session starts so the device joins at it.
+    ///
+    /// A device that comes up announcing a level of its own *changes* the room's, and
+    /// nobody asked it to: it is the panel's speakers, and whoever was listening a minute
+    /// ago set them where they are (#389). `None` joins at full scale, which is what a
+    /// build with no room to read has to mean.
+    pub room_level: Option<std::sync::Arc<castaway_core::RoomLevel>>,
     /// Stream quality in kbps: 96, 160 or 320.
     pub bitrate: u16,
     /// Apply Spotify's loudness normalisation.
@@ -78,7 +83,7 @@ impl Default for PlaybackQuality {
         // and unnormalised playback is what has people reaching for the volume between
         // tracks.
         Self {
-            initial_volume: 0.5,
+            room_level: None,
             bitrate: 320,
             normalisation: true,
             local_file_directories: Vec::new(),
@@ -124,7 +129,7 @@ impl SpotifyService {
             ConnectSettings {
                 device_name: self.state.info.remote_name.clone(),
                 device_id: self.state.info.device_id.clone(),
-                initial_volume: quality.initial_volume,
+                room_level: quality.room_level.clone(),
                 bitrate: quality.bitrate,
                 normalisation: quality.normalisation,
                 local_file_directories: quality.local_file_directories,

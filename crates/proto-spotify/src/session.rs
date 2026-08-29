@@ -46,6 +46,18 @@ use crate::sink::PcmSink;
 /// interval that still looks like it is moving.
 const POSITION_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The level a session announces to the phone when it comes up.
+///
+/// The room's, so connecting moves nothing. `ConnectConfig::initial_volume` is not optional
+/// — librespot has to publish *some* level in the device's connect state, and it is what
+/// the phone's slider shows — so the honest value is where the panel already is (#389).
+///
+/// Full scale where there is no room to read, which is the same default
+/// [`castaway_core::Volume`] has and what `[audio] initial_volume` starts the panel at.
+fn joining_at(room: Option<&castaway_core::RoomLevel>) -> castaway_core::Volume {
+    room.map_or(castaway_core::Volume::FULL, castaway_core::RoomLevel::get)
+}
+
 /// What librespot's player multiplies the decoded samples by: nothing.
 ///
 /// The taper belongs to the output gain, and to *only* the output gain (#85).
@@ -201,8 +213,8 @@ pub struct ConnectSettings {
     /// it keys the blob decryption — a mismatch fails login with nothing that looks like
     /// a cause.
     pub device_id: String,
-    /// Volume the device comes up at, as a fraction of full scale.
-    pub initial_volume: f32,
+    /// The room's level, read at login so the session joins at it rather than moving it.
+    pub room_level: Option<std::sync::Arc<castaway_core::RoomLevel>>,
     /// Stream quality in kbps. Anything other than 96/160/320 falls back to 320 with a
     /// warning — the set is librespot's, not ours, and a typo should not silently halve
     /// the bitrate.
@@ -782,7 +794,9 @@ async fn start(
     let (spirc, spirc_task) = Spirc::new(
         ConnectConfig {
             name: settings.device_name.clone(),
-            initial_volume: volume_to_spotify(settings.initial_volume),
+            initial_volume: volume_to_spotify(
+                joining_at(settings.room_level.as_deref()).position(),
+            ),
             ..ConnectConfig::default()
         },
         session.clone(),
@@ -1738,7 +1752,7 @@ mod tests {
         ConnectSettings {
             device_name: "castaway".into(),
             device_id: "deadbeef".into(),
-            initial_volume: 0.5,
+            room_level: None,
             bitrate: 320,
             normalisation: true,
             local_file_directories: Vec::new(),
@@ -2015,6 +2029,34 @@ mod tests {
         assert_eq!(volume_to_spotify(0.0), 0);
         assert_eq!(volume_to_spotify(1.0), u16::MAX);
         assert_eq!(volume_to_spotify(2.0), u16::MAX);
+    }
+
+    #[test]
+    fn a_session_joins_at_the_rooms_level_rather_than_setting_one() {
+        // #389. What the phone's slider shows when it connects, and — because that number
+        // comes straight back as a `VolumeChanged` and lands on the output gain — what the
+        // room is at a moment later. Reading the room makes the round trip a no-op.
+        let room = castaway_core::RoomLevel::new(castaway_core::Volume::from_position(0.8));
+        let joined = joining_at(Some(&room));
+        assert!(
+            (joined.position() - 0.8).abs() < 1e-6,
+            "a session joined at {} in a room at 0.8",
+            joined.position()
+        );
+        // Through Spotify's own scale and back, which is the trip the number actually
+        // makes: a session that joins at the room's level and reports it must not move it.
+        let round_tripped =
+            crate::control::volume_from_spotify(volume_to_spotify(joined.position()));
+        assert!(
+            (round_tripped.amplitude() - joined.amplitude()).abs() < 1e-4,
+            "connecting moved the room from {} to {}",
+            joined.amplitude(),
+            round_tripped.amplitude()
+        );
+
+        // No room to read is full scale, not half: a build with no panel behind it must
+        // not invent an attenuation.
+        assert_eq!(joining_at(None), castaway_core::Volume::FULL);
     }
 
     #[test]
@@ -3217,7 +3259,7 @@ mod tests {
             ConnectSettings {
                 device_name: "panel".to_owned(),
                 device_id: "0123456789abcdef".to_owned(),
-                initial_volume: 0.5,
+                room_level: None,
                 bitrate: 320,
                 normalisation: false,
                 local_file_directories: Vec::new(),

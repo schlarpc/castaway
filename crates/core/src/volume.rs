@@ -119,9 +119,80 @@ impl Volume {
     }
 }
 
+/// Where the room's volume stands, for a source that has to *join* at a level rather than
+/// announce one.
+///
+/// The panel has one pair of speakers and one level, and the mixer holds it as an amplitude
+/// because that is what it multiplies by. A source arriving has the opposite need: it wants
+/// the position, because that is the scale its own protocol speaks and the number its
+/// sender's slider will show. Reversing the taper out of an amplitude is not the answer —
+/// it puts the curve in a second place — so the position is kept here beside the gain and
+/// written wherever the gain is.
+///
+/// What it is for: a device that comes up announcing its own level *changes* the room's,
+/// and a Spotify session joining at a fixed half-scale dropped the panel 30 dB with nobody
+/// touching a slider (#389). A source that reads this instead joins silently, and only a
+/// finger on a slider moves anything.
+#[derive(Debug)]
+pub struct RoomLevel(std::sync::atomic::AtomicU32);
+
+impl Default for RoomLevel {
+    /// Full scale, matching [`Volume`]'s own default.
+    fn default() -> Self {
+        Self::new(Volume::FULL)
+    }
+}
+
+impl RoomLevel {
+    /// A room sitting at `level`.
+    #[must_use]
+    pub fn new(level: Volume) -> Self {
+        Self(std::sync::atomic::AtomicU32::new(
+            level.position().to_bits(),
+        ))
+    }
+
+    /// Record where the room's level now stands.
+    pub fn set(&self, level: Volume) {
+        self.0.store(
+            level.position().to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Where it stands.
+    #[must_use]
+    pub fn get(&self) -> Volume {
+        Volume::from_position(f32::from_bits(
+            self.0.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_room_level_round_trips_the_position_a_finger_set() {
+        // The property the whole type exists for: what a source reads back is the slider
+        // the room is on, not a position reconstructed from an amplitude (#389).
+        let room = RoomLevel::default();
+        assert_eq!(room.get(), Volume::FULL);
+        for position in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let level = Volume::from_position(position);
+            room.set(level);
+            assert!(
+                (room.get().position() - position).abs() < 1e-6,
+                "a room set to {position} read back as {}",
+                room.get().position()
+            );
+            assert!(
+                (room.get().amplitude() - level.amplitude()).abs() < 1e-6,
+                "the taper moved across a store and a load"
+            );
+        }
+    }
 
     /// The defect #85 is about, stated as an assertion: the middle of a slider's travel
     /// must not be ~10 dB hot.

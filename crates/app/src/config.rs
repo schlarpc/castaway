@@ -1109,13 +1109,6 @@ pub enum UnknownController {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Spotify {
-    /// Volume the device comes up at, `0.0..=1.0`.
-    ///
-    /// Applies once per session, when someone pairs. Half scale because a panel that
-    /// comes up at full volume in a shared space is the kind of thing that only happens
-    /// once before somebody unplugs it.
-    pub initial_volume: f32,
-
     /// Stream quality: 96, 160 or 320 kbps.
     ///
     /// librespot's own default is 160, which is what a Premium account entitled to 320
@@ -1147,7 +1140,6 @@ pub struct Spotify {
 impl Default for Spotify {
     fn default() -> Self {
         Self {
-            initial_volume: 0.5,
             bitrate: 320,
             normalisation: true,
             local_file_directories: Vec::new(),
@@ -1235,9 +1227,9 @@ impl Default for Enable {
 /// indistinguishable from a broken receiver, and unrecoverable from the room the panel is
 /// in. This is the one that degrades safely.
 ///
-/// Spotify's own `initial_volume` stays at 0.5 and is a different question — it applies
-/// per session, in librespot's `SoftMixer`, to a source that always arrives with a phone
-/// holding its slider.
+/// It is the panel's only level: a Spotify session reads it and comes up there rather than
+/// publishing one of its own, so nothing a sender connects moves the room on its way in
+/// (#389).
 const fn default_initial_volume() -> f32 {
     1.0
 }

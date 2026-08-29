@@ -624,6 +624,11 @@ pub struct RenderPipeline {
     /// when the next source starts.
     #[cfg(feature = "audio")]
     gain: Arc<crate::audio_session::Gain>,
+    /// Where that gain stands as a slider position, for a source that has to come up at
+    /// the room's level instead of announcing one of its own (#389). Written beside the
+    /// gain, never instead of it: the mixer multiplies by the amplitude.
+    #[cfg(feature = "audio")]
+    room: Arc<castaway_core::RoomLevel>,
     /// The live audio session's declared-latency handle, kept here because the input it
     /// steers has moved onto its decode thread by the time the figure arrives: the
     /// sender declares on the timing plane, mid-session, and [`Pipeline::audio_latency`]
@@ -676,6 +681,8 @@ impl RenderPipeline {
                 #[cfg(feature = "audio")]
                 gain: Arc::new(crate::audio_session::Gain::default()),
                 #[cfg(feature = "audio")]
+                room: Arc::new(castaway_core::RoomLevel::default()),
+                #[cfg(feature = "audio")]
                 live_latency: Mutex::new(None),
             },
             rx,
@@ -694,6 +701,13 @@ impl RenderPipeline {
     #[must_use]
     pub fn gain(&self) -> Arc<crate::audio_session::Gain> {
         Arc::clone(&self.gain)
+    }
+
+    /// The same level, in the scale a joining source needs it in.
+    #[cfg(feature = "audio")]
+    #[must_use]
+    pub fn room_level(&self) -> Arc<castaway_core::RoomLevel> {
+        Arc::clone(&self.room)
     }
 
     /// Play through `mixer` rather than one of this pipeline's own.
@@ -1316,6 +1330,7 @@ impl Pipeline for RenderPipeline {
                 #[cfg(feature = "audio")]
                 {
                     self.gain.set(level);
+                    self.room.set(level);
                     // Both numbers, because they are the two that used to be confused:
                     // where the sender's slider is, and what the samples get multiplied
                     // by (#85). A log showing only one cannot tell you the taper ran.

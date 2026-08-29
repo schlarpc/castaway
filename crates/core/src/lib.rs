@@ -51,5 +51,5 @@ pub use types::{
     EncodedFrame, FrameImage, FrameSource, FriendlyName, GpuSurface, MediaRequest, MediaUri,
     PcmClock, PcmFrame, PixelFormat, ProtocolKind, RequestHeader, VideoCodec, MEDIA_USER_AGENT,
 };
-pub use volume::Volume;
+pub use volume::{RoomLevel, Volume};
 pub use wake::Waker;
