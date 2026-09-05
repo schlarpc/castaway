@@ -1,0 +1,5 @@
+// The .exe's icon, and nothing else — the same icon as the receiver's, by path rather
+// than by copy, so there is one .ico to regenerate when castaway-icon.svg changes (see
+// crates/app/assets/README.md). No manifest, for the app's reason: nix/windows.nix
+// stages manifests externally, and an embedded one would silently replace it.
+1 ICON "../../app/assets/castaway.ico"

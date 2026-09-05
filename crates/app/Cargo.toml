@@ -107,9 +107,8 @@ ctr.workspace = true
 # Embeds assets/castaway.rc (the .exe icon) when the *target* is Windows — which is
 # why this is an unconditional build-dependency rather than a `[target...]` one:
 # cargo matches those tables against the host, and the Windows build is a cross
-# build from Linux. Chosen over winresource because it drives `llvm-rc`, which is
-# the resource compiler nix/windows.nix actually ships.
-embed-resource = "3"
+# build from Linux.
+embed-resource.workspace = true
 
 [features]
 # Everything the Linux kiosk ships, because that is the artifact and it should be the

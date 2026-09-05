@@ -281,6 +281,12 @@ tempfile = "3"
 # `cast-replay`, which takes a credential's validity window from the certificate itself.
 x509-parser = "0.18"
 
+# --- build ---
+# The Windows resource compiler driver behind the two .exe icons (app and launcher).
+# Chosen over winresource because it drives `llvm-rc`, which is the resource compiler
+# nix/windows.nix actually ships.
+embed-resource = "3"
+
 [workspace.lints.rust]
 unsafe_code = "warn"
 missing_docs = "allow"

@@ -27,6 +27,13 @@ time = { workspace = true, features = ["formatting"] }
 # The job object, and nothing else. Kill-on-close is what stops an Electron child from
 # outliving the receiver that spawned it — the same failure `deploy-windows` handles with
 # `taskkill /T`, which there is no `/T` for here.
+[build-dependencies]
+# Embeds assets/launcher.rc (the .exe icon) when the *target* is Windows — an
+# unconditional build-dependency rather than a `[target...]` one, for the reason
+# crates/app gives: cargo matches those tables against the host, and the Windows
+# build is a cross build from Linux.
+embed-resource.workspace = true
+
 [dev-dependencies]
 castaway-test-support.workspace = true
 tempfile.workspace = true
