@@ -202,13 +202,20 @@ x25519-dalek = { version = "3", features = ["getrandom", "static_secrets"] }
 aes = "0.8"
 ctr = "0.9"
 # AirPlay 1 audio is AES-128-CBC; Cast mirroring is CTR. Both, deliberately named.
+#
+# The three move as one, and they stay on the `cipher` 0.4 generation until the rest of
+# the graph does. `cbc` 0.2 is `cipher` 0.5, and `aes` 0.8 is `cipher` 0.4, so bumping it
+# alone does not compile (Dependabot #372); bumping `aes`/`ctr` with it would compile, but
+# `aes-gcm` (webrtc), `ccm` (rs-matter), librespot-audio and `pkcs5` all still take `aes`
+# 0.8, so the binary would carry two aes/cipher/inout trees for one AirPlay decryptor.
+# The move is #397, once those dependencies are across.
 cbc = "0.1"
 rsa = { version = "0.9", features = ["sha2", "sha1"] }
 sha2 = "0.10"
 sha1 = "0.10"
 # Only for the CKS `sig` query parameter, whose shape is the backend's choice
 # (MD5 of a constant and a timestamp). Nothing here relies on it for security.
-md-5 = "0.10"
+md-5 = "0.11"
 # Opening AirServer's credential database, whose every BLOB is a libsodium
 # `crypto_secretbox` (XSalsa20-Poly1305) under a BLAKE2b-derived key.
 #
