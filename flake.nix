@@ -258,9 +258,13 @@
         in pkgs.runCommand "castaway-bluetooth-firmware" { } ''
           mkdir -p $out/intel $out/rtl_bt $out/LICENSES
 
-          # Intel AX200/AX201/AX210 — the dev box's own radio.
+          # Intel AX200/AX201 (the dev box's own radio), AX210 (the Framework's) and
+          # AX211 (the deploy box's). The AX2xx names come from the silicon ids the part
+          # reports, not its USB id — the AX210 and AX211 take different images under the
+          # same loader — so each part we have gets its own line here (#391).
           cp ${pkgs.linux-firmware}/lib/firmware/intel/ibt-20-1-3.* $out/intel/
           cp ${pkgs.linux-firmware}/lib/firmware/intel/ibt-0041-0041.* $out/intel/
+          cp ${pkgs.linux-firmware}/lib/firmware/intel/ibt-1040-0041.* $out/intel/
           # Realtek RTL8761B/BU — the deploy dongle.
           cp ${pkgs.linux-firmware}/lib/firmware/rtl_bt/rtl8761b*.bin $out/rtl_bt/
 

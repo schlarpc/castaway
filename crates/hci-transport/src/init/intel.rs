@@ -35,6 +35,22 @@ const READ_VERSION_TLV: u8 = 0xFF;
 
 /// TLV type carrying which image the controller is currently running.
 const TLV_IMAGE_TYPE: u8 = 0x1C;
+/// TLV types naming the silicon: the CNVi (the Bluetooth IP on the host or card) and
+/// the CNVr (the radio). `btintel.h`'s `INTEL_TLV_CNVI_TOP` and `INTEL_TLV_CNVR_TOP`,
+/// each a little-endian u32 with the part *type* in the low 12 bits and the stepping in
+/// bits 24–27.
+const TLV_CNVI_TOP: u8 = 0x10;
+const TLV_CNVR_TOP: u8 = 0x11;
+/// The CNVi's Bluetooth IP: `hw_variant` in bits 16–21, which is what decides whether the
+/// part boots straight into the image or through an intermediate loader first.
+const TLV_CNVI_BT: u8 = 0x12;
+/// Which signed-header layout the bootloader verifies: `0x00` RSA, `0x01` ECDSA.
+const TLV_SBE_TYPE: u8 = 0x2F;
+
+/// The first `hw_variant` that boots through an intermediate loader image
+/// (`ibt-*-iml.sfi`) before the operational one. `btintel` gates the whole `-iml` flow on
+/// this; below it a part takes one image and one reset.
+const HW_VARIANT_INTERMEDIATE_LOADER: u8 = 0x1e;
 
 /// Image type values in a *TLV* response.
 mod tlv_image {
@@ -152,28 +168,28 @@ impl IntelInit {
     /// Intel's USB vendor id.
     pub const VENDOR: u16 = 0x8087;
 
-    /// Products this loader handles, and the image stem each one takes.
+    /// Products this loader claims, with the image stem and signed-header layout each one
+    /// is *expected* to take.
     ///
-    /// The stem is per-product, not per-loader, and that is the whole point. It used to be
-    /// a fixed field on the loader — `ibt-20-1-3`, which is the AX200/AX201 image — while
-    /// the product list also claimed the AX210 and AX211. Those are a different generation
-    /// and need `ibt-0041-0041`, so a bootloader-mode AX210 was being sent another part's
-    /// *signed* image: secure boot rejects it, or worse accepts a partial upload. The
-    /// right blob was already in the binary, unused, because `flake.nix` embeds it.
+    /// Expected, not used: which image a part needs is not a property of its USB id. The
+    /// AX2xx generation answers `Read_Version` with TLVs naming its own silicon, and the
+    /// loader builds the image name from those, the way `btintel` does
+    /// ([`VersionTlv::image_stem`]). One product id spans more than one CNVi — the
+    /// AX211 in the deploy box and the AX210 in the dev box take different images, and
+    /// sending the AX211 the AX210's is accepted by the bootloader (the signature is
+    /// Intel's either way) and then never boots (#391). So the entry here is what the
+    /// probe and [`driveability`](crate::init::driveability) predict *before* the part is
+    /// opened, and what a legacy-struct part (the AX200 pair, which answer no TLVs) is
+    /// sent.
     ///
-    /// The signed-header layout travels with the stem, because it is a property of the
-    /// same generation: the AX200 pair are RSA, the AX210 pair are ECDSA, and sending one
-    /// layout's offsets to the other part gets the opening fragment refused with `0x1F`.
-    ///
-    /// `btintel` derives both from the TLV version response (the CNVi/CNVR ids, and
-    /// `sbe_type`) rather than from USB. Keying on the product id is a narrower rule that
-    /// happens to agree for every part we claim; if that stops being true, the answer is
-    /// to read the TLV, not to add another entry here.
+    /// The layout follows the same rule: the TLV's `sbe_type` names it when present, and
+    /// the entry here stands in when it is not. Getting it wrong sends the other layout's
+    /// offsets as the opening fragment, which the part refuses with `0x1F`.
     pub const PRODUCTS: &'static [(u16, &'static str, SecureBoot)] = &[
         (0x0029, "intel/ibt-20-1-3", SecureBoot::Rsa), // AX200
         (0x0026, "intel/ibt-20-1-3", SecureBoot::Rsa), // AX201
-        (0x0032, "intel/ibt-0041-0041", SecureBoot::Ecdsa), // AX210
-        (0x0033, "intel/ibt-0041-0041", SecureBoot::Ecdsa), // AX211
+        (0x0032, "intel/ibt-0041-0041", SecureBoot::Ecdsa), // AX210: CNVi 0x410, CNVr 0x410
+        (0x0033, "intel/ibt-1040-0041", SecureBoot::Ecdsa), // AX211: CNVi 0x401, CNVr 0x410
     ];
 
     /// The image stem and header layout for a product, if this loader claims it.
@@ -188,9 +204,9 @@ impl IntelInit {
             .map(|(_, stem, layout)| (*stem, *layout))
     }
 
-    /// The image stem for a product, if this loader claims it.
+    /// The image stem a product is expected to take, if this loader claims it.
     #[must_use]
-    fn image_stem(id: UsbId) -> Option<&'static str> {
+    fn expected_image_stem(id: UsbId) -> Option<&'static str> {
         Self::product(id).map(|(stem, _)| stem)
     }
 }
@@ -202,7 +218,7 @@ impl ControllerInit for IntelInit {
     }
 
     fn matches(&self, id: UsbId) -> bool {
-        Self::image_stem(id).is_some()
+        Self::expected_image_stem(id).is_some()
     }
 
     fn required_images(&self, id: UsbId) -> Vec<RequiredImage> {
@@ -213,10 +229,18 @@ impl ControllerInit for IntelInit {
         // `.ddc` is the per-board tuning table, and `init` explicitly logs and continues
         // without one — so it must not count against this build's ability to drive the
         // controller (#307).
-        Self::image_stem(id).map_or_else(Vec::new, |stem| match stem {
+        //
+        // A prediction from the product id, because the part has not been opened yet and
+        // only the part knows its silicon (see `PRODUCTS`). `init` asks for what the TLV
+        // names, and a build carrying the wrong one finds out there, by file name.
+        Self::expected_image_stem(id).map_or_else(Vec::new, |stem| match stem {
             "intel/ibt-0041-0041" => vec![
                 RequiredImage::essential("intel/ibt-0041-0041.sfi"),
                 RequiredImage::optional("intel/ibt-0041-0041.ddc"),
+            ],
+            "intel/ibt-1040-0041" => vec![
+                RequiredImage::essential("intel/ibt-1040-0041.sfi"),
+                RequiredImage::optional("intel/ibt-1040-0041.ddc"),
             ],
             _ => vec![
                 RequiredImage::essential("intel/ibt-20-1-3.sfi"),
@@ -231,8 +255,7 @@ impl ControllerInit for IntelInit {
         hci: &dyn HciTransport,
         firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
-        let (image_stem, secure_boot) =
-            Self::product(id).ok_or(TransportError::UnsupportedController(id))?;
+        let expected = Self::product(id).ok_or(TransportError::UnsupportedController(id))?;
         let version = read_version(hci).await?;
         debug!(tlv = ?hex(&version), "intel version response");
 
@@ -245,17 +268,7 @@ impl ControllerInit for IntelInit {
                 info!("intel controller already running operational firmware");
                 return Ok(());
             }
-            RunningImage::Bootloader => {
-                // At info, not debug, and deliberately: this happens once on a cold boot
-                // and never again, it is the branch that has never run against real
-                // hardware (#229), and without it a deploy log cannot tell a controller
-                // that refused `Read_Version` from one that refused a firmware fragment.
-                info!(
-                    image = %image_stem,
-                    version = %hex(&version),
-                    "intel controller is in the bootloader; loading firmware"
-                );
-            }
+            RunningImage::Bootloader => {}
             RunningImage::Unknown => {
                 return Err(TransportError::Controller {
                     what: "intel read_version",
@@ -263,6 +276,19 @@ impl ControllerInit for IntelInit {
                 })
             }
         }
+
+        let (image_stem, secure_boot) = select_image(&version, expected)?;
+        // At info, not debug, and deliberately: this happens once on a cold boot and
+        // never again, and without it a deploy log cannot tell a controller that refused
+        // `Read_Version` from one that refused a firmware fragment — or, now, one that
+        // was sent the image its product id predicted rather than the one it asked for.
+        info!(
+            image = %image_stem,
+            expected = expected.0,
+            layout = ?secure_boot,
+            version = %hex(&version),
+            "intel controller is in the bootloader; loading firmware"
+        );
 
         let sfi_name = format!("{image_stem}.sfi");
         let sfi = firmware.get(&sfi_name).await?;
@@ -403,10 +429,7 @@ fn hex(bytes: &[u8]) -> String {
 /// for operational, the legacy struct says `0x23`.
 #[must_use]
 pub fn running_image(response: &[u8]) -> RunningImage {
-    // The legacy struct is a fixed nine bytes and starts with the Intel hardware
-    // platform id, which is always 0x37. A TLV list starts with a type byte, and no
-    // type we care about is 0x37 — so the two are told apart without guessing.
-    if response.len() == LEGACY_VERSION_LEN && response.first() == Some(&0x37) {
+    if is_legacy_version(response) {
         return match response.get(LEGACY_FW_VARIANT) {
             Some(&legacy_variant::BOOTLOADER) => RunningImage::Bootloader,
             Some(&legacy_variant::OPERATIONAL) => RunningImage::Operational,
@@ -414,23 +437,165 @@ pub fn running_image(response: &[u8]) -> RunningImage {
         };
     }
 
+    tlvs(response)
+        .find(|(kind, _)| *kind == TLV_IMAGE_TYPE)
+        .map_or(RunningImage::Unknown, |(_, value)| match value.first() {
+            Some(&tlv_image::BOOTLOADER) => RunningImage::Bootloader,
+            Some(&tlv_image::OPERATIONAL) => RunningImage::Operational,
+            _ => RunningImage::Unknown,
+        })
+}
+
+/// Whether a version response is the AX200-era fixed struct rather than a TLV list.
+///
+/// The legacy struct is a fixed nine bytes and starts with the Intel hardware platform
+/// id, which is always 0x37. A TLV list starts with a type byte, and no type we care
+/// about is 0x37 — so the two are told apart without guessing.
+fn is_legacy_version(response: &[u8]) -> bool {
+    response.len() == LEGACY_VERSION_LEN && response.first() == Some(&0x37)
+}
+
+/// Walk a TLV list, yielding `(type, value)` and stopping at the first entry that runs
+/// off the end.
+fn tlvs(response: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     let mut rest = response;
-    while rest.len() >= 2 {
-        let kind = rest[0];
-        let len = usize::from(rest[1]);
-        let Some(value) = rest.get(2..2 + len) else {
-            break;
+    std::iter::from_fn(move || {
+        let (&kind, after_kind) = rest.split_first()?;
+        let (&len, after_len) = after_kind.split_first()?;
+        let value = after_len.get(..usize::from(len))?;
+        rest = &after_len[usize::from(len)..];
+        Some((kind, value))
+    })
+}
+
+/// The fields of a TLV version response the loader acts on, parsed once at the boundary.
+///
+/// Every field is optional because every field is: a part answers the TLVs it has, and a
+/// missing one is a fact about the part rather than a malformed response. What the
+/// loader cannot proceed without, it refuses at the point of use with the field named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VersionTlv {
+    cnvi_top: Option<u32>,
+    cnvr_top: Option<u32>,
+    cnvi_bt: Option<u32>,
+    sbe_type: Option<u8>,
+}
+
+impl VersionTlv {
+    /// Parse a TLV list. Entries that are not one of the fields above are skipped, and a
+    /// field of the wrong width is treated as absent rather than misread.
+    #[must_use]
+    pub fn parse(response: &[u8]) -> Self {
+        let mut out = Self::default();
+        let u32_le = |v: &[u8]| -> Option<u32> {
+            let bytes: [u8; 4] = v.try_into().ok()?;
+            Some(u32::from_le_bytes(bytes))
         };
-        if kind == TLV_IMAGE_TYPE {
-            return match value.first() {
-                Some(&tlv_image::BOOTLOADER) => RunningImage::Bootloader,
-                Some(&tlv_image::OPERATIONAL) => RunningImage::Operational,
-                _ => RunningImage::Unknown,
-            };
+        for (kind, value) in tlvs(response) {
+            match kind {
+                TLV_CNVI_TOP => out.cnvi_top = u32_le(value),
+                TLV_CNVR_TOP => out.cnvr_top = u32_le(value),
+                TLV_CNVI_BT => out.cnvi_bt = u32_le(value),
+                TLV_SBE_TYPE => out.sbe_type = value.first().copied(),
+                _ => {}
+            }
         }
-        rest = &rest[2 + len..];
+        out
     }
-    RunningImage::Unknown
+
+    /// `INTEL_HW_VARIANT`: the Bluetooth IP generation, from the CNVi.
+    #[must_use]
+    pub fn hw_variant(&self) -> Option<u8> {
+        self.cnvi_bt
+            .and_then(|bt| u8::try_from((bt >> 16) & 0x3f).ok())
+    }
+
+    /// The image this part takes: `intel/ibt-<cnvi>-<cnvr>`, exactly as `btintel` names
+    /// it.
+    ///
+    /// Each half is `INTEL_CNVX_TOP_PACK_SWAB` of the top: the 12-bit type shifted up a
+    /// nibble, the 4-bit stepping in the low nibble, and the two bytes swapped. The swap
+    /// is why the AX210's type `0x410` reads as `0041` and the AX211's `0x401` as `1040`
+    /// — two parts one bit apart in the silicon id, one image name apart on disk.
+    ///
+    /// # Errors
+    /// [`TransportError::Controller`] if the response names no silicon — there is then no
+    /// image to choose, and choosing one from the product id instead is the guess that
+    /// booted nothing on the AX211 — or if the part is a generation that boots through an
+    /// intermediate loader, which this loader does not send and must not pretend to.
+    pub fn image_stem(&self) -> Result<String, TransportError> {
+        let (Some(cnvi), Some(cnvr)) = (self.cnvi_top, self.cnvr_top) else {
+            return Err(TransportError::Controller {
+                what: "intel read_version",
+                detail: "the version response names no CNVi/CNVr silicon, so no image can \
+                         be chosen for this part"
+                    .to_owned(),
+            });
+        };
+        if let Some(variant) = self.hw_variant() {
+            if variant >= HW_VARIANT_INTERMEDIATE_LOADER {
+                return Err(TransportError::Controller {
+                    what: "intel read_version",
+                    detail: format!(
+                        "hw_variant {variant:#04x} boots through an intermediate loader \
+                         image, which this loader does not implement"
+                    ),
+                });
+            }
+        }
+        Ok(format!(
+            "intel/ibt-{:04x}-{:04x}",
+            pack_top(cnvi),
+            pack_top(cnvr)
+        ))
+    }
+
+    /// The signed-header layout the bootloader will verify, if the part said.
+    ///
+    /// # Errors
+    /// [`TransportError::Controller`] for an `sbe_type` that is neither RSA nor ECDSA:
+    /// there is no third layout to fall back to, and uploading in either would be a
+    /// guess the part answers with `0x1F` at best.
+    pub fn secure_boot(&self) -> Result<Option<SecureBoot>, TransportError> {
+        match self.sbe_type {
+            None => Ok(None),
+            Some(0x00) => Ok(Some(SecureBoot::Rsa)),
+            Some(0x01) => Ok(Some(SecureBoot::Ecdsa)),
+            Some(other) => Err(TransportError::Controller {
+                what: "intel read_version",
+                detail: format!("sbe_type {other:#04x} is neither RSA (0x00) nor ECDSA (0x01)"),
+            }),
+        }
+    }
+}
+
+/// `INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(top), INTEL_CNVX_TOP_STEP(top))`.
+fn pack_top(top: u32) -> u16 {
+    // Both masks leave fewer than 16 bits, so the narrowing cannot truncate.
+    let kind = (top & 0x0000_0fff) as u16;
+    let step = ((top & 0x0f00_0000) >> 24) as u16;
+    ((kind << 4) | step).swap_bytes()
+}
+
+/// Which image to upload, and in which layout, from what the part said about itself.
+///
+/// A TLV response names its own silicon and that decides; `expected` — the product
+/// table's entry — is what a legacy-struct part gets, and the layout a TLV part gets when
+/// it carries no `sbe_type`.
+///
+/// # Errors
+/// As [`VersionTlv::image_stem`] and [`VersionTlv::secure_boot`].
+fn select_image(
+    response: &[u8],
+    expected: (&'static str, SecureBoot),
+) -> Result<(String, SecureBoot), TransportError> {
+    if is_legacy_version(response) {
+        return Ok((expected.0.to_owned(), expected.1));
+    }
+    let tlv = VersionTlv::parse(response);
+    let stem = tlv.image_stem()?;
+    let secure_boot = tlv.secure_boot()?.unwrap_or(expected.1);
+    Ok((stem, secure_boot))
 }
 
 /// The four transfers a `.sfi` is split into, in the order secure boot requires them.
@@ -875,17 +1040,45 @@ mod tests {
     /// land the finding as a fixture rather than a memory).
     const AX200_OPERATIONAL: [u8; 9] = [0x37, 0x14, 0x00, 0x23, 0x00, 0xfa, 0x11, 0x14, 0x00];
 
-    /// A TLV block reporting `image`.
+    /// The **real** `Read_Version` response from the AX210 in this dev box, read through
+    /// the kernel (`hcitool cmd 0x3f 0x0005 0xff`) on 2026-09-04 while it was running
+    /// operational firmware. CNVi and CNVr type `0x410`, `hw_variant` `0x17`, and the
+    /// kernel loaded `ibt-0041-0041.sfi` into it that morning.
+    const AX210_OPERATIONAL_TLV: [u8; 103] = [
+        0x10, 0x04, 0x10, 0x04, 0x40, 0x00, 0x11, 0x04, 0x10, 0x04, 0x40, 0x00, 0x12, 0x04, 0x00,
+        0x37, 0x17, 0x00, 0x13, 0x04, 0x20, 0x37, 0x12, 0x00, 0x15, 0x02, 0x13, 0x04, 0x16, 0x02,
+        0x00, 0x00, 0x17, 0x02, 0x87, 0x80, 0x18, 0x02, 0x32, 0x00, 0x1C, 0x01, 0x03, 0x1D, 0x02,
+        0x05, 0x1A, 0x1E, 0x01, 0x01, 0x1F, 0x04, 0xCA, 0x40, 0x01, 0x00, 0x20, 0x01, 0x06, 0x21,
+        0x01, 0x06, 0x22, 0x01, 0xA0, 0x23, 0x01, 0x0D, 0x24, 0x02, 0x02, 0x00, 0x25, 0x02, 0xCA,
+        0x30, 0x26, 0x02, 0xCA, 0x30, 0x2A, 0x01, 0x01, 0x2B, 0x01, 0x01, 0x32, 0x04, 0x7D, 0x67,
+        0x25, 0x29, 0x33, 0x01, 0x00, 0x34, 0x00, 0x35, 0x04, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// The **real** `Read_Version` response from the AX211 in the deploy box, in its
+    /// bootloader, as logged by the probe on 2026-09-05 (#391). CNVi type `0x401`, CNVr
+    /// type `0x410`, `hw_variant` `0x19`, `sbe_type` `0x01`: the part that was sent
+    /// `ibt-0041-0041` on 2026-08-29 and booted nothing, and that booted `ibt-1040-0041`
+    /// in 17ms once asked what it was.
+    const AX211_BOOTLOADER_TLV: [u8; 90] = [
+        0x10, 0x04, 0x01, 0x04, 0x08, 0x00, 0x11, 0x04, 0x10, 0x14, 0x40, 0x00, 0x12, 0x04, 0x00,
+        0x37, 0x19, 0x00, 0x15, 0x02, 0x13, 0x06, 0x16, 0x02, 0x00, 0x00, 0x17, 0x02, 0x87, 0x80,
+        0x18, 0x02, 0x33, 0x00, 0x1C, 0x01, 0x01, 0x1D, 0x02, 0x28, 0x13, 0x1E, 0x01, 0x01, 0x1F,
+        0x04, 0x26, 0x00, 0x00, 0x00, 0x27, 0x01, 0x00, 0x28, 0x01, 0x01, 0x29, 0x01, 0x00, 0x2A,
+        0x01, 0x01, 0x2B, 0x01, 0x01, 0x2C, 0x01, 0x00, 0x2D, 0x03, 0x01, 0x0A, 0x0E, 0x2E, 0x01,
+        0x00, 0x2F, 0x01, 0x01, 0x30, 0x06, 0xF9, 0x97, 0x95, 0x6D, 0xB2, 0x5C, 0x31, 0x01, 0x00,
+    ];
+
+    /// A TLV block reporting `image`, from the part the scripted controller models: the
+    /// AX210's silicon ids and ECDSA secure boot, with a stray TLV first so no offset is
+    /// fixed.
     fn version_tlv(image: u8) -> Vec<u8> {
-        vec![
-            0x01,
-            0x02,
-            0xAA,
-            0xBB, // some other TLV first, so offsets are not fixed
-            TLV_IMAGE_TYPE,
-            0x01,
-            image,
-        ]
+        let mut tlv = vec![0x01, 0x02, 0xAA, 0xBB];
+        tlv.extend_from_slice(&[TLV_CNVI_TOP, 0x04, 0x10, 0x04, 0x40, 0x00]);
+        tlv.extend_from_slice(&[TLV_CNVR_TOP, 0x04, 0x10, 0x04, 0x40, 0x00]);
+        tlv.extend_from_slice(&[TLV_CNVI_BT, 0x04, 0x00, 0x37, 0x17, 0x00]);
+        tlv.extend_from_slice(&[TLV_IMAGE_TYPE, 0x01, image]);
+        tlv.extend_from_slice(&[TLV_SBE_TYPE, 0x01, 0x01]);
+        tlv
     }
 
     /// A `.sfi` in `secure_boot`'s layout, with `blocks` as the payload.
@@ -907,9 +1100,9 @@ mod tests {
         image
     }
 
-    /// The AX200-era layout, which is what the `ibt-20-1-3` fixtures below use.
+    /// The AX210 layout, which is what the scripted controller's `sbe_type` asks for.
     fn sfi(blocks: &[u8]) -> Vec<u8> {
-        sfi_for(SecureBoot::Rsa, blocks)
+        sfi_for(SecureBoot::Ecdsa, blocks)
     }
 
     /// A `CMD_WRITE_BOOT_PARAMS` command carrying `addr`, padded to 4-byte alignment.
@@ -932,11 +1125,14 @@ mod tests {
         command_block(words * 4 + 1)
     }
 
+    /// A build carrying `sfi_bytes` under `name`.
+    fn firmware_named(name: &'static str, sfi_bytes: Vec<u8>) -> FirmwareSet {
+        FirmwareSet::new().with(name, Firmware::File(write_temp("ibt.sfi", &sfi_bytes)))
+    }
+
+    /// A build carrying the image the scripted controller names.
     fn firmware_with(sfi_bytes: Vec<u8>) -> FirmwareSet {
-        FirmwareSet::new().with(
-            "intel/ibt-20-1-3.sfi",
-            Firmware::File(write_temp("ibt.sfi", &sfi_bytes)),
-        )
+        firmware_named("intel/ibt-0041-0041.sfi", sfi_bytes)
     }
 
     fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -1009,7 +1205,7 @@ mod tests {
 
     #[test]
     fn an_sfi_splits_into_header_key_signature_and_payload() {
-        let image = sfi(&aligned_block(1));
+        let image = sfi_for(SecureBoot::Rsa, &aligned_block(1));
         let parts = split_sfi(&image, "test", SecureBoot::Rsa).unwrap();
         assert_eq!(parts.css.len(), 128);
         assert_eq!(parts.public_key.len(), 256);
@@ -1125,10 +1321,10 @@ mod tests {
         let image = sfi(&command_block(8));
         let transport = controller(
             version_tlv(tlv_image::BOOTLOADER),
-            uploaded_len(&image, SecureBoot::Rsa),
+            uploaded_len(&image, SecureBoot::Ecdsa),
         );
         IntelInit
-            .init(AX200, &transport, &firmware_with(image))
+            .init(AX210, &transport, &firmware_with(image))
             .await
             .unwrap();
 
@@ -1158,10 +1354,10 @@ mod tests {
         let image = sfi(&command_block(0));
         let transport = controller(
             version_tlv(tlv_image::BOOTLOADER),
-            uploaded_len(&image, SecureBoot::Rsa),
+            uploaded_len(&image, SecureBoot::Ecdsa),
         );
         IntelInit
-            .init(AX200, &transport, &firmware_with(image))
+            .init(AX210, &transport, &firmware_with(image))
             .await
             .unwrap();
 
@@ -1184,7 +1380,7 @@ mod tests {
         // possible nor needed, and erroring here would make every second start fail.
         let transport = controller(version_tlv(tlv_image::OPERATIONAL), 0);
         IntelInit
-            .init(AX200, &transport, &FirmwareSet::new())
+            .init(AX210, &transport, &FirmwareSet::new())
             .await
             .unwrap();
 
@@ -1198,11 +1394,48 @@ mod tests {
     async fn a_missing_image_fails_before_the_upload_starts() {
         let transport = controller(version_tlv(tlv_image::BOOTLOADER), 0);
         let err = IntelInit
-            .init(AX200, &transport, &FirmwareSet::new())
+            .init(AX210, &transport, &FirmwareSet::new())
             .await
             .unwrap_err();
-        assert!(format!("{err}").contains("ibt-20-1-3.sfi"), "got: {err}");
+        assert!(format!("{err}").contains("ibt-0041-0041.sfi"), "got: {err}");
         assert!(!transport.sent_commands().contains(&SECURE_SEND));
+    }
+
+    #[tokio::test]
+    async fn the_image_asked_for_is_the_one_the_part_names_not_the_one_its_product_id_predicts() {
+        // #391 in one test. The AX211 and the AX210 share a loader, a layout and a boot
+        // address, and their product table entries once shared an image name. The AX211's
+        // silicon ids say otherwise, and a build carrying only the AX210's image must fail
+        // by *name* before the upload — not upload it, watch the bootloader accept a
+        // validly signed image for the wrong silicon, and reset into nothing.
+        let image = sfi(&command_block(2));
+        let transport = controller(AX211_BOOTLOADER_TLV.to_vec(), usize::MAX);
+        let err = IntelInit
+            .init(AX211, &transport, &firmware_with(image))
+            .await
+            .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("ibt-1040-0041.sfi"), "got: {text}");
+        assert!(
+            !transport.sent_commands().contains(&SECURE_SEND),
+            "the AX210's image must not be sent to the AX211"
+        );
+
+        // And with the right image present, that is the one that goes.
+        let image = sfi(&command_block(2));
+        let transport = controller(
+            AX211_BOOTLOADER_TLV.to_vec(),
+            uploaded_len(&image, SecureBoot::Ecdsa),
+        );
+        IntelInit
+            .init(
+                AX211,
+                &transport,
+                &firmware_named("intel/ibt-1040-0041.sfi", image),
+            )
+            .await
+            .unwrap();
+        assert!(transport.sent_commands().contains(&INTEL_RESET));
     }
 
     #[tokio::test]
@@ -1210,10 +1443,10 @@ mod tests {
         let image = sfi(&command_block(2));
         let transport = controller(
             version_tlv(tlv_image::BOOTLOADER),
-            uploaded_len(&image, SecureBoot::Rsa),
+            uploaded_len(&image, SecureBoot::Ecdsa),
         );
         IntelInit
-            .init(AX200, &transport, &firmware_with(image))
+            .init(AX210, &transport, &firmware_with(image))
             .await
             .unwrap();
 
@@ -1238,7 +1471,7 @@ mod tests {
         let image = sfi(&command_block(2));
         let transport = controller(version_tlv(tlv_image::BOOTLOADER), usize::MAX);
         let err = IntelInit
-            .init(AX200, &transport, &firmware_with(image))
+            .init(AX210, &transport, &firmware_with(image))
             .await
             .unwrap_err();
 
@@ -1260,10 +1493,10 @@ mod tests {
         // as "no bootup notification", which points at the boot step rather than at the
         // image that was refused before it.
         let image = sfi(&command_block(2));
-        let len = uploaded_len(&image, SecureBoot::Rsa);
+        let len = uploaded_len(&image, SecureBoot::Ecdsa);
         let transport = controller_announcing(version_tlv(tlv_image::BOOTLOADER), len, 0x0D);
         let err = IntelInit
-            .init(AX200, &transport, &firmware_with(image))
+            .init(AX210, &transport, &firmware_with(image))
             .await
             .unwrap_err();
 
@@ -1281,33 +1514,135 @@ mod tests {
 
     /// The AX200 in the dev box.
     const AX200: UsbId = UsbId::new(0x8087, 0x0029);
+    /// The AX210 in the dev box.
+    const AX210: UsbId = UsbId::new(0x8087, 0x0032);
+    /// The AX211 in the deploy box.
+    const AX211: UsbId = UsbId::new(0x8087, 0x0033);
+
+    #[test]
+    fn the_image_is_named_from_the_silicon_the_part_reports() {
+        // Both TLVs are captures, and the two parts differ by one bit in the CNVi type
+        // — 0x410 against 0x401 — which the byte swap turns into `0041` against `1040`.
+        // The kernel loaded `ibt-0041-0041.sfi` into the first part the morning its TLV
+        // was read; the second was sent that same image on 2026-08-29 and booted nothing.
+        assert_eq!(
+            VersionTlv::parse(&AX210_OPERATIONAL_TLV)
+                .image_stem()
+                .unwrap(),
+            "intel/ibt-0041-0041"
+        );
+        assert_eq!(
+            VersionTlv::parse(&AX211_BOOTLOADER_TLV)
+                .image_stem()
+                .unwrap(),
+            "intel/ibt-1040-0041"
+        );
+        assert_eq!(
+            VersionTlv::parse(&AX210_OPERATIONAL_TLV).hw_variant(),
+            Some(0x17)
+        );
+        assert_eq!(
+            VersionTlv::parse(&AX211_BOOTLOADER_TLV).hw_variant(),
+            Some(0x19)
+        );
+    }
+
+    #[test]
+    fn the_stepping_lands_in_the_low_nibble_before_the_swap() {
+        // `INTEL_CNVX_TOP_PACK_SWAB`: type 0x504 at stepping 1 is `ibt-*-4150`, which is
+        // a real file name and the one case where the stepping is visible.
+        assert_eq!(pack_top(0x0100_0504), 0x4150);
+        assert_eq!(pack_top(0x0040_0410), 0x0041);
+        assert_eq!(pack_top(0x0008_0401), 0x1040);
+    }
+
+    #[test]
+    fn a_response_naming_no_silicon_gets_no_image_rather_than_the_predicted_one() {
+        // Falling back to the product id here would be the exact guess #391 was.
+        let err = VersionTlv::parse(&version_tlv(tlv_image::BOOTLOADER)[..4])
+            .image_stem()
+            .unwrap_err();
+        assert!(format!("{err}").contains("no CNVi/CNVr"), "got: {err}");
+        let expected = ("intel/ibt-0041-0041", SecureBoot::Ecdsa);
+        assert!(select_image(&[0x01, 0x02, 0xAA, 0xBB], expected).is_err());
+        // The legacy struct names no silicon either, and *is* what the product id is for.
+        assert_eq!(
+            select_image(&AX200_OPERATIONAL, ("intel/ibt-20-1-3", SecureBoot::Rsa)).unwrap(),
+            ("intel/ibt-20-1-3".to_owned(), SecureBoot::Rsa)
+        );
+    }
+
+    #[test]
+    fn a_part_that_boots_through_an_intermediate_loader_is_refused() {
+        // Blazar and later take an `-iml` image and a second handshake before the
+        // operational one. Sending them the operational image alone is another wrong
+        // image with a valid signature.
+        let mut tlv = version_tlv(tlv_image::BOOTLOADER);
+        let bt = tlv.iter().position(|b| *b == TLV_CNVI_BT).unwrap();
+        tlv[bt + 4] = HW_VARIANT_INTERMEDIATE_LOADER;
+        let err = VersionTlv::parse(&tlv).image_stem().unwrap_err();
+        assert!(
+            format!("{err}").contains("intermediate loader"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_layout_follows_sbe_type_when_the_part_gives_one() {
+        let expected = ("intel/ibt-0041-0041", SecureBoot::Rsa);
+        let ecdsa = version_tlv(tlv_image::BOOTLOADER);
+        assert_eq!(select_image(&ecdsa, expected).unwrap().1, SecureBoot::Ecdsa);
+
+        let mut rsa = ecdsa.clone();
+        let sbe = rsa.iter().position(|b| *b == TLV_SBE_TYPE).unwrap();
+        rsa[sbe + 2] = 0x00;
+        assert_eq!(select_image(&rsa, expected).unwrap().1, SecureBoot::Rsa);
+
+        let mut unknown = ecdsa.clone();
+        unknown[sbe + 2] = 0x02;
+        assert!(select_image(&unknown, expected).is_err());
+
+        // No `sbe_type` at all: the product table's layout stands in.
+        let cut = AX211_BOOTLOADER_TLV
+            .iter()
+            .position(|b| *b == TLV_SBE_TYPE)
+            .unwrap();
+        let without = &AX211_BOOTLOADER_TLV[..cut];
+        assert_eq!(
+            select_image(without, ("intel/ibt-1040-0041", SecureBoot::Ecdsa))
+                .unwrap()
+                .1,
+            SecureBoot::Ecdsa
+        );
+    }
 
     #[test]
     fn each_generation_gets_its_own_signed_image() {
-        // A secure-boot part sent another part's signed image rejects it, or worse
-        // accepts a partial upload. The AX210 blob was already embedded by `flake.nix`
-        // and simply never selected, because the stem was a fixed field on the loader.
+        // The product table is the prediction the probe makes before the part is opened,
+        // and it has to predict the file `init` will actually ask for on the parts we
+        // have, or its MISSING check lies about a part that is going to fail.
         let intel = IntelInit;
         assert_eq!(
-            IntelInit::image_stem(AX200),
+            IntelInit::expected_image_stem(AX200),
             Some("intel/ibt-20-1-3"),
             "AX200"
         );
         assert_eq!(
-            IntelInit::image_stem(UsbId::new(0x8087, 0x0032)),
+            IntelInit::expected_image_stem(AX210),
             Some("intel/ibt-0041-0041"),
             "AX210 is a different generation"
         );
-        assert_ne!(
-            IntelInit::image_stem(AX200),
-            IntelInit::image_stem(UsbId::new(0x8087, 0x0033)),
-            "AX211 must not be sent the AX200 image"
+        assert_eq!(
+            IntelInit::expected_image_stem(AX211),
+            Some("intel/ibt-1040-0041"),
+            "the AX211's silicon is not the AX210's"
         );
-        // And the probe must name the file it will actually ask for, or its MISSING
-        // check lies about a part that is going to fail.
         assert!(intel
-            .required_images(UsbId::new(0x8087, 0x0032))
+            .required_images(AX210)
             .contains(&RequiredImage::essential("intel/ibt-0041-0041.sfi")));
+        assert!(intel
+            .required_images(AX211)
+            .contains(&RequiredImage::essential("intel/ibt-1040-0041.sfi")));
         assert!(intel
             .required_images(AX200)
             .contains(&RequiredImage::essential("intel/ibt-20-1-3.sfi")));

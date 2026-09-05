@@ -619,8 +619,8 @@ Both of the risks flagged here turned out to be real, and are handled in `flake.
   default evaluation refuses. `allowUnfreePredicate` whitelists it by name alongside
   `msvc-sysroot`, so anything else unfree still fails loudly.
 
-The derivation carves out ~1.2 MB — Intel `ibt-20-1-3` and `ibt-0041-0041`, Realtek
-`rtl8761b*` — rather than pulling in the 1.7 GB whole, which keeps the closure sane and
+The derivation carves out ~2 MB — Intel `ibt-20-1-3`, `ibt-0041-0041` and
+`ibt-1040-0041`, Realtek `rtl8761b*` — rather than pulling in the 1.7 GB whole, which keeps the closure sane and
 makes what we ship auditable.
 
 ### 11.3a-ii Driving the bench from the other radio
