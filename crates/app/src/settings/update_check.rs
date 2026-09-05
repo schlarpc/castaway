@@ -144,8 +144,7 @@ fn report_for(progress: &Progress, armed: bool) -> Report {
     /// What accepting the offer costs, said plainly. The panel really does go dark, and
     /// somebody's film really does stop — an offer that did not say so would be a
     /// surprise dressed as a button.
-    const WHAT_IT_COSTS: &str = "The panel goes blank for about a minute and comes back on \
-                                 the new version. Anything casting right now stops.";
+    const WHAT_IT_COSTS: &str = "The screen goes blank for about a minute. Anything casting stops.";
 
     let working = |say: &str| Report {
         say: say.to_string(),
@@ -157,7 +156,7 @@ fn report_for(progress: &Progress, armed: bool) -> Report {
         if armed {
             say
         } else {
-            format!("{say} Automatic updates are off, so nothing is taken on its own.")
+            format!("{say} Automatic updates are off.")
         }
     };
 
@@ -165,21 +164,17 @@ fn report_for(progress: &Progress, armed: bool) -> Report {
         // Not normally seen — `start` asks for a check before it renders anything — but a
         // press that the command channel refused lands here, and "checking" is still what
         // the person asked for.
-        Progress::Idle | Progress::Checking => working("Checking for a newer build…"),
+        Progress::Idle | Progress::Checking => working("Checking for updates…"),
         Progress::UpToDate { running } => Report {
-            say: note(format!(
-                "This panel is running build {running}, which is the newest there is."
-            )),
+            say: note(format!("You're on the newest build ({running}).")),
             stage: Stage::Settled,
             rows: Vec::new(),
         },
-        Progress::Offer {
-            build,
-            commit,
-            bytes,
-        } => Report {
+        // The build number and the size, and not the commit: the number is what the menu
+        // row and the log both call it, and a hash is a developer's name for it.
+        Progress::Offer { build, bytes, .. } => Report {
             say: note(format!(
-                "Build {build} ({commit}) is available — {}. Nothing has been downloaded yet.",
+                "Build {build} is available ({}).",
                 megabytes(*bytes)
             )),
             stage: Stage::Settled,
@@ -200,10 +195,10 @@ fn report_for(progress: &Progress, armed: bool) -> Report {
         // The denominator above is the signed manifest's size, and this is what earns it:
         // the bytes are checked against the digest that manifest declared, not against a
         // length the server chose.
-        Progress::Verifying => working("Checking what arrived against the signed manifest…"),
-        Progress::Extracting => working("Unpacking it…"),
-        Progress::Staged { build, commit } => Report {
-            say: note(format!("Build {build} ({commit}) is downloaded and ready.")),
+        Progress::Verifying => working("Verifying…"),
+        Progress::Extracting => working("Unpacking…"),
+        Progress::Staged { build, .. } => Report {
+            say: note(format!("Build {build} is downloaded and ready.")),
             stage: Stage::Settled,
             rows: vec![Row {
                 id: TAKE_IT.to_string(),
@@ -211,7 +206,7 @@ fn report_for(progress: &Progress, armed: bool) -> Report {
                 detail: Some(WHAT_IT_COSTS.to_string()),
             }],
         },
-        Progress::Restarting => working("Restarting into the new version…"),
+        Progress::Restarting => working("Restarting…"),
         Progress::Failed { why } => Report {
             say: why.clone(),
             stage: Stage::Failed,
@@ -280,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn an_offer_names_the_build_the_commit_and_the_size_and_offers_one_row() {
+    fn an_offer_names_the_build_and_the_size_and_offers_one_row() {
         let report = report_for(
             &Progress::Offer {
                 build: build(957),
@@ -290,20 +285,23 @@ mod tests {
             true,
         );
         assert_eq!(report.stage, Stage::Settled);
-        for wanted in ["957", "efc4316", "237 MB"] {
+        for wanted in ["957", "237 MB"] {
             assert!(
                 report.say.contains(wanted),
                 "{wanted} missing: {}",
                 report.say
             );
         }
-        // Nothing is downloaded before the press, and the screen has to say so — the
-        // whole difference between an offer and something that happens to somebody.
+        // The number a person can act on, and not the hash — that one belongs to the log
+        // and the footer. The whole sentence is one line on a panel, and was two.
+        assert!(!report.say.contains("efc4316"), "{}", report.say);
         assert!(
-            report.say.contains("Nothing has been downloaded"),
-            "{}",
+            report.say.len() < 60,
+            "too long for the glass: {}",
             report.say
         );
+        // Nothing is downloaded before the press, and the row is what says so: it offers
+        // the download, rather than a restart of something already here.
         let [row] = report.rows.as_slice() else {
             panic!("an offer with {} rows", report.rows.len());
         };

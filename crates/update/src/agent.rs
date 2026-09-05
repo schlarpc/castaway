@@ -122,6 +122,23 @@ pub enum StandDown {
     Unmanaged(#[source] LayoutError),
 }
 
+impl StandDown {
+    /// The sentence the settings screen shows. `Display` above is the log's: it names the
+    /// file, the flag and the fix, for whoever reads the log to act on. The person at the
+    /// panel is not that reader, and a paragraph about `versions/<sha>/` trees is noise to
+    /// them — one short line that says whether updates are coming is the whole answer.
+    #[must_use]
+    pub const fn on_glass(&self) -> &'static str {
+        match self {
+            Self::Disabled => "Automatic updates are switched off in the settings file.",
+            Self::TrustAnchors(_) => "This build cannot verify updates.",
+            Self::UnknownBuild => "This is a development build, so it cannot take updates.",
+            Self::Hold => "Updates are paused because this version was installed by hand.",
+            Self::Unmanaged(_) => "Updates are not available for this installation.",
+        }
+    }
+}
+
 /// What somebody at the panel can ask the updater for (#360).
 ///
 /// Two, and neither carries a reply: [`Progress`] on the watch channel is the single
@@ -247,7 +264,7 @@ impl Inbox {
     /// Say why there is no updater, for the screen that is going to ask.
     pub fn stand_down(self, why: &StandDown) {
         let _ = self.progress.send(Progress::StoodDown {
-            why: Chain(why).to_string(),
+            why: why.on_glass().to_string(),
         });
     }
 }
@@ -536,7 +553,7 @@ impl Agent {
                         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                         self.report_failure(&e);
                         report.say(Progress::Failed {
-                            why: Chain(&e).to_string(),
+                            why: e.on_glass().to_string(),
                         });
                         self.phase = Phase::UpToDate;
                     }
@@ -623,7 +640,11 @@ impl Agent {
         // whoever is here can act on it.
         if self.holding() {
             report.say(Progress::StoodDown {
-                why: format!("{}\n{}", StandDown::Hold, self.tree.hold().display()),
+                why: format!(
+                    "{}\nTo turn them back on, delete {}",
+                    StandDown::Hold.on_glass(),
+                    self.tree.hold().display()
+                ),
             });
             return None;
         }
@@ -648,7 +669,7 @@ impl Agent {
             (Command::CheckNow, Action::Wait(_)) => {
                 warn!("auto-update: the schedule refused a manual check, which should not happen");
                 report.say(Progress::Failed {
-                    why: "the updater would not answer a check just now".to_string(),
+                    why: "Could not check right now. Try again.".to_string(),
                 });
                 None
             }
@@ -692,7 +713,7 @@ impl Agent {
             Err(e) => {
                 warn!(error = %Chain(&e), "auto-update: a manual check found nothing it could trust");
                 report.say(Progress::Failed {
-                    why: Chain(&e).to_string(),
+                    why: e.on_glass().to_string(),
                 });
             }
         }
@@ -705,7 +726,7 @@ impl Agent {
                 // Pressed with nothing on offer — a screen from before a restart, or a
                 // stale one. Saying so beats doing nothing, which reads as a dead row.
                 report.say(Progress::Failed {
-                    why: "there is nothing to install; check again".to_string(),
+                    why: "Nothing to install. Check for updates again.".to_string(),
                 });
                 return None;
             };
@@ -722,7 +743,7 @@ impl Agent {
                 Err(e) => {
                     warn!(error = %Chain(&e), "auto-update: the staging somebody asked for failed");
                     report.say(Progress::Failed {
-                        why: Chain(&e).to_string(),
+                        why: e.on_glass().to_string(),
                     });
                     return None;
                 }
@@ -739,7 +760,7 @@ impl Agent {
                 // The tree is fine; the pointer write was not. Keep it — tonight's loop
                 // and the next boot both still find it.
                 report.say(Progress::Failed {
-                    why: Chain(&e).to_string(),
+                    why: e.on_glass().to_string(),
                 });
                 self.staged = Some(staged);
                 None
@@ -1554,6 +1575,33 @@ pub enum UpdateError {
     /// The receiver is shutting down.
     #[error("cancelled")]
     Cancelled,
+}
+
+impl UpdateError {
+    /// The sentence the settings screen shows for this failure. The log gets the chain
+    /// (`Chain`), which says which server, which digest and which path; the person at the
+    /// panel gets what it means for them — whether the network, the release or this box
+    /// is the trouble, and whether pressing again can help. Exhaustive on purpose: a new
+    /// failure has to say what it means before it can be shown.
+    #[must_use]
+    pub const fn on_glass(&self) -> &'static str {
+        match self {
+            Self::Http { .. } | Self::ReleaseJson(_) | Self::AttestationListing(_) => {
+                "Could not reach the update server. Try again."
+            }
+            Self::NoAsset { .. } => "The latest release is missing its download.",
+            Self::NoAttestation { .. }
+            | Self::Attestation { .. }
+            | Self::Manifest(_)
+            | Self::UnsignedBrowser => "The update could not be verified, so it was not installed.",
+            Self::DigestMismatch { .. }
+            | Self::ShortDownload { .. }
+            | Self::HostileEntry { .. }
+            | Self::Zip(_) => "The download was damaged. Try again.",
+            Self::Io { .. } | Self::Layout { .. } => "The update could not be written to disk.",
+            Self::Cancelled => "The update was cancelled.",
+        }
+    }
 }
 
 /// An error and its causes on one line, because `tracing` renders only the outermost.
