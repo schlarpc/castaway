@@ -172,9 +172,14 @@ def main():
         f"the guest's address on the segment ({GUEST_IP})",
         lambda: GUEST_IP in shell("ip", "-o", "-4", "addr", "show")[1],
         300,
+        # All address families for the second dump, and not `ip link`: `-4` omits an
+        # interface that is up with no IPv4 address, which is exactly the shape this poll
+        # expires on, and `ip link show` is refused for the adb shell user on this image
+        # ("request send failed: Permission denied", #387). The all-family form lists
+        # every link, addressed or not, and is not refused.
         diagnose=lambda: (
             f"addresses:\n{shell('ip', '-o', '-4', 'addr', 'show')[1]}"
-            f"links:\n{shell('ip', '-o', 'link', 'show')[1]}"
+            f"links:\n{shell('ip', '-o', 'addr', 'show')[1]}"
             f"routes:\n{shell('ip', '-o', 'route', 'show')[1]}"
         ),
     )
