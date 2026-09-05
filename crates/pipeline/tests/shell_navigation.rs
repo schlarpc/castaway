@@ -264,3 +264,54 @@ fn refreshing_home_does_not_close_a_screen_someone_is_reading() {
 
     assert_eq!(render.shell_depth(), 2, "still in the picker");
 }
+
+#[test]
+fn a_burst_of_in_place_refreshes_costs_one_paint_and_shows_the_last() {
+    // #400: an update reporting every megabyte queued two hundred tagged refreshes in
+    // nine seconds, and each one was a full 4K rasterisation inside the drain — the loop
+    // painted every intermediate screen nobody could see, never presented until the last,
+    // and could not reach its own exit flag for forty seconds. A replacement in place
+    // owes one paint per pump, of whatever ended up on top.
+    let (tx, mut render) = loop_with_home();
+    render.shell_push(Screen::Picker(Box::new(
+        pipeline::picker::Picker::loading("Check for updates", "Checking…").with_tag("update"),
+    )));
+    render.pump();
+    let before = render.shell_paints();
+
+    for i in 0..200u32 {
+        tx.send(RenderCommand::ReplaceScreenTagged {
+            screen: Box::new(Screen::Picker(Box::new(
+                pipeline::picker::Picker::loading("Check for updates", format!("{i}%"))
+                    .with_tag("update"),
+            ))),
+            tag: "update".to_string(),
+        });
+    }
+    render.pump();
+    assert_eq!(
+        render.shell_paints() - before,
+        1,
+        "two hundred replacements drained by one pump are one rasterisation"
+    );
+    assert_eq!(
+        render.shell_depth(),
+        2,
+        "a replacement in place is not a step"
+    );
+
+    // And a pump with nothing to drain paints nothing: the flag is consumed, not sticky.
+    render.pump();
+    assert_eq!(render.shell_paints() - before, 1);
+
+    // A plain replacement and a Home refresh owe the same single paint.
+    tx.send(RenderCommand::ReplaceScreen(Box::new(Screen::Picker(
+        Box::new(pipeline::picker::Picker::loading(
+            "Check for updates",
+            "done",
+        )),
+    ))));
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    render.pump();
+    assert_eq!(render.shell_paints() - before, 2);
+}

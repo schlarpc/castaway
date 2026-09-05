@@ -1617,6 +1617,15 @@ pub struct RenderLoop {
     floor: crate::motion::Floor,
     /// Whether anything is still moving, so the kiosk knows to ask for another frame.
     animating: bool,
+    /// A screen was replaced in place and the shell has not been drawn since. Consumed
+    /// once per pump, after the command drain, so a producer that replaces its screen
+    /// faster than a 4K rasterisation takes — an update reporting every megabyte (#400)
+    /// — costs one paint per frame rather than one per report. Navigations that begin a
+    /// transition still paint at once, because the layer they launch has to be the new
+    /// screen's texture already.
+    shell_repaint_due: bool,
+    /// How many times the shell has been rasterised. For tests and logs.
+    shell_paints: u64,
     /// The mascot overlay's own placement, if she is up. Kept so the floor's recession can be
     /// *composed* with it: she is a sub-rect of the scene, not a full-panel layer, so handing
     /// her the floor's transform directly would stretch line art across the whole panel.
@@ -1821,6 +1830,8 @@ impl RenderLoop {
             motions: crate::motion::Motions::default(),
             floor: crate::motion::Floor::default(),
             animating: false,
+            shell_repaint_due: false,
+            shell_paints: 0,
             mascot_base: None,
             last_touch: None,
             #[cfg(feature = "audio")]
@@ -3124,6 +3135,7 @@ impl RenderLoop {
         while let Some(cmd) = self.rx.try_recv() {
             self.apply(cmd);
         }
+        self.flush_shell_repaint();
         self.tick_transition(dt);
         self.tick_motion(dt);
         self.tick_transport();
@@ -3256,6 +3268,7 @@ impl RenderLoop {
                 applied += 1;
             }
         }
+        self.flush_shell_repaint();
         self.tick_transport();
         self.update_osd();
         self.present_and_serve_taps();
@@ -3277,6 +3290,7 @@ impl RenderLoop {
                 }
             }
         }
+        self.flush_shell_repaint();
         self.tick_transport();
         self.update_osd();
         self.present_and_serve_taps();
@@ -3573,7 +3587,7 @@ impl RenderLoop {
             RenderCommand::ReplaceScreen(screen) => {
                 if self.panel.stack().is_some() {
                     self.panel.replace_top(*screen);
-                    self.repaint_shell();
+                    self.shell_repaint_due = true;
                     self.reflow_surfaces();
                 }
                 false
@@ -3581,7 +3595,7 @@ impl RenderLoop {
             RenderCommand::ReplaceScreenTagged { screen, tag } => {
                 if self.shell_tag().is_some_and(|on_top| on_top == tag) {
                     self.panel.replace_top(*screen);
-                    self.repaint_shell();
+                    self.shell_repaint_due = true;
                     self.reflow_surfaces();
                 }
                 false
@@ -3709,7 +3723,7 @@ impl RenderLoop {
     /// reading.
     pub fn set_home(&mut self, scene: crate::attract::AttractScene) {
         self.panel.set_home(scene);
-        self.repaint_shell();
+        self.shell_repaint_due = true;
         self.reflow_surfaces();
     }
 
@@ -3884,6 +3898,14 @@ impl RenderLoop {
             self.repaint_shell();
         }
         self.reflow_surfaces();
+    }
+
+    /// How many times the shell has been rasterised since this loop started. For tests
+    /// and logs: the property #400 rests on is that this climbs by one per pump however
+    /// many replacements the pump drained.
+    #[must_use]
+    pub fn shell_paints(&self) -> u64 {
+        self.shell_paints
     }
 
     /// How deep the shell is; `1` is Home. For tests and logs.
@@ -4164,8 +4186,19 @@ impl RenderLoop {
     }
 
     fn repaint_shell(&mut self) {
+        self.shell_repaint_due = false;
         if let Err(e) = self.paint_screen() {
             error!(error = %e, "failed to draw the shell screen");
+        }
+    }
+
+    /// The one paint an in-place replacement owes, once the drain is over. Two hundred
+    /// replacements queued between two pumps are two hundred stack updates and one
+    /// rasterisation of whatever ended up on top — the fix for #400, where they were two
+    /// hundred 4K rasterisations and the loop could not reach its own exit flag.
+    fn flush_shell_repaint(&mut self) {
+        if self.shell_repaint_due {
+            self.repaint_shell();
         }
     }
 
@@ -4180,6 +4213,7 @@ impl RenderLoop {
         let (w, h) = self.compositor.target_size();
         let (w, h) = (w.max(1), h.max(1));
         let rgba = self.render_screen(screen, w, h)?;
+        self.shell_paints += 1;
         // The mascot's foreground half rides its own layer above the widget's page (see
         // `LayerId::MascotOverlay`). Rasterised alongside Home and carried while other
         // screens are up — suppression keeps it off them — so coming back to Home does
