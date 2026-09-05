@@ -5,14 +5,22 @@
 //! receiver and watching it not work.
 //!
 //! ```text
-//! cargo run -p hci-probe                  # list what is attached
-//! cargo run -p hci-probe -- 8087:0029     # claim and initialise
+//! cargo run -p castaway-bt-probe                  # list what is attached
+//! cargo run -p castaway-bt-probe -- 8087:0029     # claim and initialise
 //! ```
+//!
+//! The listing's `MISSING` check is a **prediction** from the USB product id, because the
+//! part has not been opened yet: an AX2xx names its own image from the silicon ids in its
+//! version response, and one product id spans more than one silicon (the AX210 and the
+//! AX211 take different images under the same loader, #391). The claim-and-initialise
+//! run logs both — `image=` is what the part asked for, `expected=` is what the listing
+//! predicted — and a build carrying only the predicted one fails there, by file name,
+//! before any fragment goes out.
 //!
 //! Its own crate with its own `[[bin]]`, rather than an example on `hci-transport`, for
 //! two reasons that both point the same way: cargo examples are not cross-compiled, so an
 //! example can never become the `probe.exe` the Windows box needs (`nix run
-//! .#windows-probe`); and a `[[bin]]` inside `hci-transport` would pull
+//! .#windows-bt-probe`); and a `[[bin]]` inside `hci-transport` would pull
 //! `tracing-subscriber` and a multi-thread runtime out of that crate's dev-dependencies
 //! and into the dependency graph of everything that links it.
 //!
@@ -39,9 +47,9 @@
 //! ```text
 //! echo 0 | sudo tee /sys/bus/usb/drivers_autoprobe   # nothing binds anything
 //! echo -n 3-10:1.0 | sudo tee /sys/bus/usb/drivers/btusb/unbind
-//! cargo run -p hci-probe -- 8087:0032 --to-bootloader
+//! cargo run -p castaway-bt-probe -- 8087:0032 --to-bootloader
 //! echo -n 3-10 | sudo tee /sys/bus/usb/drivers/usb/bind   # see below
-//! cargo run -p hci-probe -- 8087:0032                # now it loads firmware
+//! cargo run -p castaway-bt-probe -- 8087:0032                # now it loads firmware
 //! ```
 //!
 //! Three things about that, each one observed rather than assumed:
@@ -64,12 +72,12 @@
 //!
 //! # On the Windows box
 //!
-//! Same two commands, through `nix run .#windows-probe --`, which pushes this binary to a
+//! Same two commands, through `nix run .#windows-bt-probe --`, which pushes this binary to a
 //! scratch directory and runs it there:
 //!
 //! ```text
-//! nix run .#windows-probe -- 8087:0032 --to-bootloader
-//! nix run .#windows-probe -- 8087:0032
+//! nix run .#windows-bt-probe -- 8087:0033 --to-bootloader
+//! nix run .#windows-bt-probe -- 8087:0033
 //! ```
 //!
 //! Two things have to be true on that box first, and neither is per-iteration:

@@ -273,7 +273,7 @@ let
   });
 
   # The bring-up tool, cross-built so it can be pushed to the box on its own
-  # (`nix run .#windows-probe`). Its own derivation for the launcher's reason and one
+  # (`nix run .#windows-bt-probe`). Its own derivation for the launcher's reason and one
   # more: iteration speed is the entire point of it existing, and a probe that rebuilt
   # the receiver would be no faster to get onto the box than the receiver is.
   #
@@ -286,9 +286,9 @@ let
   # artifact. It does take the DLL-closure check below, because "the .exe dies on startup
   # with a modal dialog" is exactly as unhelpful for a probe as for the receiver.
   probe = craneLib.buildPackage (crossArgs // {
-    pname = "castaway-probe-windows";
+    pname = "castaway-bt-probe-windows";
     cargoArtifacts = crossBaseArtifacts;
-    cargoExtraArgs = "--package hci-probe --bins";
+    cargoExtraArgs = "--package castaway-bt-probe --bins";
     CASTAWAY_FIRMWARE_DIR = bluetoothFirmware;
   });
 
@@ -587,7 +587,7 @@ rec {
   };
 
   # Exposed, where `launcher` is not, because it is run on its own rather than only
-  # staged into the receiver's tree: `nix run .#windows-probe` pushes exactly this.
+  # staged into the receiver's tree: `nix run .#windows-bt-probe` pushes exactly this.
   inherit probe;
 
   # One artifact, two checks: what the loader will look for, and what Windows will make
@@ -600,7 +600,7 @@ rec {
     # receiver's other machinery, so it is the one artifact whose import list is *only*
     # the USB transport's — which makes this the check that would catch a regression there
     # before the receiver's much larger list absorbed it.
-    castaway-probe-windows-dll-closure = mkBundleCheck probe;
+    castaway-bt-probe-windows-dll-closure = mkBundleCheck probe;
   };
 
   # Cross dev shell: `nix develop .#windows` then plain `cargo build`, which picks the

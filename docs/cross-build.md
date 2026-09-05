@@ -36,7 +36,7 @@ exercises your *future* Linux target.
 | Output | Features | What it's for |
 |---|---|---|
 | `.#castaway-windows-electron` | `--no-default-features --features electron,audio-out` | the deploy artifact, and since D55 the only one: render + hwaccel + the Electron browser subprocess, with the ECS distribution, our host app, and the Widevine CDM staged, plus WASAPI output through cpal |
-| `.#castaway-probe-windows` | `--package hci-probe` (`usb` only) | the controller bring-up tool, and the one cross-built artifact that is not part of a release: a single small .exe with no ffmpeg, no browser and no receiver, so it rebuilds and reaches the box in a fraction of the time the deploy artifact does (#287) |
+| `.#castaway-bt-probe-windows` | `--package castaway-bt-probe` (`usb` only) | the controller bring-up tool, and the one cross-built artifact that is not part of a release: a single small .exe with no ffmpeg, no browser and no receiver, so it rebuilds and reaches the box in a fraction of the time the deploy artifact does (#287) |
 | `.#msvc-sysroot` | — | the MSVC CRT + Windows SDK sysroot, built and cached independently |
 
 There were four artifacts until D55: a bare canary, `render`, `hwaccel`, and the deploy build.
@@ -79,13 +79,13 @@ each time round, so it has its own path that touches nothing the receiver owns:
 
 ```
 nix run .#windows-winusb                          # once per box; --undo gives the radio back
-nix run .#windows-probe                           # list what the box can see
-nix run .#windows-probe -- 8087:0032 --identify   # claim and ask, writing nothing
-nix run .#windows-probe -- 8087:0032 --to-bootloader
-nix run .#windows-probe -- 8087:0032              # now it exercises the loader
+nix run .#windows-bt-probe                           # list what the box can see
+nix run .#windows-bt-probe -- 8087:0033 --identify   # claim and ask, writing nothing
+nix run .#windows-bt-probe -- 8087:0033 --to-bootloader
+nix run .#windows-bt-probe -- 8087:0033              # now it exercises the loader
 ```
 
-One .exe goes into `%LOCALAPPDATA%\castaway-probe` — beside the install root rather than
+One .exe goes into `%LOCALAPPDATA%\castaway-bt-probe` — beside the install root rather than
 inside it — and is re-copied only when its hash differs from what is already there, so a
 repeat run is a single round trip. It runs in the SSH session rather than through
 `schtasks /IT`: the probe writes to stdout and claims a USB device, neither of which needs
@@ -104,7 +104,11 @@ neither is reversible by accident:
   `bluetooth = false` in the box's castaway.toml and restart it once — the receiver goes on
   casting, painting and serving, and simply does not claim the device. That is a runtime
   switch rather than a rebuild (D55), so it costs one restart per sitting, not one per
-  iteration.
+  iteration. A receiver whose *startup* claim failed — because the radio was on BTHUSB
+  when it started, which is the usual case — never retries it, and needs no restart:
+  its log says `Bluetooth sink unavailable; continuing without it` once, and that is the
+  whole of its Bluetooth for that run. Only a receiver that once held the radio re-opens
+  it, with backoff, after losing it.
 
 ### The install layout
 

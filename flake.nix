@@ -853,12 +853,12 @@
             windows-winusb = windowsDeploy.winusb;
 
             # The controller bring-up tool, cross-built for the box.
-            castaway-probe-windows = windows.probe;
+            castaway-bt-probe-windows = windows.probe;
 
-            # …and the loop that runs it there: `nix run .#windows-probe -- 8087:0032`.
+            # …and the loop that runs it there: `nix run .#windows-bt-probe -- 8087:0033`.
             # Pushes just that one .exe to a scratch directory and runs it, leaving the
             # installed receiver and its version trees alone.
-            windows-probe = windowsDeploy.probe;
+            windows-bt-probe = windowsDeploy.probe;
           }
         ));
 

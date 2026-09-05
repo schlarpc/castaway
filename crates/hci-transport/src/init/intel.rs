@@ -11,7 +11,7 @@
 //! already initialised, and unbinding `btusb` is not enough to arrange that: the
 //! operational image survives both a driver unbind and a USB port reset. The part has to
 //! be sent back to the bootloader with `Intel_Reset` first — see
-//! `hci-probe --to-bootloader`.
+//! `castaway-bt-probe --to-bootloader`.
 
 use substrate_hci::{Command, HciPacket, HciTransport, OpCode};
 use tracing::{debug, info, warn};

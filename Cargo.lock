@@ -1063,6 +1063,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "castaway-bt-probe"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hci-transport",
+ "substrate-hci",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "castaway-core"
 version = "0.1.0"
 dependencies = [
@@ -3060,17 +3071,6 @@ dependencies = [
  "thiserror 1.0.69",
  "widestring",
  "winapi",
-]
-
-[[package]]
-name = "hci-probe"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "hci-transport",
- "substrate-hci",
- "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]

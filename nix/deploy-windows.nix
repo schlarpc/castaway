@@ -263,7 +263,7 @@ let
   # Three properties, each one a reason this is not `deploy`:
   #
   #   1. **It touches nothing the receiver owns.** One .exe into
-  #      `%LOCALAPPDATA%\castaway-probe`, which is beside the install root rather than
+  #      `%LOCALAPPDATA%\castaway-bt-probe`, which is beside the install root rather than
   #      inside it, so no version tree, no `current` pointer and no scheduled task is
   #      involved. Removing the directory is the whole uninstall.
   #   2. **It re-copies only on change.** The binary is a couple of megabytes and the loop
@@ -282,7 +282,7 @@ let
   # A USB claim is exclusive, so with the receiver's Bluetooth on, this cannot open the
   # device at all — the probe says so, and names the command.
   probeApp = pkgs.writeShellApplication {
-    name = "castaway-windows-probe";
+    name = "castaway-windows-bt-probe";
     runtimeInputs = [ pkgs.openssh pkgs.coreutils pkgs.gnugrep ];
     text = preamble + ''
       # OpenSSH-for-Windows hands the command string to cmd.exe, which applies its own
@@ -297,7 +297,7 @@ let
           *)
             echo "error: unexpected argument '$a'" >&2
             echo >&2
-            echo "usage: castaway-windows-probe [vendor:product] [--identify|--to-bootloader]" >&2
+            echo "usage: castaway-windows-bt-probe [vendor:product] [--identify|--to-bootloader]" >&2
             echo "  (no arguments lists the controllers the box can see)" >&2
             exit 1 ;;
         esac
@@ -312,23 +312,23 @@ let
         echo "error: could not resolve %LOCALAPPDATA% on $host" >&2
         exit 1
       fi
-      dir="$base\\castaway-probe"
+      dir="$base\\castaway-bt-probe"
       # scp speaks forward slashes even to a Windows host; cmd takes either.
       dir_fwd="''${dir//\\//}"
 
-      want=$(sha256sum ${probe}/bin/hci-probe.exe | cut -d' ' -f1)
-      if [ "$(remote_sha256 "$dir\\hci-probe.exe")" = "$want" ]; then
-        echo "==> hci-probe.exe on $host is current"
+      want=$(sha256sum ${probe}/bin/castaway-bt-probe.exe | cut -d' ' -f1)
+      if [ "$(remote_sha256 "$dir\\castaway-bt-probe.exe")" = "$want" ]; then
+        echo "==> castaway-bt-probe.exe on $host is current"
       else
-        echo "==> copying hci-probe.exe to $dir"
+        echo "==> copying castaway-bt-probe.exe to $dir"
         on_box "if not exist \"$dir\" mkdir \"$dir\""
-        scp "''${ssh_opts[@]}" -q ${probe}/bin/hci-probe.exe "$host:$dir_fwd/hci-probe.exe"
+        scp "''${ssh_opts[@]}" -q ${probe}/bin/castaway-bt-probe.exe "$host:$dir_fwd/castaway-bt-probe.exe"
         # Read it back rather than trusting scp's exit status: the failure this catches is
         # a partial copy, which scp reports as success and the probe reports as a
         # confusing crash at some later point in a firmware upload.
-        got=$(remote_sha256 "$dir\\hci-probe.exe")
+        got=$(remote_sha256 "$dir\\castaway-bt-probe.exe")
         if [ "$got" != "$want" ]; then
-          echo "error: hci-probe.exe did not land intact (want $want, got ''${got:-nothing})" >&2
+          echo "error: castaway-bt-probe.exe did not land intact (want $want, got ''${got:-nothing})" >&2
           exit 1
         fi
       fi
@@ -342,11 +342,11 @@ let
         exit 1
       fi
 
-      echo "==> hci-probe.exe ''${args[*]-}"
+      echo "==> castaway-bt-probe.exe ''${args[*]-}"
       # `set "VAR=value"` rather than `set VAR=value`: cmd takes everything up to the
       # `&&` as the value, trailing space included, so the unquoted form would set the
       # filter to "debug " and leave EnvFilter to make what it can of that.
-      on_box "cd /d \"$dir\" && set \"RUST_LOG=$log\" && hci-probe.exe ''${args[*]-}" | unix
+      on_box "cd /d \"$dir\" && set \"RUST_LOG=$log\" && castaway-bt-probe.exe ''${args[*]-}" | unix
     '';
   };
 
