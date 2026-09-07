@@ -96,7 +96,7 @@ adblock = { version = "0.13", optional = true, default-features = false, feature
     "resource-assembler",
 ] }
 # Blocking HTTP client to fetch+cache EasyList at startup.
-ureq = { version = "2", optional = true }
+ureq = { version = "3", optional = true }
 # Cross-platform audio output: ALSA on Linux, WASAPI on Windows.
 cpal = { version = "0.18", optional = true }
 # The LDAC decoder. The only A2DP codec libav has no decoder for, so the only one that
