@@ -8,8 +8,18 @@
 # loads them in the real browser runtime and points them at our platform server.
 #
 # Not checked into the tree: half a megabyte of minified JavaScript that Google rewrites
-# on its own schedule is exactly what a pinned fetch is for. A bundle that moves fails
-# the hash, which is the signal to go and re-read what changed — see `docs/` and #16.
+# on its own schedule is exactly what a pinned fetch is for.
+#
+# Fetched from a Wayback Machine snapshot, not from gstatic. Google publishes no
+# versioned URLs for either bundle — CAF is only ever `v3/`, and v2's `2.0.0/` is a
+# label, not a release: its contents changed at least twice between August and October
+# 2026 — so pinning the live URL meant every rewrite broke every dev shell. A snapshot's
+# `id_` URL serves the original bytes and never changes. Noticing that Google *has*
+# moved is still wanted, because it is the signal to go and re-read the platform layer
+# (#16); that is `sdk-drift` in .github/workflows/live-endpoints.yml, which compares
+# the live bundles against these pins and goes red on its own instead of on a `direnv`
+# load. To re-pin: find the new capture in the Wayback CDX index for the upstream URL,
+# check its `id_` bytes against a fresh gstatic fetch, and update cast-receiver-sdk.json.
 #
 # Both generations are pinned because both are in play and they are *identical* at the
 # platform layer: same `ws://localhost:<port>/v2/ipc`, same `{namespace,senderId,data}`
@@ -19,17 +29,16 @@
 { pkgs }:
 
 let
-  v2 = pkgs.fetchurl {
-    url = "https://www.gstatic.com/cast/sdk/libs/receiver/2.0.0/cast_receiver.js";
-    hash = "sha256-IXmrC4XsB8CvBLHj7YfW9pDw7Smid5gTX6WbAizeq7c=";
-  };
-  caf = pkgs.fetchurl {
-    url = "https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js";
-    hash = "sha256-m6xoEyWK5Dq2vFFdd8ZL6krbBXkw1AS4NfU/BeQw8lQ=";
+  pins = builtins.fromJSON (builtins.readFile ./cast-receiver-sdk.json);
+  fetch = name: pin: pkgs.fetchurl {
+    inherit name;
+    url = "https://web.archive.org/web/${pin.snapshot}id_/${pin.upstream}";
+    inherit (pin) hash;
   };
 in
 pkgs.runCommand "cast-receiver-sdk" { } ''
   mkdir -p $out
-  cp ${v2} $out/cast_receiver.js
-  cp ${caf} $out/cast_receiver_framework.js
+  ${pkgs.lib.concatStrings (pkgs.lib.mapAttrsToList (name: pin: ''
+    cp ${fetch name pin} $out/${name}
+  '') pins)}
 ''

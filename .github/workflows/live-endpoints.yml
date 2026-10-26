@@ -6,7 +6,7 @@ name: Live endpoints
 # #40 names that as the failure this project cannot detect in advance — a revocation or an
 # API change lands as a silent fallback to the checked-in table, not as an error.
 #
-# So this job exercises both endpoints on a schedule and lets the run go red when one
+# So the first job exercises both endpoints on a schedule and lets the run go red when one
 # stops behaving. It runs the `#[ignore]`d live tests in
 # `crates/cast-replay/tests/live_backend.rs` (#294).
 #
@@ -66,3 +66,30 @@ jobs:
             cargo nextest run -p cast-replay --run-ignored all -E 'binary(live_backend)'
       - uses: ./.github/actions/postmortem
         if: failure()
+
+  # The Cast receiver SDK bundles are fetched from immutable Wayback snapshots
+  # (nix/cast-receiver-sdk.nix), so Google rewriting them no longer breaks a build. It
+  # still matters when they move — the platform layer `proto-cast` reimplements is read
+  # off these files (#16) — so the live bundles are compared against the pins here, where
+  # a red run is the alert. No Nix, no carve: this must not share a failure with anything
+  # above.
+  sdk-drift:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Compare the live Cast receiver SDK bundles against their pins
+        run: |
+          set -euo pipefail
+          drift=0
+          while read -r name upstream hash; do
+            got="sha256-$(curl -sSfL --retry 3 "$upstream" | openssl dgst -sha256 -binary | base64)"
+            if [ "$got" = "$hash" ]; then
+              echo "$name: unchanged"
+            else
+              echo "::error title=$name moved::$upstream is now $got (pinned $hash). Re-read the platform layer (#16) and re-pin nix/cast-receiver-sdk.json."
+              drift=1
+            fi
+          done < <(jq -r 'to_entries[] | "\(.key) \(.value.upstream) \(.value.hash)"' nix/cast-receiver-sdk.json)
+          exit "$drift"

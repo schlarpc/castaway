@@ -1,0 +1,12 @@
+{
+  "cast_receiver.js": {
+    "upstream": "https://www.gstatic.com/cast/sdk/libs/receiver/2.0.0/cast_receiver.js",
+    "snapshot": "20261014110607",
+    "hash": "sha256-IXmrC4XsB8CvBLHj7YfW9pDw7Smid5gTX6WbAizeq7c="
+  },
+  "cast_receiver_framework.js": {
+    "upstream": "https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js",
+    "snapshot": "20261020145101",
+    "hash": "sha256-m6xoEyWK5Dq2vFFdd8ZL6krbBXkw1AS4NfU/BeQw8lQ="
+  }
+}
