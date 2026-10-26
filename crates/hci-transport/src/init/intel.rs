@@ -1135,8 +1135,14 @@ mod tests {
         firmware_named("intel/ibt-0041-0041.sfi", sfi_bytes)
     }
 
+    /// A file of its own per call. `cargo test` runs these tests as threads of one
+    /// process, and a path shared between them is truncated by one test's write while
+    /// another's loader is reading it — "image is 0 bytes", under coverage only, because
+    /// nextest gives every test a process of its own.
     fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("castaway-{}-{name}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("castaway-{}-{n}-{name}", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         path
     }
