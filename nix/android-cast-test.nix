@@ -125,9 +125,16 @@ let
 
     # `-net-tap-script-up/down no`: the emulator otherwise runs /etc/qemu-ifup, which does
     # not exist here and does not need to — the interface is already configured above.
+    #
+    # A retry also wipes user data. `-no-snapshot` makes it a cold boot, but the dead
+    # attempt has already run first-boot setup and Play Services, and a phone booted on
+    # top of that never showed castaway in the picker (#387). `-wipe-data` puts it back
+    # to the state a first attempt starts from.
     boot_emulator() {
       echo "== emulator on tap0 (attempt $1)"
-      ${sdkRoot}/emulator/emulator -avd cast \
+      wipe=""
+      [ "$1" -gt 1 ] && wipe="-wipe-data"
+      ${sdkRoot}/emulator/emulator -avd cast $wipe \
         -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
         -gpu swiftshader_indirect -memory 3072 -cores 2 \
         -net-tap tap0 -net-tap-script-up no -net-tap-script-down no \
