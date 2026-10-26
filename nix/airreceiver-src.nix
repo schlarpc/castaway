@@ -28,8 +28,13 @@
 # per-file key; requesting the final URL cold returns 403. This replays the chain with
 # a cookie jar. The key is stable per file rather than per session, but nothing about
 # the markup is a contract, so treat this as a best-effort convenience: when it breaks
-# the derivation fails loudly with instructions, and `CASTAWAY_AIRRECEIVER_SO` takes a
-# path to a library you obtained yourself. The hash below is the check either way.
+# the derivation fails loudly with instructions: seed the store with a library you
+# obtained yourself, and the hash below is the check either way.
+#
+# It has broken: since 2026-10-08 every hop is behind Cloudflare's JS challenge, which
+# `curl` cannot pass (#356). There is deliberately no environment-variable override —
+# a builder never sees the caller's environment, and a sandboxed one could not read a
+# path under `$HOME` if it did — so `nix-store --add-fixed` is the one manual route.
 {
   lib,
   stdenvNoCC,
@@ -56,12 +61,6 @@ stdenvNoCC.mkDerivation {
   buildCommand = ''
     set -euo pipefail
 
-    if [ -n "''${CASTAWAY_AIRRECEIVER_SO:-}" ]; then
-      echo "using CASTAWAY_AIRRECEIVER_SO=$CASTAWAY_AIRRECEIVER_SO" >&2
-      cp "$CASTAWAY_AIRRECEIVER_SO" "$out"
-      exit 0
-    fi
-
     base=https://www.apkmirror.com
     rel="$base/apk/devsoftmedia/airreceiverlite/airreceiverlite-5-1-7-release/"
     dl="$base/apk/softmedia/airreceiverlite/airreceiverlite-5-1-7-release/airreceiverlite-5-1-7-android-apk-download/"
@@ -74,17 +73,16 @@ stdenvNoCC.mkDerivation {
       echo "$1" >&2
       cat >&2 <<'EOF'
 
-    The download chain at apkmirror.com has changed, or is refusing this build.
-    Nothing here is a contract, so this is expected to happen eventually.
+    The download chain at apkmirror.com has changed, or is refusing this build —
+    most likely Cloudflare's JS challenge, which curl cannot pass. See issue #356.
 
     Obtain lib/arm64-v8a/libAirReceiver.so from AirReceiverLite 5.1.7 by any route
-    (its sha256 is the outputHash in nix/airreceiver-src.nix), then either:
+    (a real browser gets past the challenge; its sha256 is the outputHash in
+    nix/airreceiver-src.nix), then add it to the store:
 
-      export CASTAWAY_AIRRECEIVER_SO=/path/to/libAirReceiver.so
-
-    or add it to the store directly:
-
-      nix-store --add-fixed sha256 /path/to/libAirReceiver.so
+      unzip bundle.apkm split_config.arm64_v8a.apk
+      unzip split_config.arm64_v8a.apk lib/arm64-v8a/libAirReceiver.so
+      nix-store --add-fixed sha256 lib/arm64-v8a/libAirReceiver.so
     EOF
       exit 1
     }
