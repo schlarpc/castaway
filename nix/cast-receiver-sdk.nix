@@ -21,11 +21,11 @@
 let
   v2 = pkgs.fetchurl {
     url = "https://www.gstatic.com/cast/sdk/libs/receiver/2.0.0/cast_receiver.js";
-    hash = "sha256-R0JDwckB40gsLBGBTp8DOtonN0N43GkPclVnHsAExiY=";
+    hash = "sha256-IXmrC4XsB8CvBLHj7YfW9pDw7Smid5gTX6WbAizeq7c=";
   };
   caf = pkgs.fetchurl {
     url = "https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js";
-    hash = "sha256-RqeMsPGJV0J6c3zMEBXf0aWHx1WOxm3w/0d/VXnvjqA=";
+    hash = "sha256-m6xoEyWK5Dq2vFFdd8ZL6krbBXkw1AS4NfU/BeQw8lQ=";
   };
 in
 pkgs.runCommand "cast-receiver-sdk" { } ''
