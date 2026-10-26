@@ -40,7 +40,7 @@ fn cks_table_has_at_least_a_quarter_of_runway_left() {
     assert!(
         days >= MIN_REMAINING_DAYS,
         "The checked-in CKS (AirReceiver) signature table has {days} days left \
-         (threshold {MIN_REMAINING_DAYS}); it stops at Unix {} = 2027-12-06. Past that \
+         (threshold {MIN_REMAINING_DAYS}); it stops at Unix {} = 2030-12-06. Past that \
          a panel on the offline table stops authenticating to official senders, \
          silently.\n\
          What to do: re-export the CKS table from a fresh AirReceiver artifact \

@@ -11,6 +11,11 @@ tooling and notes in `re-shell/artifacts/airreceiver-cast-signatures/`
 (`dbio.py`, `cks_store.py`); the container format, the key derivation and the
 on-device re-issue are documented in `CKS_5.1.7.md` there.
 
+The build now carves 5.1.8 instead (#436): same device certificate, intermediate
+and backend credentials, a new peer key, and the windows moved three years later.
+The addresses that change between builds, and how they were re-found, are in
+`PROVENANCE.md` §1.
+
 **No longer checked in.** The device certificate, its intermediate, the peer
 template and key, and the 900 windows of signatures are SoftMedia's identity — a
 Google-issued Cast device credential with an RSA private key — so they are carved
@@ -60,8 +65,9 @@ anchors.
 
 ## Coverage
 
-900 two-day windows, **2023-01-01 → 2027-12-06**. Window *n* starts at
-`1672531200 + n * 172800`. All 1800 signatures verify against `device_cert.pem`
+900 two-day windows, **2026-01-01 → 2030-12-06** (AirReceiverLite 5.1.8; 5.1.7's
+ran 2023-01-01 → 2027-12-06 under a different peer key, #436). Window *n* starts at
+`1767225600 + n * 172800`. All 1800 signatures verify against `device_cert.pem`
 over the certificate `template.rs` re-issues, and all 1800 are accepted by
 Openscreen's sender-side path (chain, policy, validity, digest, signature) —
 `openscreen_conformance.py` in the RE directory runs that, with the checker
@@ -73,7 +79,7 @@ connect.
 
 ## Caveats — read before relying on this
 
-* **It expires.** The table stops on **2027-12-06**. After that only the network
+* **It expires.** The table stops on **2030-12-06**. After that only the network
   path can produce a credential, and `CksTable::credential_at` returns
   `ReplayError::OutOfRange` rather than something that looks like it works.
 * **It is not our identity.** This is AirReceiver's Cast identity, shared with
@@ -81,10 +87,10 @@ connect.
   more holder of it, not the holder.
 * **It is revocable.** `AuthResponse` carries a `crl` field and Chrome fetches the
   Cast device CRL. Google can revoke `RYW0O FA8FCA6AC5A0` at any time and this
-  stops working before 2027 — nothing here can detect that in advance. Openscreen
+  stops working before 2030 — nothing here can detect that in advance. Openscreen
   senders default to `kCrlOptional`, so returning no CRL is accepted today.
 * **The chain's own ceiling is 2032-12-12**, set by `Eureka Root CA` expiring —
-  earlier than the device certificate's own 2034 `notAfter`, and five years after
+  earlier than the device certificate's own 2034 `notAfter`, and two years after
   the table runs out either way.
 * **No device private key is involved.** None is present in any examined build,
   and the replay's structure is evidence the vendor holds none either: a party

@@ -1448,7 +1448,7 @@ async fn serve(
         //
         // Cast is the only adapter whose *startup* can fail for a reason that has
         // nothing to do with hardware: the replayed device identities stop covering the
-        // calendar on 2027-03-21 (AirServer) and 2027-12-06 (CKS), so a panel with no
+        // calendar on 2027-03-21 (AirServer) and 2030-12-06 (CKS), so a panel with no
         // uplink past the later of those resolves no credential at all. Until this was a
         // `?`, that took the whole process with it — DLNA, AirPlay, Bluetooth, Spotify
         // and the screen — on every boot.

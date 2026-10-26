@@ -1,7 +1,7 @@
 //! The expiry canary's arithmetic — pure over `(horizon, today)`.
 //!
 //! Each checked-in signature table is a *floor* with a fixed end date (`cks`
-//! stops 2027-12-06, `airserver` 2027-03-21). Past it, only the live endpoint can
+//! stops 2030-12-06, `airserver` 2027-03-21). Past it, only the live endpoint can
 //! produce a credential; a panel that has lost its uplink simply stops answering
 //! official senders, silently, because a table running out is not a runtime error
 //! — it is a fact about the calendar the binary was built on.

@@ -40,8 +40,8 @@
 //!
 //! The default order is [`Identity::Cks`] then
 //! [`Identity::AirServer`], and on *expiry* grounds that second entry is
-//! nearly vacuous: CKS covers through 2027-12-06 and AirServer stops 2027-03-21,
-//! so any instant AirServer can serve, CKS can serve too. It earns its place in
+//! nearly vacuous: CKS covers 2026-01-01 through 2030-12-06 and AirServer stops
+//! 2027-03-21, so from now on any instant AirServer can serve, CKS can serve too. It earns its place in
 //! two situations that expiry does not describe:
 //!
 //! * **Revocation.** D41's unmitigated risk is Google revoking the AirReceiver
@@ -116,7 +116,7 @@ const REFRESH_HORIZON: i64 = 3 * 24 * 3600;
 #[non_exhaustive]
 pub enum Identity {
     /// SoftMedia / AirReceiver, `CN=RYW0O FA8FCA6AC5A0` under `Eureka Gen1 ICA`.
-    /// Covers 2023-01-01 → 2027-12-06. See [`crate::cks`].
+    /// Covers 2026-01-01 → 2030-12-06. See [`crate::cks`].
     Cks,
     /// App Dynamic / AirServer, `CN=2001805200936810051` under
     /// `Widevine Cast Subroot`. Covers 2024-03-20 → 2027-03-21. See
@@ -1100,13 +1100,13 @@ mod tests {
         .await
         .unwrap();
 
-        let at = 1_785_196_800; // 2026-07-28, window 652
+        let at = 1_785_196_800; // 2026-07-28, window 104
         let credential = provider.current_at(at);
         let credential = credential.credential();
         assert!(credential.valid_at(at));
         assert_eq!(
             credential.origin(),
-            &CredentialOrigin::CksTable { index: 652 }
+            &CredentialOrigin::CksTable { index: 104 }
         );
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
         }
     }
 
-    /// Between AirServer's end (2027-03-21) and CKS's (2027-12-06) only one table
+    /// Between AirServer's end (2027-03-21) and CKS's (2030-12-06) only one table
     /// can answer, so the preferred-but-exhausted identity must fall through rather
     /// than fail. This is the one case where the fallback is driven by expiry.
     #[tokio::test]

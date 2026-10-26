@@ -45,7 +45,7 @@
 //! | from | SoftMedia / AirReceiver | App Dynamic / AirServer |
 //! | device CN | `RYW0O FA8FCA6AC5A0` | `2001805200936810051` |
 //! | root path | `Eureka Root CA` | `Widevine Cast Subroot` |
-//! | covers | 2023-01-01 → 2027-12-06 | 2024-03-20 → 2027-03-21 |
+//! | covers | 2026-01-01 → 2030-12-06 | 2024-03-20 → 2027-03-21 |
 //! | windows | 900, 2-day step, tiled | 1095, 1-day step, overlapping |
 //! | certificates | re-issued from a template | stored verbatim |
 //!
@@ -252,7 +252,7 @@ pub enum CredentialOrigin {
     /// credential, still inside its window.
     Cache,
     /// Re-issued from the checked-in CKS table at `index` — SoftMedia's
-    /// (AirReceiver's) identity. Works offline; stops working 2027-12-06.
+    /// (AirReceiver's) identity. Works offline; stops working 2030-12-06.
     CksTable {
         /// The window's index in the table.
         index: u32,

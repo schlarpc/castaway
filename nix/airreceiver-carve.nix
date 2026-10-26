@@ -23,7 +23,7 @@
 
 stdenvNoCC.mkDerivation {
   pname = "airreceiver-cast-carve";
-  version = "5.1.7";
+  version = "5.1.8";
 
   dontUnpack = true;
 

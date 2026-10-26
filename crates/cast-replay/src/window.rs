@@ -131,16 +131,16 @@ mod tests {
 
     #[test]
     fn utc_time_matches_the_reference_rendering() {
-        // Window 0 of the shipped table: 2023-01-01 .. 2023-01-03. These are the
-        // exact byte strings that appear in the checked-in peer template, so if
-        // this rendering drifts the reissued certificate stops matching.
+        // Window 0 of the shipped table: 2026-01-01 .. 2026-01-03. These are the
+        // exact byte strings that appear in the carved peer template, so if this
+        // rendering drifts the reissued certificate stops matching.
         assert_eq!(
-            UtcTime::from_unix(1_672_531_200).unwrap().as_bytes(),
-            b"230101000000Z"
+            UtcTime::from_unix(1_767_225_600).unwrap().as_bytes(),
+            b"260101000000Z"
         );
         assert_eq!(
-            UtcTime::from_unix(1_672_704_000).unwrap().as_bytes(),
-            b"230103000000Z"
+            UtcTime::from_unix(1_767_398_400).unwrap().as_bytes(),
+            b"260103000000Z"
         );
     }
 

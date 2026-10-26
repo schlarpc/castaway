@@ -1,12 +1,12 @@
 //! The checked-in signature table — the offline fallback.
 //!
-//! 900 two-day windows, 2023-01-01 through 2027-12-06, two precomputed
+//! 900 two-day windows, 2026-01-01 through 2030-12-06, two precomputed
 //! signatures each (SHA-1 and SHA-256), over a peer certificate re-issued per
 //! window from one template and one key. Every window points at the *same* peer
 //! certificate and key; only the signatures differ.
 //!
 //! Provenance and the caveats that come with it are in `fixtures/README.md`.
-//! The one that matters operationally: **the table stops on 2027-12-06**, and
+//! The one that matters operationally: **the table stops on 2030-12-06**, and
 //! after that only the network path can produce a credential.
 
 use rsa::pkcs1::DecodeRsaPrivateKey as _;
@@ -19,8 +19,12 @@ use crate::template::PeerTemplate;
 use crate::window::{Window, WINDOW_SECS};
 use crate::{CastCredential, CredentialOrigin, ReplayError};
 
-/// Start of window 0: 2023-01-01T00:00:00Z.
-const EPOCH_UNIX: i64 = 1_672_531_200;
+/// Start of window 0: 2026-01-01T00:00:00Z.
+///
+/// AirReceiverLite 5.1.8's table. 5.1.7's ran 2023-01-01 → 2027-12-06 under a different
+/// peer key; the bump to 5.1.8 (#436) is what moved this, and the carve's `epoch_unix`
+/// is where to read it off a future build.
+const EPOCH_UNIX: i64 = 1_767_225_600;
 
 /// Number of windows in the shipped table.
 const WINDOW_COUNT: u32 = 900;
@@ -135,7 +139,7 @@ impl CksTable {
     }
 
     /// The first instant the shipped table does **not** cover — its horizon,
-    /// exclusive: 2027-12-06T00:00:00Z.
+    /// exclusive: 2030-12-06T00:00:00Z.
     ///
     /// A compile-time constant, derived from the same layout that produces every
     /// window, so it is readable without a carved identity. The expiry canary
@@ -153,7 +157,7 @@ impl CksTable {
     ///
     /// # Errors
     /// [`ReplayError::OutOfRange`] if the table does not cover `unix` — which, past
-    /// 2027-12-06, it never will. [`ReplayError::Sign`] if re-issuing fails.
+    /// 2030-12-06, it never will. [`ReplayError::Sign`] if re-issuing fails.
     pub fn credential_at(&self, unix: i64) -> Result<CastCredential, ReplayError> {
         let index = self.index_at(unix).ok_or(ReplayError::OutOfRange {
             identity: Identity::Cks,
@@ -210,10 +214,10 @@ mod tests {
     #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn the_table_covers_the_range_it_is_documented_to() {
         let t = table();
-        assert_eq!(t.window(0).unwrap().start_unix(), 1_672_531_200); // 2023-01-01
-        assert_eq!(t.window(899).unwrap().end_unix(), 1_828_051_200); // 2027-12-06
+        assert_eq!(t.window(0).unwrap().start_unix(), 1_767_225_600); // 2026-01-01
+        assert_eq!(t.window(899).unwrap().end_unix(), 1_922_745_600); // 2030-12-06
         assert!(t.window(900).is_none());
-        assert_eq!(t.covers_until(), 1_828_051_200);
+        assert_eq!(t.covers_until(), 1_922_745_600);
     }
 
     #[test]
@@ -225,12 +229,14 @@ mod tests {
             assert_eq!(t.index_at(w.start_unix()), Some(index));
             assert_eq!(t.index_at(w.end_unix() - 1), Some(index));
         }
-        assert_eq!(t.index_at(1_672_531_199), None, "before the table starts");
-        assert_eq!(t.index_at(1_828_051_200), None, "the instant it ends");
+        assert_eq!(t.index_at(1_767_225_599), None, "before the table starts");
+        assert_eq!(t.index_at(1_922_745_600), None, "the instant it ends");
     }
 
     /// The golden vectors: SHA-256 of the re-issued peer certificate for four
-    /// windows, taken from the reference extractor. If the DER rewrite drifts by a
+    /// windows of the 5.1.8 table, from an independent re-issue in Python's
+    /// `cryptography` (`cks_golden_reissue.py` in the RE directory) that first
+    /// reproduced all four of 5.1.7's vectors from the reference extractor. If the DER rewrite drifts by a
     /// byte these change, and every signature in the table stops verifying.
     #[test]
     #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
@@ -239,19 +245,19 @@ mod tests {
         for (index, want) in [
             (
                 0u32,
-                "3eb84f0318dbfd33185b3ee5eecc757e37e3b44e78bbbea33c4e8bf45a0caf0e",
+                "1d4dcfdd1d3aa8856423902e61d17aec1ed4fc8ca094a9a9577f7f7dfa38374e",
             ),
             (
                 1,
-                "30e74921b6fa2eb98ce860563363d074b41330cfd6feff9f3c6c6a194760a830",
+                "a0d67800d5ccc80db6d68184eab88abd72dc777570750697ae2f407f1a46d853",
             ),
             (
                 652,
-                "15f9611b2e90c2315673515b60484ec3f7f13ba30711678f996fad1b592d1a1d",
+                "63515f7d75f00d703475bd3565610003f80841d80e701d79928b7ab2b69b7e2e",
             ),
             (
                 899,
-                "a3065249fee57cdfbc228c008a938bebe2c95a49f3d030d23631fb84b21e5919",
+                "4da45bd93cf72d6b21c6b4b52f12f1c412886fccfecd84c6e76f86922b0c435a",
             ),
         ] {
             let der = t
@@ -318,7 +324,7 @@ mod tests {
         let t = table();
         match t.credential_at(t.covers_until()) {
             Err(ReplayError::OutOfRange { covers_until, .. }) => {
-                assert_eq!(covers_until, 1_828_051_200);
+                assert_eq!(covers_until, 1_922_745_600);
             }
             other => panic!("expected OutOfRange, got {other:?}"),
         }

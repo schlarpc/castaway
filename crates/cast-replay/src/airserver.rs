@@ -2,7 +2,7 @@
 //!
 //! [`crate::cks`] holds SoftMedia's (AirReceiver's) identity. This holds App
 //! Dynamic's (AirServer's), and the reason to carry both is **not** horizon — the
-//! CKS table runs to 2027-12-06 and this one stops on 2027-03-21, so on expiry
+//! CKS table runs to 2030-12-06 and this one stops on 2027-03-21, so on expiry
 //! alone this is strictly the worse of the two. The reason is *revocation*.
 //!
 //! D41 names the risk it could not mitigate: the AirReceiver identity is shared
@@ -18,7 +18,7 @@
 //! | device CN | `RYW0O FA8FCA6AC5A0` | `2001805200936810051` |
 //! | issuer | `Eureka Gen1 ICA` | `NVidia mdarcy … Cast ICA` |
 //! | root path | `Eureka Root CA` | `Widevine Cast Subroot` |
-//! | covers | 2023-01-01 → 2027-12-06 | 2024-03-20 → 2027-03-21 |
+//! | covers | 2026-01-01 → 2030-12-06 | 2024-03-20 → 2027-03-21 |
 //!
 //! Different device, different intermediate, different branch of the Cast PKI. A
 //! revocation or root-level problem that kills one has no particular reason to

@@ -82,6 +82,8 @@ the same bytes rather than a later build that moved everything.
 |---|---|---|
 | `com.softmedia.receiver.lite.apk` (AirReceiver Lite **5.1.7**) | 12 810 825 | `79fcae57ea65b56d212e6f020e4230eb69fe399c1030476f462ecd6af04851c8` |
 | └ `lib/arm64-v8a/libAirReceiver.so` | 11 016 352 | `71701f4fc335e14a504674454580baa8e6e4528ad0de28f1cfbc5ca34c398974` |
+| `com.softmedia.receiver.lite_5.1.8-2020164766_…_apkmirror.com.apkm` (AirReceiver Lite **5.1.8**, what the build carves) | 54 216 913 | `3f71d85f34fc7414710a53c93ad25172856c0dec1d636ea35db97b0a94fc9f9d` |
+| └ `split_config.arm64_v8a.apk` → `lib/arm64-v8a/libAirReceiver.so` | 11 148 248 | `254852b5a76b3f62d3bfb79e7822b90a09f01610fdb757bf96b08f5a9c6aece5` |
 | `AirServer-5.7.2-x64.msi` | 20 738 048 | `173685e9c546993d9956030587ee296b61947e8944878538abd5a598b91a9bfc` |
 | └ `AirServer.exe` (**5.7.2**) | 23 779 840 | `134a95c53b105e9d48f34289ea5694fcb836ecb751f31e62123c45ef50e6a7df` |
 | `AirServer-2025.7.23-x64.msix` | 105 967 771 | `2fd5fbd509d5b557ec442c3f628c443ba55a8b587a2ccf82d11858a78e52ef45` |
@@ -128,6 +130,43 @@ python3 cks_store.py libAirReceiver.so --openscreen
 Result: 900 windows, 1800 signatures, one peer key, one peer certificate template.
 Unlike AirServer's, these per-window certificates differ **only** in validity, so
 `src/template.rs` re-issues them from one template rather than storing 900 copies.
+
+### 5.1.8 (#436)
+
+The addresses above are 5.1.7's. The build carves 5.1.8, fetched from the
+Internet Archive mirror (#356). Against 5.1.7, the carve's output:
+
+| | 5.1.7 | 5.1.8 |
+|---|---|---|
+| device certificate, ICA | `RYW0O FA8FCA6AC5A0` | **identical** |
+| CKS API key, `sig` secret, field cipher | | **identical** |
+| peer key, peer template | | **new** (template CN `f917dfca-6348-11f1-…`) |
+| windows | 900, 2023-01-01 → 2027-12-06 | 900, **2026-01-01 → 2030-12-06** |
+| `dbio` blob | ELF `0x195184` | ELF `0x19c8cc` |
+| `dbio` password | `com.softmedia.receiver` | unchanged |
+
+So the device is the same one, and SoftMedia re-signed three years of windows under a
+fresh peer key. Revocation exposure (D41) is unchanged; the expiry floor moves three
+years.
+
+Everything the carve finds by search (the string key, the `x-api-key` anchor, the field
+cipher, the `dbio` blob) found itself. Only the five emulation entry points in
+`KEK_FNS` are pinned per build, and they were re-found without a decompiler:
+
+* **The four functions**: take each 5.1.7 function's first 64 instructions, mask the
+  PC-relative immediates (`adrp`/`adr`, `b`/`bl`, `b.cond`, `cbz`/`tbz`, literal
+  `ldr`, and the page-offset `add`/`ldr` that pair with an `adrp`), and search
+  5.1.8's `.text`. Each matches exactly once, and all four at the same `+0xC950`:
+  `0x35F49C`, `0x35FE64`, `0x35F5A4`, `0x35FB28` (ELF vaddrs).
+* **The function pointer** is data, so it can't be matched that way. Six code sites in
+  5.1.7 load `0xA8BF30` through an `adrp`+`ldr`/`add` pair. Five of them match (masked
+  ±16 instructions) a unique 5.1.8 site, and all five decode to the same target,
+  `0xAAC270`.
+
+Neither step is the proof. The proof is that the carve then recovers the password,
+unwraps the store, and all 1800 signatures verify against the device certificate. A
+wrong address can't produce that. The same two steps should work for the next build;
+when they don't, that is the point at which Ghidra is needed again.
 
 ## 2. The CKS remote pull
 

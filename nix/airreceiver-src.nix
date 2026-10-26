@@ -1,4 +1,4 @@
-# Fetch `libAirReceiver.so` (arm64-v8a) out of AirReceiverLite 5.1.7.
+# Fetch `libAirReceiver.so` (arm64-v8a) out of AirReceiverLite 5.1.8.
 #
 # A fixed-output derivation, so it gets network access and its result is pinned by
 # hash. That hash is the **library's**, not the container's, which is deliberate: the
@@ -9,7 +9,7 @@
 #
 # ## Where from
 #
-# The APKMirror `.apkm` for 5.1.7 — the universal bundle that carries the
+# The APKMirror `.apkm` for 5.1.8 — the universal bundle that carries the
 # `config.arm64_v8a` split — as mirrored on the Internet Archive, which serves a stable
 # anonymous URL. That is what this route was missing everywhere else:
 #
@@ -34,7 +34,7 @@
 
 stdenvNoCC.mkDerivation {
   pname = "libAirReceiver";
-  version = "5.1.7";
+  version = "5.1.8";
 
   nativeBuildInputs = [ curl unzip ];
 
@@ -43,7 +43,7 @@ stdenvNoCC.mkDerivation {
   # is also the value PROVENANCE §1 records for the binary the RE was done against.
   outputHashAlgo = "sha256";
   outputHashMode = "flat";
-  outputHash = "sha256-cXAfT8M14UpQRnRFRYC6qObkUorQ3ijxz7xco0w5iXQ=";
+  outputHash = "sha256-JUhStadrP2LTv7eeeCK5CgnwFhD9t1e/lrCPWpxq7OU=";
 
   SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
 
@@ -55,10 +55,10 @@ stdenvNoCC.mkDerivation {
       echo "$1" >&2
       cat >&2 <<'EOF'
 
-    The Internet Archive mirror of AirReceiverLite 5.1.7 is unreachable, or no longer
+    The Internet Archive mirror of AirReceiverLite 5.1.8 is unreachable, or no longer
     holds the bundle. See issue #356.
 
-    Obtain lib/arm64-v8a/libAirReceiver.so from AirReceiverLite 5.1.7 by any route
+    Obtain lib/arm64-v8a/libAirReceiver.so from AirReceiverLite 5.1.8 by any route
     (its sha256 is the outputHash in nix/airreceiver-src.nix), then add it to the
     store:
 
@@ -70,7 +70,7 @@ stdenvNoCC.mkDerivation {
     }
 
     curl -sSfL --retry 5 --retry-all-errors --retry-delay 3 -o bundle.apkm \
-      'https://archive.org/download/com.softmedia.receiver.lite/com.softmedia.receiver.lite_5.1.7-2020164765_4arch_7dpi_24lang_74d08633aab15d4b4d458068f96a8708_apkmirror.com.apkm' \
+      'https://archive.org/download/com.softmedia.receiver.lite/com.softmedia.receiver.lite_5.1.8-2020164766_4arch_7dpi_24lang_a8ddb5eb459ae731a6e7015d9a9ae025_apkmirror.com.apkm' \
       || fail "could not download the bundle from the Internet Archive mirror"
 
     # An .apkm is a zip of split APKs; the arm64 split holds the library.
@@ -83,7 +83,7 @@ stdenvNoCC.mkDerivation {
   '';
 
   meta = {
-    description = "libAirReceiver.so (arm64-v8a) from AirReceiverLite 5.1.7";
+    description = "libAirReceiver.so (arm64-v8a) from AirReceiverLite 5.1.8";
     # SoftMedia's, and not ours to redistribute — which is the whole point of fetching
     # it rather than vendoring it.
     license = lib.licenses.unfree;

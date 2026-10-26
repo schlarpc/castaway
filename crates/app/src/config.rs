@@ -557,7 +557,7 @@ pub struct Cast {
 /// sender and Cast is decorative. Read `crates/cast-replay/fixtures/README.md`
 /// before deciding to leave it on: the identity is shared with every install of
 /// the app it came from, Google can revoke it, and the offline table stops on
-/// 2027-12-06.
+/// 2030-12-06.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Replay {
@@ -568,7 +568,7 @@ pub struct Replay {
     /// Whether either live endpoint may be contacted.
     ///
     /// Turning this off pins the receiver to the checked-in tables — which works,
-    /// offline, until 2027-12-06 and not one window past it. The live endpoints are
+    /// offline, until 2030-12-06 and not one window past it. The live endpoints are
     /// the only thing that extends past that date, and the only thing that stops the
     /// checked-in databases from being the receiver's expiry date.
     pub network: bool,
@@ -588,9 +588,9 @@ pub struct Replay {
     ///
     /// Two are shipped, and they are *different devices on different branches of
     /// the Cast PKI* — `cks` is AirReceiver's (`Eureka Gen1 ICA`, through
-    /// 2027-12-06), `airserver` is AirServer's (`Widevine Cast Subroot`, through
-    /// 2027-03-21). The default order prefers `cks` because it lasts eight months
-    /// longer.
+    /// 2030-12-06), `airserver` is AirServer's (`Widevine Cast Subroot`, through
+    /// 2027-03-21). The default order prefers `cks` because it lasts three years
+    /// and eight months longer.
     ///
     /// The reason to change it is **revocation**. Both identities are borrowed and
     /// shared with every install of the product they came from, and Google can

@@ -39,8 +39,8 @@ file bytes are zero and the real target is the relocation *addend*.
 * **The strings** are found by scanning for the encoded-byte pattern, not by
   address.
 * **Which 32-hex constant is which** is the real problem — there are three in
-  5.1.7, and content cannot tell them apart. So the table itself disambiguates:
-  find the slot whose decoded string is exactly `x-api-key` (a public HTTP header
+  5.1.7 and in 5.1.8, and content cannot tell them apart. So the table itself
+  disambiguates: find the slot whose decoded string is exactly `x-api-key` (a public HTTP header
   name, not a secret), and the API key and `sig` secret are the next two slots.
   That adjacency is a property of the constructor's layout, not an address.
 
@@ -265,7 +265,7 @@ def carve(data, elf=None):
 
     # Every relocation slot that resolves, through one or two hops, to a string
     # that decodes. One hop is the table itself; two is the table-of-pointers the
-    # 5.1.7 constructor uses.
+    # 5.1.7 and 5.1.8 constructors use.
     resolved = {}
     for slot in elf.relative:
         p1 = elf.ptr(slot)
@@ -467,8 +467,14 @@ DBIO_HEADER = 0x40
 # carve asserts the library's hash before using them. `nix/airreceiver-src.nix` pins
 # the same hash, so the two travel together and a swapped library fails here with a
 # reason rather than somewhere further down with garbage.
-KEK_FNS = (0x352B4C, 0x353514, 0x352C54, 0x3531D8, 0xA8BF30)
-SOURCE_SHA256 = "71701f4fc335e14a504674454580baa8e6e4528ad0de28f1cfbc5ca34c398974"
+#
+# Re-derived for 5.1.8 from 5.1.7's without a decompiler (#436): each 5.1.7 function's
+# first 64 instructions, PC-relative immediates masked, match exactly once in 5.1.8 —
+# all four at +0xC950 — and the function pointer is the `adrp`/`ldr` target at the
+# five 5.1.8 sites that match 5.1.7's loads of the old one. The method is in
+# PROVENANCE §1; the 1800 verifying signatures below are what say it was right.
+KEK_FNS = (0x35F49C, 0x35FE64, 0x35F5A4, 0x35FB28, 0xAAC270)
+SOURCE_SHA256 = "254852b5a76b3f62d3bfb79e7822b90a09f01610fdb757bf96b08f5a9c6aece5"
 
 
 def recover_kek(path):
