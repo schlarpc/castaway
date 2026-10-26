@@ -7,34 +7,23 @@
 # APKMirror repack of `base.apk`, for instance, differs from the one PROVENANCE
 # recorded while the library inside is byte-identical.
 #
-# ## Why this route
+# ## Where from
 #
-# There is no vendor download for this app, and no anonymous stable URL:
+# The APKMirror `.apkm` for 5.1.7 — the universal bundle that carries the
+# `config.arm64_v8a` split — as mirrored on the Internet Archive, which serves a stable
+# anonymous URL. That is what this route was missing everywhere else:
 #
-# * **Google Play** serves it, and `apkeep -d google-play` can fetch the arm64 split
-#   given a device profile — but it requires `--email` and an `--aas-token`, i.e. a
-#   Google account in the build, and Play's terms disallow unofficial clients. Not
-#   something to automate in a public repository.
-# * **APKPure** needs no credentials and `apkeep -o 'arch=arm64-v8a'` does select an
-#   architecture — but for 5.1.7 and 5.1.6 it publishes only `armeabi-v7a` bundles.
-#   The arm64 builds it does carry (5.1.5, 4.9.7) predate the CKS client entirely:
-#   no `cast.remotetogo.com`, no `x-api-key`, nothing to carve.
-# * **APKMirror** publishes a universal `.apkm` for 5.1.7 that contains the
-#   `config.arm64_v8a` split, which is what this fetches.
+# * **Google Play** needs a Google account and an AAS token in the build, against Play's
+#   terms. Not something to automate in a public repository.
+# * **APKPure** publishes only `armeabi-v7a` bundles for 5.1.7 and 5.1.6; its arm64
+#   builds (5.1.5, 4.9.7) predate the CKS client entirely, so there is nothing to carve.
+# * **APKMirror** itself publishes the bundle, and this derivation used to walk its
+#   download chain with `curl`. Since 2026-10-08 every hop of that chain is behind
+#   Cloudflare's JS challenge (#356), which no `curl` gets past.
 #
-# ## The fragile part, and what happens when it breaks
-#
-# The download is gated behind a short page chain that sets a cookie and mints a
-# per-file key; requesting the final URL cold returns 403. This replays the chain with
-# a cookie jar. The key is stable per file rather than per session, but nothing about
-# the markup is a contract, so treat this as a best-effort convenience: when it breaks
-# the derivation fails loudly with instructions: seed the store with a library you
-# obtained yourself, and the hash below is the check either way.
-#
-# It has broken: since 2026-10-08 every hop is behind Cloudflare's JS challenge, which
-# `curl` cannot pass (#356). There is deliberately no environment-variable override —
-# a builder never sees the caller's environment, and a sandboxed one could not read a
-# path under `$HOME` if it did — so `nix-store --add-fixed` is the one manual route.
+# The hash pins the library, so the mirror is trusted for availability only. If it
+# goes away, any route to the same bytes works: `nix-store --add-fixed sha256` on the
+# extracted library, as the failure says.
 {
   lib,
   stdenvNoCC,
@@ -61,24 +50,17 @@ stdenvNoCC.mkDerivation {
   buildCommand = ''
     set -euo pipefail
 
-    base=https://www.apkmirror.com
-    rel="$base/apk/devsoftmedia/airreceiverlite/airreceiverlite-5-1-7-release/"
-    dl="$base/apk/softmedia/airreceiverlite/airreceiverlite-5-1-7-release/airreceiverlite-5-1-7-android-apk-download/"
-    ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-    jar=$PWD/jar.txt
-    get() { curl -sSL --retry 5 --retry-all-errors --retry-delay 3 -c "$jar" -b "$jar" -A "$ua" "$@"; }
-
     fail() {
       echo "" >&2
       echo "$1" >&2
       cat >&2 <<'EOF'
 
-    The download chain at apkmirror.com has changed, or is refusing this build —
-    most likely Cloudflare's JS challenge, which curl cannot pass. See issue #356.
+    The Internet Archive mirror of AirReceiverLite 5.1.7 is unreachable, or no longer
+    holds the bundle. See issue #356.
 
     Obtain lib/arm64-v8a/libAirReceiver.so from AirReceiverLite 5.1.7 by any route
-    (a real browser gets past the challenge; its sha256 is the outputHash in
-    nix/airreceiver-src.nix), then add it to the store:
+    (its sha256 is the outputHash in nix/airreceiver-src.nix), then add it to the
+    store:
 
       unzip bundle.apkm split_config.arm64_v8a.apk
       unzip split_config.arm64_v8a.apk lib/arm64-v8a/libAirReceiver.so
@@ -87,26 +69,9 @@ stdenvNoCC.mkDerivation {
       exit 1
     }
 
-    get -e "$base/" "$rel" -o rel.html || fail "could not fetch the release page"
-    get -e "$rel" "$dl" -o dl.html     || fail "could not fetch the download page"
-
-    key=$(grep -oE 'download/\?key=[0-9a-f]+' dl.html | head -1) \
-      || fail "no download key on the download page"
-    [ -n "$key" ] || fail "no download key on the download page"
-
-    # The final link is not always present on the first request; the page mints it a
-    # beat later. Retry rather than treating a race as a breakage.
-    final=""
-    for _ in 1 2 3 4 5; do
-      get -e "$dl" "$dl$key" -o key.html || true
-      final=$(grep -oE 'download\.php\?id=[0-9]+&key=[0-9a-f]+' key.html | head -1 || true)
-      [ -n "$final" ] && break
-      sleep 5
-    done
-    [ -n "$final" ] || fail "no final download link after 5 attempts"
-
-    get -e "$dl$key" "$base/wp-content/themes/APKMirror/$final" -o bundle.apkm \
-      || fail "could not download the bundle"
+    curl -sSfL --retry 5 --retry-all-errors --retry-delay 3 -o bundle.apkm \
+      'https://archive.org/download/com.softmedia.receiver.lite/com.softmedia.receiver.lite_5.1.7-2020164765_4arch_7dpi_24lang_74d08633aab15d4b4d458068f96a8708_apkmirror.com.apkm' \
+      || fail "could not download the bundle from the Internet Archive mirror"
 
     # An .apkm is a zip of split APKs; the arm64 split holds the library.
     unzip -q -o bundle.apkm 'split_config.arm64_v8a.apk' \
