@@ -43,6 +43,48 @@ def shell(*args, timeout=60):
     return adb("shell", *args, timeout=timeout)
 
 
+# Exit status for "this emulator cannot run the test; boot another one" — EX_TEMPFAIL.
+# The builder relaunches the emulator on it and on nothing else, so a real failure
+# never gets retried into a pass.
+EMULATOR_UNUSABLE = 75
+
+# How many reopens of the modem channel in a row must fail before the modem is
+# declared gone. The RIL retries every 10s. In 12 local boots (#387), 3 dropped the
+# channel at startup: two recovered on the first retry, and the third failed 19 times
+# in a row until the poll expired. Three is past every recovery seen and well inside
+# the 300s the poll otherwise waits out.
+MODEM_REOPEN_FAILURES = 3
+
+MODEM_OPEN = re.compile(r"opening qemu_modem_port (-?\d+)!")
+
+
+class ModemLost(Exception):
+    """The emulator's modem simulator stopped answering, so eth0 never comes up."""
+
+
+def modem_lost(ril_log):
+    """Whether the RIL's log ends in `MODEM_REOPEN_FAILURES` failed opens in a row.
+
+    eth0 is configured by exactly one thing: the reference RIL, as it answers the
+    framework's SETUP_DATA_CALL (`set_Ip_Addr … 10.0.2.15/24 on interface eth0`). That
+    needs the RIL's AT channel to the emulator's modem simulator. Some boots lose that
+    channel during the RIL's first probe (`Found GSM Modem` rather than `Multimode`,
+    then "Re-opening after close"), and while the host side stays gone every reopen
+    logs fd -1. Nothing in the guest can bring it back. It is a property of that
+    emulator process, so the only remedy is a fresh one.
+
+    Pure over the text of `logcat -b radio -s RIL`, so it can be checked against saved
+    logs without an emulator.
+    """
+    fds = [int(m.group(1)) for m in MODEM_OPEN.finditer(ril_log)]
+    trailing = 0
+    for fd in reversed(fds):
+        if fd != -1:
+            break
+        trailing += 1
+    return trailing >= MODEM_REOPEN_FAILURES
+
+
 def wait_for(what, predicate, timeout, interval=2, diagnose=None):
     """Poll until `predicate()` is truthy, with the failure naming the step.
 
@@ -168,9 +210,18 @@ def main():
     # hosted runner slower than the ceiling, and a guest that has stopped taking SLIRP's
     # fixed address — look identical from the step's name alone, and a longer timeout
     # would otherwise just hide the second one for longer.
+    def segment_up():
+        if GUEST_IP in shell("ip", "-o", "-4", "addr", "show")[1]:
+            return True
+        # The address comes from the RIL (see `modem_lost`), so a dead modem means it is
+        # never coming. Said in seconds, rather than as the 300s timeout #387 kept hitting.
+        if modem_lost(adb("logcat", "-b", "radio", "-d", "-s", "RIL")[1]):
+            raise ModemLost
+        return False
+
     wait_for(
         f"the guest's address on the segment ({GUEST_IP})",
-        lambda: GUEST_IP in shell("ip", "-o", "-4", "addr", "show")[1],
+        segment_up,
         300,
         # All address families for the second dump, and not `ip link`: `-4` omits an
         # interface that is up with no IPv4 address, which is exactly the shape this poll
@@ -356,4 +407,13 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except ModemLost:
+        print(
+            "EMULATOR UNUSABLE: the RIL lost the emulator's modem simulator and has failed "
+            f"to reopen it {MODEM_REOPEN_FAILURES} times in a row, so eth0 will never be "
+            "configured (#387). Nothing Cast-related has run yet.",
+            flush=True,
+        )
+        sys.exit(EMULATOR_UNUSABLE)

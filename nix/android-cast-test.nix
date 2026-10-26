@@ -123,14 +123,17 @@ let
     tcpdump -i tap0 -s0 -U -w "$WORK/segment.pcap" > "$WORK/tcpdump.log" 2>&1 &
     TCPDUMP_PID=$!
 
-    echo "== emulator on tap0"
     # `-net-tap-script-up/down no`: the emulator otherwise runs /etc/qemu-ifup, which does
     # not exist here and does not need to — the interface is already configured above.
-    ${sdkRoot}/emulator/emulator -avd cast \
-      -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
-      -gpu swiftshader_indirect -memory 3072 -cores 2 \
-      -net-tap tap0 -net-tap-script-up no -net-tap-script-down no \
-      > "$WORK/emulator.log" 2>&1 &
+    boot_emulator() {
+      echo "== emulator on tap0 (attempt $1)"
+      ${sdkRoot}/emulator/emulator -avd cast \
+        -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+        -gpu swiftshader_indirect -memory 3072 -cores 2 \
+        -net-tap tap0 -net-tap-script-up no -net-tap-script-down no \
+        > "$WORK/emulator.log" 2>&1 &
+    }
+    boot_emulator 1
 
     echo "== castaway on the same segment"
     # stdout is kept too, but only for diagnosis: anything that goes wrong before the
@@ -140,12 +143,30 @@ let
       ${castaway}/bin/castaway > "$WORK/castaway-stdout.log" 2>&1 &
     CASTAWAY_PID=$!
 
-    echo "== driving the phone"
-    ADB=${sdkRoot}/platform-tools/adb \
-    CASTAWAY_LOG=${journal} \
-    RECEIVER_IP=${receiverIp} GUEST_IP=${guestIp} GUEST_WIFI_IP=${guestWifiIp} \
-      ${python}/bin/python3 ${drive}
-    DRIVE_RC=$?
+    # Some boots lose the emulator's modem simulator during the RIL's first probe and
+    # never get it back, and eth0 comes from the RIL, so that emulator can never reach
+    # the segment (#387: 1 boot in 12 locally). The drive detects that before anything
+    # Cast-related runs and exits 75; only that status gets a fresh emulator. Any other
+    # failure is final, so this cannot retry a real defect into a pass. `-no-snapshot`
+    # makes every attempt a cold boot, and castaway keeps running across attempts: it
+    # never saw the dead one.
+    attempt=1
+    while :; do
+      echo "== driving the phone"
+      ADB=${sdkRoot}/platform-tools/adb \
+      CASTAWAY_LOG=${journal} \
+      RECEIVER_IP=${receiverIp} GUEST_IP=${guestIp} GUEST_WIFI_IP=${guestWifiIp} \
+        ${python}/bin/python3 ${drive}
+      DRIVE_RC=$?
+      [ $DRIVE_RC -eq 75 ] && [ $attempt -lt 3 ] || break
+      cp "$WORK/emulator.log" "$WORK/emulator-attempt-$attempt.log"
+      ${sdkRoot}/platform-tools/adb logcat -d > "$WORK/logcat-attempt-$attempt.txt" 2>&1 || true
+      ${sdkRoot}/platform-tools/adb emu kill > /dev/null 2>&1 || true
+      for _ in $(seq 30); do pgrep -f qemu-system > /dev/null || break; sleep 1; done
+      pkill -9 -f qemu-system 2>/dev/null || true
+      attempt=$((attempt + 1))
+      boot_emulator $attempt
+    done
 
     ${sdkRoot}/platform-tools/adb logcat -d > "$WORK/logcat.txt" 2>&1 || true
 
@@ -197,7 +218,7 @@ pkgs.runCommand "castaway-android-cast"
   # network leg's half of the fixture factory #225 promised (rule 9): a real Play
   # Services sender's mDNS, CASTv2 and mirroring RTP, regenerable by rebuilding this.
   keep() {
-    cp "$WORK"/castaway-stdout.log "$WORK"/emulator.log "$WORK"/logcat.txt \
+    cp "$WORK"/castaway-stdout.log "$WORK"/emulator*.log "$WORK"/logcat*.txt \
        "$WORK"/segment.pcap ${journal} $out/ 2>/dev/null || true
   }
   cleanup() {
