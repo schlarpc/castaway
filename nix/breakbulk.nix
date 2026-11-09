@@ -144,8 +144,10 @@ let
             # nix/linux-kiosk.nix's postInstall, as a stage after `install`: the fd
             # addon from its own product, the Electron/CDM wrapper, the browser host
             # app and the desktop entry.
+            # `install` always runs last and keeps top-level directories, so this
+            # runs before it and lays out bin/ itself.
             target.${native}.stages.kiosk = {
-              after = "install";
+              after = "splitDebug";
               run = { input, pkgs, ... }:
                 let
                   addon = repo.workspaces.default.target.${native}.packages.castaway-browser-fd;
@@ -156,8 +158,7 @@ let
                   ];
                 in
                 pkgs.runCommand "castaway-kiosk" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
-                  cp -r --no-preserve=mode ${input} $out
-                  chmod +x $out/bin/*
+                  install -Dm755 ${input}/castaway $out/bin/castaway
                   install -Dm755 ${addon}/lib/libcastaway_browser_fd.so $out/lib/libcastaway_browser_fd.so
                   wrapProgram $out/bin/castaway \
                     --set-default CASTAWAY_ELECTRON ${electron}/bin/electron \
@@ -175,13 +176,14 @@ let
             # implicit fixup, which is exactly the #348 bug crane had.
             target.${msvc} = {
               stages.deployTree = {
-                after = "install";
+                after = "linked";
                 run = { input, pkgs, ... }:
                   let
                     launcher = repo.workspaces.default.target.${msvc}.variants.windows.packages.castaway-launcher;
                   in
                   pkgs.runCommand "castaway-windows-electron" { } (''
-                    cp -r --no-preserve=mode ${input} $out
+                    mkdir -p $out/bin
+                    cp ${input}/*.exe "$out/bin/"
                     cp ${windows.ffmpeg}/bin/*.dll "$out/bin/"
                     cp ${launcher}/bin/launcher.exe "$out/bin/"
                   '' + windows.stageBrowser);
