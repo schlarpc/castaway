@@ -12,6 +12,15 @@
 
     crane.url = "github:ipetkov/crane";
 
+    # breakbulk: one derivation per Cargo unit (experimental port, nix/breakbulk.nix).
+    # Exposed under `legacyPackages.<system>.bb` only, beside the crane build, so
+    # `nix flake check`/`show` never trigger its import-from-derivation planning.
+    breakbulk = {
+      url = "github:schlarpc/breakbulk";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
+
     # nix-direnv for the development shell
     nix-direnv = {
       url = "github:nix-community/nix-direnv";
@@ -149,6 +158,7 @@
     , nixpkgs
     , rust-overlay
     , crane
+    , breakbulk
     , nix-direnv
     , ffmpeg-windows-src
     , widevine-windows-src
@@ -1462,6 +1472,24 @@
           # CARGO_BUILD_TARGET, which would silently hijack the native dev loop.
           windows = (windowsFor system).devShell;
         });
+
+      # The breakbulk port (nix/breakbulk.nix): `nix build .#bb.<attr>`.
+      legacyPackages = eachSystem (system: {
+        bb = import ./nix/breakbulk.nix {
+          inherit breakbulk system;
+          pkgs = pkgsFor system;
+          root = self;
+          rustToolchain = rustToolchainFor system;
+          inherit gitRev buildNumber;
+          carveEnv = castCarveEnvFor system;
+          ldacbt = ldacbtFor system;
+          moonlightCommonC = moonlightCommonCFor system;
+          bluetoothFirmware = bluetoothFirmwareFor system;
+          electron = electronLinuxFor system;
+          widevineCdm = widevineLinuxFor system;
+          windows = windowsFor system;
+        };
+      });
 
       # Expose nix-direnv for .envrc to use
       lib = {

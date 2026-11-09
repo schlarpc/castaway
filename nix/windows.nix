@@ -562,6 +562,8 @@ let
 in
 rec {
   inherit sysroot crossEnv target toolchainBins;
+  # For the breakbulk port (nix/breakbulk.nix), which reuses the staging and checks.
+  inherit ffmpeg clangCl hostCc stageBrowser mkArchive mkBundleCheck mkAuthenticodeCheck;
 
   # The deploy artifact, and now the only one (D55).
   #

@@ -12,6 +12,30 @@
         "url": "https://dl.airserver.com/pc32/AirServer-5.7.2-x64.msi"
       }
     },
+    "breakbulk": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-overlay": [
+          "rust-overlay"
+        ],
+        "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1794192306,
+        "narHash": "sha256-CXksKPNd+X9aYcR6u6CcX8TZlV8EVOkTlo7x2la4qsI=",
+        "owner": "schlarpc",
+        "repo": "breakbulk",
+        "rev": "321ddd27f016070383984806f779bb7b34d712a1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "schlarpc",
+        "repo": "breakbulk",
+        "type": "github"
+      }
+    },
     "crane": {
       "locked": {
         "lastModified": 1788465171,
@@ -210,6 +234,7 @@
     "root": {
       "inputs": {
         "airserver-msi-src": "airserver-msi-src",
+        "breakbulk": "breakbulk",
         "crane": "crane",
         "electron-linux-src": "electron-linux-src",
         "electron-windows-src": "electron-windows-src",
@@ -242,6 +267,21 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1689347949,
+        "narHash": "sha256-12tWmuL2zgBgZkdoB6qXZsgJEH9LR3oUgpaQq2RbI80=",
+        "owner": "nix-systems",
+        "repo": "default-linux",
+        "rev": "31732fcf5e8fea42e59c2488ad31a0e651500f68",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default-linux",
         "type": "github"
       }
     },
