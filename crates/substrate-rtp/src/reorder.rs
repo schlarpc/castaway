@@ -45,7 +45,6 @@ impl ReorderBuffer {
     /// Number of buffered (not-yet-popped) packets.
     #[must_use]
     pub fn len(&self) -> usize {
-        std::hint::black_box(());
         self.buf.len()
     }
 
