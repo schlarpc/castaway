@@ -70,6 +70,18 @@ let
     CASTAWAY_REQUIRE_FFMPEG = "1";
   };
 
+  # breakbulk runs nextest once per test binary, and nextest rejects the whole config
+  # when a `binary(...)` filter matches no binary in the run. Drop the one override
+  # that names a binary; ldac_decode loses its runner exclusivity under breakbulk.
+  nextestConfig = pkgs.writeText "nextest.toml" (lib.replaceStrings
+    [ ''
+      [[profile.default.overrides]]
+      filter = 'package(pipeline) and binary(ldac_decode)'
+      threads-required = "num-test-threads"
+    '' ]
+    [ "" ]
+    (builtins.readFile ../.config/nextest.toml));
+
   repo = bb.mkRepository {
     inherit pkgs root;
     modules = [
@@ -78,6 +90,7 @@ let
           toolchain = { rustc = rustToolchain; cargo = rustToolchain; };
           fmt.enable = true;
           test.runner = "nextest";
+          test.nextest.configFile = nextestConfig;
 
           targets.${native} = { };
           # The deploy artifact's three binaries, and nothing else: the rest of the
@@ -120,7 +133,14 @@ let
           cflags = [ "-Wno-error" "/EHsc" ];
         };
 
-        packages = lib.genAttrs members (_: { test.env = testEnv; test.path = [ pkgs.ffmpeg_7 ]; })
+        # clippy reads clippy.toml from the workspace root, which is outside every
+        # member's source view; without it `disallowed_methods` never fires and the
+        # tree's `#[expect]`s go unfulfilled.
+        packages = lib.genAttrs members (_: {
+          test.env = testEnv;
+          test.path = [ pkgs.ffmpeg_7 ];
+          extraSources = [ "clippy.toml" ];
+        })
           // {
           # Every env var below reaches only the named package's units — the thing
           # crane could not do, and why `CASTAWAY_GIT_REV` had to be kept off the deps
@@ -198,15 +218,41 @@ let
           };
           castaway-bt-probe.target.${msvc}.checks.dll-closure.run = { input, ... }:
             windows.mkBundleCheck (input // { pname = "castaway-bt-probe-windows"; });
-          pipeline.test = {
-            env = testEnv;
-            path = [ pkgs.ffmpeg_7 ];
-            sourceScope = [ "browser-host" ];
+          pipeline = {
+            extraSources = [ "clippy.toml" ];
+            test = {
+              env = testEnv;
+              path = [ pkgs.ffmpeg_7 ];
+              sourceScope = [ "browser-host" ];
+            };
           };
-          proto-cast.test = {
-            env = testEnv;
-            path = [ pkgs.ffmpeg_7 ];
-            sourceScope = [ "browser-host" ];
+          proto-cast = {
+            extraSources = [ "clippy.toml" ];
+            test = {
+              env = testEnv;
+              path = [ pkgs.ffmpeg_7 ];
+              sourceScope = [ "browser-host" ];
+            };
+          };
+
+          # breakbulk's curated -sys defaults declare nixpkgs inputs package-wide, and
+          # the msvc target has no nixpkgs package set to call them with. Move them to
+          # the native target. The keys must match lib/sys-defaults.nix exactly.
+          "aws-lc-sys@>=0.42.0" = {
+            inputs = lib.mkForce [ ];
+            nativeInputs = lib.mkForce [ ];
+            target.${native} = {
+              nativeInputs = p: [ p.pkg-config ];
+              inputs = p: [ p.aws-lc ];
+            };
+          };
+          libsqlite3-sys = {
+            inputs = lib.mkForce [ ];
+            nativeInputs = lib.mkForce [ ];
+            target.${native} = {
+              nativeInputs = p: [ p.pkg-config ];
+              inputs = p: [ p.sqlite ];
+            };
           };
 
           hci-transport.env.CASTAWAY_FIRMWARE_DIR = bluetoothFirmware;

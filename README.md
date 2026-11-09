@@ -108,3 +108,4 @@ Moonlight, so the default binary is GPL-bound.
 
 The other files in `docs/` are protocol records. Read the related record before you
 change a protocol crate.
+
