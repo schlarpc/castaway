@@ -17,9 +17,33 @@
 #   crt/include/            crt/lib/x86_64/
 #   sdk/include/{ucrt,um,shared,winrt}/
 #   sdk/lib/{ucrt,um}/x86_64/
-{ lib, stdenvNoCC, xwin, cacert }:
+{ lib, stdenvNoCC, xwin, cacert, fetchFromGitHub, rustPlatform }:
 
 let
+  # xwin 0.10.0, ahead of nixpkgs (0.9.0). Microsoft's VS 17 manifest switched its payload
+  # paths from `Installers\…` to `Installers/…` in November 2026, and 0.9.0 found the
+  # per-arch SDK headers by stripping the literal backslash prefix — so every cold build
+  # of this derivation failed with "unable to find x86_64 headers for Win11SDK_10.0.26100".
+  # 0.10.0 matches separator-agnostically (upstream PR #179, found first on v18 manifests).
+  # Drop this override once nixpkgs carries 0.10.0 or later.
+  xwin' = xwin.overrideAttrs (finalAttrs: old: {
+    version = "0.10.0";
+    src = fetchFromGitHub {
+      owner = "Jake-Shadle";
+      repo = "xwin";
+      tag = finalAttrs.version;
+      hash = "sha256-kUbRHrM88x3ezy0+GIpbGQfEROn16dSwPtobjdYauRM=";
+    };
+    # `cargoHash` alone does not reach the vendor derivation through overrideAttrs.
+    cargoDeps = rustPlatform.fetchCargoVendor {
+      inherit (finalAttrs) src;
+      name = "xwin-${finalAttrs.version}-vendor";
+      hash = "sha256-34v/YDT0Juwjv8EbwsOsmbp/Q89Z4c+BYxcA60X7Q3A=";
+    };
+    # 0.10.0 adds a third network-bound test beside the two nixpkgs already skips.
+    checkFlags = old.checkFlags ++ [ "--skip=verify_aarch64_compiles" ];
+  });
+
   # `xwin --arch x86_64 list` prints the versions available in the current manifest.
   crtVersion = "14.44.17.14";
   sdkVersion = "10.0.26100";
@@ -29,7 +53,7 @@ stdenvNoCC.mkDerivation {
   version = "crt-${crtVersion}-sdk-${sdkVersion}";
 
   dontUnpack = true;
-  nativeBuildInputs = [ xwin ];
+  nativeBuildInputs = [ xwin' ];
 
   # The MSVC CRT and Windows SDK are redistributable for build purposes but are not
   # free software; this derivation only repacks Microsoft's own payloads.
@@ -82,7 +106,7 @@ stdenvNoCC.mkDerivation {
 
   outputHashMode = "recursive";
   outputHashAlgo = "sha256";
-  outputHash = "sha256-o825/2nx69+2Tt0l5wnD0NzGDhcqUF/ocrgf5SDladY=";
+  outputHash = "sha256-Pr66nX8amUCdh/7oKmlIWbvz+8S5WQ8NiI7QwckKRO8=";
 
   meta = {
     description = "MSVC CRT ${crtVersion} + Windows SDK ${sdkVersion} repacked for cross-compilation";
