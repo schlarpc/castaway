@@ -20,6 +20,14 @@
 # the live bundles against these pins and goes red on its own instead of on a `direnv`
 # load. To re-pin: find the new capture in the Wayback CDX index for the upstream URL,
 # check its `id_` bytes against a fresh gstatic fetch, and update cast-receiver-sdk.json.
+# The CDX `digest` is the base32 SHA-1 of the decoded body, so `sha1sum` of the live
+# bundle (base32-encoded) picks the matching capture out of the index without fetching any.
+#
+# `--compressed` is load-bearing. Wayback replays a capture with the Content-Encoding it
+# was stored under: the October captures came back identity, the November ones gzip, even
+# to a request that asked for neither. Without curl decoding it, the pinned hash would be
+# of whichever encoding the archive happened to keep, and would never equal the live
+# hash `sdk-drift` compares it against.
 #
 # Both generations are pinned because both are in play and they are *identical* at the
 # platform layer: same `ws://localhost:<port>/v2/ipc`, same `{namespace,senderId,data}`
@@ -34,6 +42,7 @@ let
     inherit name;
     url = "https://web.archive.org/web/${pin.snapshot}id_/${pin.upstream}";
     inherit (pin) hash;
+    curlOptsList = [ "--compressed" ];
   };
 in
 pkgs.runCommand "cast-receiver-sdk" { } ''

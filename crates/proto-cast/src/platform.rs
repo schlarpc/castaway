@@ -128,8 +128,16 @@ impl IpcFrame {
 
 /// Why a sender's connection went away, in the SDK's own vocabulary.
 ///
-/// The SDK maps these to its public enum and defaults anything else to `unknown`
-/// (`$d`), so the set is closed and worth spelling out rather than passing strings.
+/// The SDK maps these to its public enum and defaults anything else to `unknown`, so the
+/// set is closed and worth spelling out rather than passing strings.
+///
+/// The November 2026 bundles (both generations) accept four more — `transport_closed`,
+/// `transport_aborted`, `transport_too_long_inactive`, `closed_by_self` — plus an
+/// optional numeric `reasonCode` beside `reason`. They feed only the SDK's disconnect
+/// telemetry (which goes nowhere without a `__platform__.metrics`, and the browser host
+/// installs none) and the event's `reason` string; no SDK behaviour branches on them. So
+/// they are not emitted here: `Unknown` for a dropped socket is still what the SDK
+/// itself would report for one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectReason {
     /// The sender closed its virtual connection — an ordinary "stop casting".
